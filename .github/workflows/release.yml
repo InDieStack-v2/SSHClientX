@@ -1,6 +1,6 @@
 name: Release
 
-# Fires when you push a tag like v0.1.0. The job builds Submarine on
+# Fires when you push a tag like v0.1.0. The job builds SSHClientX on
 # Windows, macOS, and Ubuntu, stamps the tag's version into Cargo.toml
 # and tauri.conf.json so the bundled binary's version matches the tag,
 # and uploads the installers/bundles as a draft GitHub Release.
@@ -51,8 +51,8 @@ jobs:
             rust_target: x86_64-pc-windows-msvc
 
           # macOS Apple Silicon. We produce both:
-          #   - Submarine.app (zipped → unzip + double-click, no DMG drag)
-          #   - Submarine_x.y.z_aarch64.dmg (classic DMG installer)
+          #   - SSHClientX.app (zipped → unzip + double-click, no DMG drag)
+          #   - SSHClientX_x.y.z_aarch64.dmg (classic DMG installer)
           # Intel macOS users can run this same arm64 build under Rosetta 2 —
           # we dropped the dedicated macos-13 (Intel) matrix entry because
           # GitHub's Intel macOS runner pool is so scarce that jobs would
@@ -209,8 +209,8 @@ jobs:
           set -euo pipefail
           mkdir -p arch-build
           cp packaging/arch/PKGBUILD             arch-build/
-          cp packaging/arch/submarine.desktop    arch-build/
-          cp src-tauri/target/${{ matrix.rust_target }}/release/submarine arch-build/
+          cp packaging/arch/sshclientx.desktop    arch-build/
+          cp src-tauri/target/${{ matrix.rust_target }}/release/sshclientx arch-build/
           cp src-tauri/icons/icon.png            arch-build/
 
           # Run makepkg in a throwaway Arch container. base-devel pulls in
@@ -254,11 +254,11 @@ jobs:
         run: |
           APP_DIR="src-tauri/target/${{ matrix.rust_target }}/release/bundle/macos"
           cd "$APP_DIR"
-          # The .app folder is named after productName ("Submarine").
+          # The .app folder is named after productName ("SSHClientX").
           # Wrap it in a versioned zip for the release asset name.
           ARCH="${{ matrix.os_name }}"
-          ZIP_NAME="Submarine-v${{ env.VERSION }}-${ARCH}.app.zip"
-          ditto -c -k --sequesterRsrc --keepParent "Submarine.app" "$ZIP_NAME"
+          ZIP_NAME="SSHClientX-v${{ env.VERSION }}-${ARCH}.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent "SSHClientX.app" "$ZIP_NAME"
           echo "MAC_ZIP=$APP_DIR/$ZIP_NAME" >> $GITHUB_ENV
 
       # Collect every artifact this job produced into one folder for upload.
@@ -292,7 +292,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: submarine-${{ matrix.os_name }}
+          name: sshclientx-${{ matrix.os_name }}
           path: artifacts/*
           if-no-files-found: error
 
@@ -417,7 +417,7 @@ jobs:
       # and write the matching SUBMARINE_KEYSTORE_PATH env var so Gradle's
       # signingConfig picks it up. Fail the build loudly if any of the four
       # signing secrets are missing — silent fallback to an unsigned APK
-      # ("Submarine-vX.Y.Z-app-universal-release-unsigned.apk") produces a
+      # ("SSHClientX-vX.Y.Z-app-universal-release-unsigned.apk") produces a
       # file Android rejects at install with "package appears to be invalid".
       # The four required secrets:
       #   SUBMARINE_KEYSTORE_B64        — base64 of the .jks
@@ -484,7 +484,7 @@ jobs:
           found=0
           for apk in $(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*-release*.apk" ! -name "*-unsigned.apk"); do
             base="$(basename "$apk" .apk)"
-            cp "$apk" "artifacts/Submarine-v${{ env.VERSION }}-${base}.apk"
+            cp "$apk" "artifacts/SSHClientX-v${{ env.VERSION }}-${base}.apk"
             found=$((found + 1))
           done
           if [ "$found" -eq 0 ]; then
@@ -502,7 +502,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: submarine-android
+          name: sshclientx-android
           path: artifacts/*
           if-no-files-found: error
 
@@ -516,7 +516,7 @@ jobs:
       # Resolve the tag string used for the GitHub Release. For tag pushes
       # this is github.ref_name (already "vX.Y.Z"). For workflow_dispatch,
       # github.ref_name resolves to the BRANCH ("main"), which would
-      # produce a "Submarine main" release and move the `main` tag — so
+      # produce a "SSHClientX main" release and move the `main` tag — so
       # fall back to the user-supplied version input. Normalize to a
       # leading `v` so the tag/name is uniform regardless of what the
       # user typed.
@@ -554,7 +554,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.TAG }}
-          name: Submarine ${{ steps.tag.outputs.TAG }}
+          name: SSHClientX ${{ steps.tag.outputs.TAG }}
           draft: true
           generate_release_notes: true
           files: release-files/*

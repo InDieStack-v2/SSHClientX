@@ -1,14 +1,14 @@
 {
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
-  "name": "Submarine",
-  "alternateName": ["Submarine SSH Client", "Submarine SFTP Client"],
+  "name": "SSHClientX",
+  "alternateName": ["SSHClientX SSH Client", "SSHClientX SFTP Client"],
   "applicationCategory": "DeveloperApplication",
   "applicationSubCategory": "SSH Client",
   "operatingSystem": "Windows, macOS, Linux, Android",
   "description": "Fast, secure, cross-platform SSH and SFTP desktop and mobile client. Tabbed terminal, dual-pane SFTP file browser, local/remote/dynamic port forwarding (SOCKS4/5, HTTP CONNECT), two-way folder mirror with conflict resolution, and end-to-end encrypted profile sync across devices.",
-  "url": "https://sinaxhpm.com/submarine",
-  "downloadUrl": "https://github.com/sinaxhpm/submarine/releases",
+  "url": "https://github.com/InDieStack-v2/SSHClientX",
+  "downloadUrl": "https://github.com/InDieStack-v2/SSHClientX/releases",
   "license": "https://opensource.org/licenses/MIT",
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
   "author": {
@@ -40,6 +40,6 @@
   ],
   "keywords": "ssh client, sftp client, terminal, port forwarding, socks proxy, folder sync, rust, tauri, putty alternative, winscp alternative, mobaxterm alternative, termius alternative, android ssh client",
   "sameAs": [
-    "https://github.com/sinaxhpm/submarine"
+    "https://github.com/InDieStack-v2/SSHClientX"
   ]
 }

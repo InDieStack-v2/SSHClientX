@@ -1220,7 +1220,7 @@ async fn handle_http_proxy(
         None => {
             let _ = sock.write_all(
                 b"HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n\
-                  Submarine HTTP proxy expects an absolute-URI request line \
+                  SSHClientX HTTP proxy expects an absolute-URI request line \
                   (e.g. `GET http://example.com/path HTTP/1.1`).\n"
             ).await;
             return Err(format!("http: unsupported URI form {:?}", uri));

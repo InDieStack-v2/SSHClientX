@@ -1,7 +1,7 @@
 [package]
-name = "submarine"
+name = "sshclientx"
 version = "0.3.8"
-description = "Submarine SSH Client"
+description = "SSH and SFTP client"
 authors = ["Sina Xhpm (sinaxhpm.com)"]
 license = "MIT"
 edition = "2021"
@@ -9,11 +9,11 @@ rust-version = "1.70"
 
 # Library + binary dual target. The Tauri Builder, command registry, and
 # state setup live in `src/lib.rs::run()`. The bin entry point (`src/main.rs`)
-# is a one-liner that calls `submarine_lib::run()` on desktop; on Android
+# is a one-liner that calls `sshclientx_lib::run()` on desktop; on Android
 # Tauri's `#[mobile_entry_point]` attr on `run()` generates the JNI glue and
 # the bin is never built. `cdylib` is what Gradle dlopens from the APK.
 [lib]
-name = "submarine_lib"
+name = "sshclientx_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

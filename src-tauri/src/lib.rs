@@ -211,7 +211,7 @@ fn vault_compress(plaintext: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Decompress the post-decrypt body for vault v2 reads. Bounded by a
 /// generous max-size guard so a corrupt or hostile file can't make us
-/// allocate gigabytes — a real Submarine SQLite snapshot is well under
+/// allocate gigabytes — a real SSHClientX SQLite snapshot is well under
 /// 64 MiB even with thousands of nodes.
 fn vault_decompress(compressed: &[u8]) -> Result<Vec<u8>, String> {
     const MAX_DECOMPRESSED: usize = 64 * 1024 * 1024;
@@ -270,7 +270,7 @@ fn save_vault_blocking(
     // Atomic write: tmp -> fsync -> rename. A crash / power loss in the
     // middle of a direct fs::write would leave the vault truncated, and
     // every saved credential would be unrecoverable on next launch.
-    let tmp_path = path.with_extension("submarine.tmp");
+    let tmp_path = path.with_extension("sshclientx.tmp");
     {
         use std::io::Write as _;
         let mut f = fs::File::create(&tmp_path)
@@ -3024,7 +3024,7 @@ async fn export_profile(
         let chosen = rfd::FileDialog::new()
             .set_title("Export profile")
             .set_file_name(&default_name)
-            .add_filter("Submarine profile", &["submarine"])
+            .add_filter("SSHClientX profile", &["submarine"])
             .save_file();
 
         let dst = match chosen {
@@ -3038,7 +3038,7 @@ async fn export_profile(
     }
 }
 
-/// Open a file picker and verify the chosen file looks like a Submarine
+/// Open a file picker and verify the chosen file looks like a SSHClientX
 /// vault (right header bytes). We do NOT decrypt — that requires the
 /// profile password, which the user enters after import via the regular
 /// unlock flow.
@@ -3055,7 +3055,7 @@ async fn import_profile_pick() -> Result<Option<(String, String)>, String> {
     {
         let picked = rfd::FileDialog::new()
             .set_title("Import profile")
-            .add_filter("Submarine profile", &["submarine"])
+            .add_filter("SSHClientX profile", &["submarine"])
             .pick_file();
 
         let path = match picked {
@@ -3070,11 +3070,11 @@ async fn import_profile_pick() -> Result<Option<(String, String)>, String> {
         use std::io::Read;
         let n = f.read(&mut header).map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?;
         if n < 5 || &header[..4] != VAULT_MAGIC {
-            return Err("Selected file is not a Submarine profile (bad header).".into());
+            return Err("Selected file is not a SSHClientX profile (bad header).".into());
         }
         if header[4] != VAULT_VERSION {
             return Err(format!(
-                "Profile uses an unsupported vault version ({}). Update Submarine first.",
+                "Profile uses an unsupported vault version ({}). Update SSHClientX first.",
                 header[4]
             ));
         }
@@ -3125,7 +3125,7 @@ async fn import_profile_save(
     // between the header read and the copy and we'd import garbage.
     let bytes = fs::read(&src).map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?;
     if bytes.len() < 5 || &bytes[..4] != VAULT_MAGIC || bytes[4] != VAULT_VERSION {
-        return Err("Source file is no longer a valid Submarine profile.".into());
+        return Err("Source file is no longer a valid SSHClientX profile.".into());
     }
     if bytes.len() < HEADER_LEN + NONCE_LEN + 16 {
         return Err("Source file is truncated — header is valid but the body is too small.".into());
@@ -8781,7 +8781,7 @@ fn app_temp_root() -> &'static std::path::PathBuf {
     ROOT.get_or_init(|| {
         let mut bytes = [0u8; 12];
         rand::thread_rng().fill(&mut bytes);
-        let root = std::env::temp_dir().join(format!("submarine-{}", hex::encode(bytes)));
+        let root = std::env::temp_dir().join(format!("sshclientx-{}", hex::encode(bytes)));
         let _ = std::fs::create_dir_all(&root);
         #[cfg(unix)]
         {
@@ -9199,7 +9199,7 @@ async fn android_quick_dirs(app: tauri::AppHandle) -> Result<Vec<AndroidQuickDir
         ];
         // App-scoped external files dir — always writable, survives reboots,
         // and visible to the user through any file manager under
-        // Android/data/com.submarine.app/files. This is the fallback default
+        // Android/data/com.sshclientx.app/files. This is the fallback default
         // when everything shared is locked down.
         if let Ok(dir) = app.path().app_local_data_dir() {
             candidates.push(("App storage".into(), dir));
@@ -9522,7 +9522,7 @@ fn parse_client_import(text: String) -> Result<Vec<ImportedHost>, String> {
 /// Parse `regedit /e` output of PuTTY's session key. The format is
 /// deterministic (one `[...]` header line per session, then `"key"=type:val`
 /// lines) so a line-oriented walk covers it. We only pull the three fields
-/// that translate to a Submarine row: HostName, PortNumber, UserName.
+/// that translate to a SSHClientX row: HostName, PortNumber, UserName.
 /// Session-name percent-escapes (%20 for space, etc.) are undone so the
 /// alias reads naturally.
 fn parse_putty_reg(text: &str) -> Result<Vec<ImportedHost>, String> {
@@ -10573,4 +10573,4 @@ mod tests {
             assert!(is_safe_dir_entry_name(ok), "should accept {:?}", ok);
         }
     }
-}
+}

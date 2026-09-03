@@ -1,12 +1,12 @@
 <div align="center">
-  <img src="src/assets/logo.png" alt="Submarine logo" width="120" />
-  <h1>Submarine — Modern SSH &amp; SFTP Client</h1>
+  <img src="src/assets/logo.png" alt="SSHClientX logo" width="120" />
+  <h1>SSHClientX — Modern SSH &amp; SFTP Client</h1>
   <p><strong>A fast, secure SSH and SFTP client for Windows, macOS, Linux — and now Android.</strong></p>
   <p>Manage servers, edit remote files, forward ports, and sync folders from one native window. Built with Rust and Tauri.</p>
   <p>
-    <a href="https://github.com/sinaxhpm/submarine/releases"><img alt="release" src="https://img.shields.io/github/v/release/sinaxhpm/submarine?include_prereleases" /></a>
-    <a href="https://github.com/sinaxhpm/submarine/releases"><img alt="downloads" src="https://img.shields.io/github/downloads/sinaxhpm/submarine/total" /></a>
-    <a href="https://github.com/sinaxhpm/submarine/actions"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/sinaxhpm/submarine/release.yml" /></a>
+    <a href="https://github.com/InDieStack-v2/SSHClientX/releases"><img alt="release" src="https://img.shields.io/github/v/release/InDieStack-v2/SSHClientX?include_prereleases" /></a>
+    <a href="https://github.com/InDieStack-v2/SSHClientX/releases"><img alt="downloads" src="https://img.shields.io/github/downloads/InDieStack-v2/SSHClientX/total" /></a>
+    <a href="https://github.com/InDieStack-v2/SSHClientX/actions"><img alt="ci" src="https://img.shields.io/github/actions/workflow/status/InDieStack-v2/SSHClientX/release.yml" /></a>
     <img alt="platforms" src="https://img.shields.io/badge/platform-windows%20%7C%20macos%20%7C%20linux%20%7C%20android-blue" />
     <img alt="license" src="https://img.shields.io/badge/license-MIT-green" />
   </p>
@@ -15,10 +15,10 @@
 ---
 
 <div align="center">
-  <img src="docs/screenshots/hero.png" alt="Submarine main window — terminal session with dual-pane SFTP browser open on the right" width="900" />
+  <img src="docs/screenshots/hero.png" alt="SSHClientX main window — terminal session with dual-pane SFTP browser open on the right" width="900" />
 </div>
 
-> **TL;DR** — Submarine is a fast, free, open-source SSH and SFTP client for Windows, macOS, Linux, and Android. It replaces the typical PuTTY + WinSCP + tunnel-manager stack with one tabbed window per server: terminal, SFTP, port forwarding (SOCKS / HTTP / local / remote), folder mirror, and end-to-end encrypted profile sync. Built with Rust + Tauri. MIT licensed.
+> **TL;DR** — SSHClientX is a fast, free, open-source SSH and SFTP client for Windows, macOS, Linux, and Android. It replaces the typical PuTTY + WinSCP + tunnel-manager stack with one tabbed window per server: terminal, SFTP, port forwarding (SOCKS / HTTP / local / remote), folder mirror, and end-to-end encrypted profile sync. Built with Rust + Tauri. MIT licensed.
 
 ## At a glance
 
@@ -28,7 +28,7 @@
 - **Native and cross-platform** — Windows, macOS, Linux (`.deb` / `.rpm` / Arch / AppImage), and Android — same encrypted vault everywhere
 - **Zero-knowledge cloud sync** — profiles are Argon2id + AES-256-GCM sealed on your device before upload; the server (and everyone else) only sees ciphertext. Browser dashboard at [`api.sinaxhpm.com/account`](https://api.sinaxhpm.com/account/) to manage your account and stored profiles
 - **Docker manager** — containers, logs (live tail), stats, prune, and `docker exec` shells as first-class session tabs
-- **Import from anywhere** — PuTTY `.reg`, MobaXterm `.mxtsessions`, OpenSSH config, and Submarine JSON exports all bulk-imported from the Servers page
+- **Import from anywhere** — PuTTY `.reg`, MobaXterm `.mxtsessions`, OpenSSH config, and SSHClientX JSON exports all bulk-imported from the Servers page
 - **Secure by default** — TOFU host keys with per-connection nonce binding, strict CSP, minimal Tauri permission ACL, zeroized master key
 
 ## Screenshots
@@ -69,7 +69,7 @@
 
 ## Looking for an alternative to…
 
-If you're searching for one of these, Submarine is a direct fit:
+If you're searching for one of these, SSHClientX is a direct fit:
 
 - a free **PuTTY alternative for macOS and Linux** (and a tabbed PuTTY replacement on Windows)
 - a **WinSCP alternative** that lives in the same window as your terminal
@@ -80,9 +80,9 @@ If you're searching for one of these, Submarine is a direct fit:
 - an **rsync GUI / Syncthing-lite** that mirrors a local folder to a remote SSH host with conflict resolution
 - an **Android SSH client** (ConnectBot / JuiceSSH style) that shares saved servers with your desktop
 
-## Why Submarine
+## Why SSHClientX
 
-Most SSH clients feel like they were built a decade ago and never updated. Submarine is a clean, modern alternative for developers and sysadmins who connect to remote servers every day.
+Most SSH clients feel like they were built a decade ago and never updated. SSHClientX is a clean, modern alternative for developers and sysadmins who connect to remote servers every day.
 
 - **Native and fast.** Built with Rust + Tauri — boots in under a second, uses around 80 MB of RAM with several sessions open. No Electron, no battery drain.
 - **One window, everything you need.** Terminal, SFTP file browser, port tunnels, folder sync, and saved commands — all live as tabs around each server. No more juggling PuTTY plus WinSCP plus a tunnel app.
@@ -115,7 +115,7 @@ Most SSH clients feel like they were built a decade ago and never updated. Subma
 
 ### Folder Mirror
 
-Pick a local folder, pick a remote folder, and Submarine keeps them in sync.
+Pick a local folder, pick a remote folder, and SSHClientX keeps them in sync.
 
 - **Two-way initial sync.** Walks both sides, compares by size and content hash (not just timestamp), and merges them into the same state.
 - **Live watcher.** Every save, create, rename, or delete on your local folder pushes to the server in real time.
@@ -170,26 +170,26 @@ Manage Docker on any session host without typing a single `docker` command.
 
 ## Install
 
-Pick a binary from the [latest release](https://github.com/sinaxhpm/submarine/releases) and you're done — no extra dependencies.
+Pick a binary from the [latest release](https://github.com/InDieStack-v2/SSHClientX/releases) and you're done — no extra dependencies.
 
 | OS | File |
 |---|---|
 | Windows 10 / 11 | `.exe` installer or `.msi` |
 | macOS (Apple Silicon, or Intel via Rosetta) | `.dmg` or `.app.zip` |
-| Debian / Ubuntu / Mint | `.deb` — `sudo apt install ./submarine_*.deb` |
-| Fedora / RHEL / openSUSE | `.rpm` — `sudo dnf install ./submarine-*.rpm` |
-| Arch / Manjaro / EndeavourOS | `.pkg.tar.zst` — `sudo pacman -U submarine-*.pkg.tar.zst` |
+| Debian / Ubuntu / Mint | `.deb` — `sudo apt install ./sshclientx_*.deb` |
+| Fedora / RHEL / openSUSE | `.rpm` — `sudo dnf install ./sshclientx-*.rpm` |
+| Arch / Manjaro / EndeavourOS | `.pkg.tar.zst` — `sudo pacman -U sshclientx-*.pkg.tar.zst` |
 | Any Linux | `.AppImage` — `chmod +x` and double-click |
 | Android 8.0+ | `.apk` — sideload, no Play Store required |
 
-> Builds are currently **unsigned**. Windows SmartScreen will prompt — click "More info → Run anyway". On macOS you may need `xattr -d com.apple.quarantine /Applications/Submarine.app`. Android sideloading needs "Install unknown apps" enabled for the installer source.
+> Builds are currently **unsigned**. Windows SmartScreen will prompt — click "More info → Run anyway". On macOS you may need `xattr -d com.apple.quarantine /Applications/SSHClientX.app`. Android sideloading needs "Install unknown apps" enabled for the installer source.
 
 ### Android
 
-Submarine on Android is a true native build of the same Rust core — same SSH stack, same encrypted vault, same profile sync. Reach a server from your phone with the same credentials you saved on your desktop.
+SSHClientX on Android is a true native build of the same Rust core — same SSH stack, same encrypted vault, same profile sync. Reach a server from your phone with the same credentials you saved on your desktop.
 
 - **Same encrypted vault.** Cloud sync drops your profiles onto the phone exactly as they were on desktop. Nothing re-typed.
-- **Tabbed terminal optimised for touch.** Mobile soft keyboards don't have Ctrl / Alt / Shift / Esc / Tab — Submarine ships an inline **soft-key bar** between xterm and the OS keyboard with Termux-style sticky modifiers (tap to arm, double-tap to lock). Ctrl+letter, Alt+letter, and Shift+Tab all work as expected.
+- **Tabbed terminal optimised for touch.** Mobile soft keyboards don't have Ctrl / Alt / Shift / Esc / Tab — SSHClientX ships an inline **soft-key bar** between xterm and the OS keyboard with Termux-style sticky modifiers (tap to arm, double-tap to lock). Ctrl+letter, Alt+letter, and Shift+Tab all work as expected.
 - **Auto-scroll on focus.** Tap the terminal and the prompt scrolls into view; the same fires when the OS keyboard opens so the cursor row never sits hidden behind the keyboard.
 - **SFTP file browser** with multi-select, upload from the phone's storage, download into Downloads.
 - **Port forwarding (SOCKS / local / remote)** runs as long as the app is open — handy for tunnelling a mobile browser through your home box.
@@ -200,7 +200,7 @@ Tested on Android 8.0+ (API 26+). Phones, tablets, and Android-on-ChromeOS.
 
 ## Security
 
-Your data is encrypted on your machine before anything leaves it. Submarine and the sync server never see your passwords, private keys, or profile content.
+Your data is encrypted on your machine before anything leaves it. SSHClientX and the sync server never see your passwords, private keys, or profile content.
 
 **How it works:**
 
@@ -222,7 +222,7 @@ Your data is encrypted on your machine before anything leaves it. Submarine and 
 
 ## FAQ
 
-### Is Submarine free?
+### Is SSHClientX free?
 
 Yes. MIT-licensed. Use it personally, use it at work, fork it, redistribute it.
 
@@ -232,7 +232,7 @@ Yes. Cloud sync is opt-in. All profiles, mirrors, and tunnels live locally and a
 
 ### How is it different from PuTTY, WinSCP, or MobaXterm?
 
-PuTTY and WinSCP are two separate apps you alt-tab between. MobaXterm bundles them but feels dated and is Windows-only. Submarine puts terminal, SFTP, tunnels, and folder mirror in one modern tabbed window per server — and runs natively on Windows, macOS, and Linux.
+PuTTY and WinSCP are two separate apps you alt-tab between. MobaXterm bundles them but feels dated and is Windows-only. SSHClientX puts terminal, SFTP, tunnels, and folder mirror in one modern tabbed window per server — and runs natively on Windows, macOS, and Linux.
 
 ### Does it support keys with passphrases?
 
@@ -250,25 +250,25 @@ Smaller installer (around 10 MB vs ~100 MB for an Electron equivalent), lower RA
 
 In a single encrypted file under your OS app-data directory. Nothing in plaintext. Nothing in a global Keychain or registry hive.
 
-### Does Submarine collect telemetry or analytics?
+### Does SSHClientX collect telemetry or analytics?
 
 No. There's no analytics SDK, no crash reporter that sends data home, no "phone home" call on launch. The only outbound network call beyond your SSH targets is the optional cloud-sync endpoint at `api.sinaxhpm.com`, and that endpoint only ever receives opaque ciphertext.
 
-### Can I use Submarine on my Android phone with the same servers as my desktop?
+### Can I use SSHClientX on my Android phone with the same servers as my desktop?
 
 Yes. Install the APK, unlock with the same master password you use on desktop, and the encrypted vault syncs. Every server, key, and saved tunnel appears on the phone. Folder mirror is desktop-only for now; everything else (terminal, SFTP, port forwarding) works on Android.
 
-### Is Submarine on the Play Store?
+### Is SSHClientX on the Play Store?
 
-No. Distribution is via sideloadable APK from the [releases page](https://github.com/sinaxhpm/submarine/releases). This keeps the same untouched binary running on every platform with no store-mandated changes.
+No. Distribution is via sideloadable APK from the [releases page](https://github.com/InDieStack-v2/SSHClientX/releases). This keeps the same untouched binary running on every platform with no store-mandated changes.
 
 ## Build from Source
 
 Requirements: Node 20+, Rust stable, [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your OS. Windows additionally needs **Strawberry Perl** for the vendored OpenSSL build (`winget install StrawberryPerl.StrawberryPerl`).
 
 ```bash
-git clone https://github.com/sinaxhpm/submarine
-cd submarine
+git clone https://github.com/InDieStack-v2/SSHClientX
+cd SSHClientX
 npm install
 npm run tauri dev          # run in development
 npm run tauri build        # build release bundle

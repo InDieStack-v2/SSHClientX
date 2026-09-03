@@ -1,4 +1,4 @@
-package com.submarine.app
+package com.sshclientx.app
 
 import android.content.Intent
 import android.graphics.Color

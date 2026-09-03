@@ -85,7 +85,7 @@ const AboutPanel = ({ isOpen, onClose }: Props) => {
           {/* Brand */}
           <div className="flex flex-col items-center select-none">
             <img src={logoUrl} alt="" draggable={false} className="h-14 w-auto max-w-full object-contain mb-3 drop-shadow-[0_0_24px_rgba(var(--primary),0.18)]" />
-            <h1 className="text-[20px] font-semibold text-white tracking-tight">Submarine</h1>
+            <h1 className="text-[20px] font-semibold text-white tracking-tight">SSHClientX</h1>
             <p className="text-[11.5px] text-zinc-500 mt-1 font-mono">
               {info ? `v${info.version}` : "loading…"}
             </p>

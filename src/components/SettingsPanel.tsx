@@ -26,7 +26,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
           <Settings size={24} className="text-primary" /> Settings
         </h2>
         <p className="text-[13px] text-zinc-400 mt-2">
-          Tweak how Submarine looks and feels.
+          Tweak how SSHClientX looks and feels.
           {' '}
           <span className="text-zinc-500 italic">Per-device — preferences live in this machine's local storage and don't sync with your cloud profile.</span>
         </p>

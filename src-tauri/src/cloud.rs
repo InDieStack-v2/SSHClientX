@@ -1,4 +1,4 @@
-//! Cloud sync client. Talks to the Submarine HTTP API for email-based
+//! Cloud sync client. Talks to the SSHClientX HTTP API for email-based
 //! account auth and encrypted-profile sync. The server never sees the
 //! per-profile encryption keys — we only ship the already-encrypted
 //! `.submarine` blobs (the same files `export_profile` produces locally).
@@ -202,7 +202,7 @@ impl CloudState {
             // Tauri builds set their own user-agent for the WebView; we want
             // the API server to be able to distinguish app traffic from a
             // random browser hit.
-            .user_agent(concat!("submarine-app/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("sshclientx-app/", env!("CARGO_PKG_VERSION")))
             .build()
             .expect("reqwest client should build");
 

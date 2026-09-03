@@ -52,6 +52,9 @@ original_index.css
 .env
 .env.*
 !.env.example
+.zed/
+*.jks
+*.keystore
 
 # Editor and OS scratch files we haven't already covered above.
 Thumbs.db

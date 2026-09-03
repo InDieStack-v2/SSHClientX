@@ -359,7 +359,7 @@ const TerminalView = ({
 
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: parseInt(localStorage.getItem('submarine-terminal-font-size') || '14'),
+      fontSize: parseInt(localStorage.getItem('sshclientx-terminal-font-size') || '14'),
       fontFamily: 'Consolas, "Courier New", monospace',
       theme: {
         background: '#09090b',
@@ -690,13 +690,13 @@ const TerminalView = ({
     
     // Handle Settings Change
     const handleSettingsChange = () => {
-      const newSize = parseInt(localStorage.getItem('submarine-terminal-font-size') || '14');
+      const newSize = parseInt(localStorage.getItem('sshclientx-terminal-font-size') || '14');
       if (term.options.fontSize !== newSize) {
         term.options.fontSize = newSize;
         fitAddon.fit();
       }
     };
-    window.addEventListener('submarine-settings-changed', handleSettingsChange);
+    window.addEventListener('sshclientx-settings-changed', handleSettingsChange);
 
     // ── Mobile QoL ───────────────────────────────────────────────────────────
     // Capture the container ref here so the listener add/remove calls and the
@@ -740,7 +740,7 @@ const TerminalView = ({
     window.visualViewport?.addEventListener('resize', onVvResize);
 
     return () => {
-      window.removeEventListener('submarine-settings-changed', handleSettingsChange);
+      window.removeEventListener('sshclientx-settings-changed', handleSettingsChange);
       resizeObserver.disconnect();
       onDataDisposable.dispose();
       onResizeDisposable.dispose();

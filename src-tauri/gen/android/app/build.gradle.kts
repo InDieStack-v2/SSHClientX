@@ -43,10 +43,10 @@ val hasReleaseSigning: Boolean =
 
 android {
     compileSdk = 36
-    namespace = "com.submarine.app"
+    namespace = "com.sshclientx.app"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
-        applicationId = "com.submarine.app"
+        applicationId = "com.sshclientx.app"
         minSdk = 24
         targetSdk = 36
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()

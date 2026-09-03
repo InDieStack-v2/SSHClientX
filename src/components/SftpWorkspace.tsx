@@ -80,17 +80,17 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
   // Persisted globally (not per-session) — pure layout preference.
   const [layout, setLayout] = useState<FilesLayout>(() => {
     try {
-      const v = localStorage.getItem("submarine-sftp-layout");
+      const v = localStorage.getItem("sshclientx-sftp-layout");
       return v === "split" ? "split" : "tabs";
     } catch { return "tabs"; }
   });
   const setLayoutPersisted = (l: FilesLayout) => {
     setLayout(l);
-    try { localStorage.setItem("submarine-sftp-layout", l); } catch { /* quota — ignore */ }
+    try { localStorage.setItem("sshclientx-sftp-layout", l); } catch { /* quota — ignore */ }
   };
   // Active side in tabs mode. We persist it per (session) so the user
   // returns to the side they were last using, not always Local.
-  const sideStorageKey = `submarine-sftp-side-${sessionId}`;
+  const sideStorageKey = `sshclientx-sftp-side-${sessionId}`;
   const [activeSide, setActiveSide] = useState<FilesSide>(() => {
     try {
       const v = localStorage.getItem(sideStorageKey);
@@ -112,7 +112,7 @@ const SftpWorkspace = ({ sessionId, disabled = false, serverId = 0, mirrorsConfi
   // Persist the last directory each panel was in per (session, side) so the
   // user lands on the same path next time they open this server. If the
   // saved path no longer exists, FilePanel falls back to provider.homePath().
-  const storageKey = `submarine-server-dirs-${sessionId}`;
+  const storageKey = `sshclientx-server-dirs-${sessionId}`;
   const savedDirsRef = useRef<{ local?: string; remote?: string }>(
     (() => {
       try {

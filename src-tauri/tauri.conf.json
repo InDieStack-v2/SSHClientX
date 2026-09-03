@@ -1,7 +1,7 @@
 {
-  "productName": "Submarine",
+  "productName": "SSHClientX",
   "version": "0.3.8",
-  "identifier": "com.submarine.app",
+  "identifier": "com.sshclientx.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
@@ -11,7 +11,7 @@
 "app": {
     "windows": [
       {
-        "title": "Submarine",
+        "title": "SSHClientX",
         "width": 1080,
         "height": 720,
         "minWidth": 820,

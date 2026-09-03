@@ -23,7 +23,7 @@
     <!--
         allowBackup="false" + dataExtractionRules disables Android's Auto Backup
         (Android 6+) and Device-to-Device transfer / cloud restore (Android 12+).
-        Without this, /data/data/com.submarine.app/{files,databases,shared_prefs}
+        Without this, /data/data/com.sshclientx.app/{files,databases,shared_prefs}
         (which holds the encrypted vault, the cloud OAuth bearer token, and any
         cached SSH state) rides Google's automatic backup to the user's Drive
         and to any device they sign in to. For an SSH client that's a silent
@@ -34,7 +34,7 @@
     <application
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
-        android:theme="@style/Theme.submarine"
+        android:theme="@style/Theme.sshclientx"
         android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"

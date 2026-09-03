@@ -10,10 +10,10 @@ use serde::Serialize;
 
 /// `<owner>/<repo>` on GitHub (canonical casing). Used to build the API URL
 /// for the releases query and the user-facing repo URL.
-pub const GITHUB_REPO: &str = "SinaXhpm/Submarine";
+pub const GITHUB_REPO: &str = "InDieStack-v2/SSHClientX";
 
 /// Marketing site / project page. Surfaced in the About panel.
-pub const WEBSITE_URL: &str = "https://sinaxhpm.com";
+pub const WEBSITE_URL: &str = "https://github.com/InDieStack-v2/SSHClientX";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AppInfo {
@@ -86,7 +86,7 @@ pub async fn check_for_updates() -> Result<UpdateInfo, String> {
     // GitHub API; an empty/missing UA gets a 403.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(6))
-        .user_agent(concat!("submarine-app/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("sshclientx-app/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| format!("[UPDATE] CLIENT: {}", e))?;
 

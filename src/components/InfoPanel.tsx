@@ -1613,7 +1613,7 @@ const ProcessesTab = ({ sessionId, disabled, visible = true }: { sessionId: stri
   const confirm = useConfirm();
 
   // Also pause when the OS window is minimized/hidden. `visible` only tracks the
-  // in-app Info tool being on screen; it stays true when the whole Submarine
+  // in-app Info tool being on screen; it stays true when the whole SSHClientX
   // window is minimized, so without this the 2s poll would keep hitting the
   // server over SSH while nobody's watching. Re-shows trigger a fresh fetch.
   const [winShown, setWinShown] = useState(() => typeof document === "undefined" || !document.hidden);

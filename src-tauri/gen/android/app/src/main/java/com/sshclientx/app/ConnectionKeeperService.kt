@@ -1,4 +1,4 @@
-package com.submarine.app
+package com.sshclientx.app
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -48,7 +48,7 @@ class ConnectionKeeperService : Service() {
         } else null
 
         val notification: Notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Submarine")
+            .setContentTitle("SSHClientX")
             .setContentText("Keeping your SSH sessions alive")
             .setSmallIcon(R.mipmap.ic_launcher)
             .setOngoing(true)
@@ -77,7 +77,7 @@ class ConnectionKeeperService : Service() {
     }
 
     private fun ensureNotificationChannel(): String {
-        val channelId = "submarine_background"
+        val channelId = "sshclientx_background"
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             if (nm.getNotificationChannel(channelId) == null) {

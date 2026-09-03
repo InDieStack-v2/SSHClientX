@@ -792,7 +792,7 @@ const PruneView = ({ sessionId }: { sessionId: string }) => {
         <ShieldAlert size={14} className="mt-0.5 shrink-0" />
         <div>
           <div className="font-bold uppercase tracking-wider">Safe prune only</div>
-          <div className="text-amber-200/80 mt-0.5">Submarine never runs <code className="font-mono px-1">prune -a</code> or <code className="font-mono px-1">--volumes</code>. Named volumes and tagged images are always preserved.</div>
+          <div className="text-amber-200/80 mt-0.5">SSHClientX never runs <code className="font-mono px-1">prune -a</code> or <code className="font-mono px-1">--volumes</code>. Named volumes and tagged images are always preserved.</div>
         </div>
       </div>
       {scopes.map(s => {
@@ -1285,7 +1285,7 @@ const ComposeViewerModal = ({
           }>
             <div className="px-2 py-1 mb-2 rounded bg-amber-500/5 border border-amber-500/20 text-amber-300 text-[10px] flex items-start gap-1.5">
               <AlertTriangle size={11} className="mt-0.5 shrink-0" />
-              <span>This file may contain secrets (DB passwords, API keys). View-only — Submarine never edits compose files.</span>
+              <span>This file may contain secrets (DB passwords, API keys). View-only — SSHClientX never edits compose files.</span>
             </div>
             {yaml.loading && <Spinner label="Reading compose file…" />}
             {yaml.error && <ErrorBanner err={yaml.error} />}

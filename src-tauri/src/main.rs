@@ -10,5 +10,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    submarine_lib::run();
+    sshclientx_lib::run();
 }

@@ -2,7 +2,7 @@
   "app": {
     "windows": [
       {
-        "title": "Submarine",
+        "title": "SSHClientX",
         "decorations": true,
         "transparent": false,
         "fullscreen": false

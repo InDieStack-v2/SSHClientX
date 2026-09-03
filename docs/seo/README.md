@@ -1,7 +1,7 @@
-# SEO / AEO assets for the Submarine website
+# SEO / AEO assets for the SSHClientX website
 
 These structured-data templates belong on whatever public page advertises
-Submarine — currently `sinaxhpm.com/submarine`. They are **not** loaded by
+SSHClientX — currently `sinaxhpm.com/sshclientx`. They are **not** loaded by
 the desktop or mobile app: the Tauri WebView CSP (`script-src 'self'`)
 blocks inline `<script>` tags, and AI crawlers don't reach the shell.
 

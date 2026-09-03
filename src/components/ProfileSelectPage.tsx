@@ -135,7 +135,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   // owner fills in later). Goes through the backend URL-opener like every other
   // external link so the CSP stays tight.
   const openDonate = () => {
-    invoke("open_external_url", { url: "https://github.com/SinaXhpm/submarine#donate" }).catch(() => {});
+    invoke("open_external_url", { url: "https://github.com/InDieStack-v2/SSHClientX#donate" }).catch(() => {});
   };
 
   // When the expanded row changes, reset + focus the password so opening a
@@ -353,9 +353,9 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
             draggable={false}
             className="h-28 w-auto max-w-full object-contain mb-4 drop-shadow-[0_0_32px_rgba(var(--primary),0.22)]"
           />
-          <h1 className="text-[22px] font-semibold text-white tracking-tight leading-none">Submarine</h1>
+          <h1 className="text-[22px] font-semibold text-white tracking-tight leading-none">SSHClientX</h1>
           <p className="text-[10px] text-primary/80 mt-1.5 tracking-[0.22em] uppercase font-semibold">
-            Run Silent, Run Deep
+            SSH & SFTP Client
           </p>
           <p className="text-[12.5px] text-zinc-500 mt-2">
             {loading
@@ -599,7 +599,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
             </button>
             <button
               onClick={openDonate}
-              title="Support Submarine on GitHub"
+              title="Support SSHClientX on GitHub"
               className="h-8 px-4 rounded-lg text-[12.5px] font-bold text-rose-200 bg-rose-500/10 border border-rose-500/25 hover:bg-rose-500/20 hover:text-rose-100 transition-colors flex items-center gap-1.5"
             >
               <Heart size={13} className="fill-rose-400/40" /> Donate

@@ -85,14 +85,14 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
   const [customPassword, setCustomPassword] = useState("");
   // The connect-time log box mirrors the terminal font-size setting, so the
   // user's chosen size applies to the startup logs too — not just the shell.
-  // `submarine-settings-changed` (dispatched by Settings on save) keeps it live.
+  // `sshclientx-settings-changed` (dispatched by Settings on save) keeps it live.
   const readLogFontSize = () =>
-    Math.max(1, parseInt(localStorage.getItem('submarine-terminal-font-size') || '14') || 14);
+    Math.max(1, parseInt(localStorage.getItem('sshclientx-terminal-font-size') || '14') || 14);
   const [logFontSize, setLogFontSize] = useState(readLogFontSize);
   useEffect(() => {
     const sync = () => setLogFontSize(readLogFontSize());
-    window.addEventListener('submarine-settings-changed', sync);
-    return () => window.removeEventListener('submarine-settings-changed', sync);
+    window.addEventListener('sshclientx-settings-changed', sync);
+    return () => window.removeEventListener('sshclientx-settings-changed', sync);
   }, []);
   // The connection effect runs once and captures `customPassword=""` in its
   // closure. Auto-reconnect attempts and the disconnect listener that
@@ -115,7 +115,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
   // ---- Dedicated SSH connections for SFTP / port-forwarding -----------------
   // Two INDEPENDENT, per-tab toggles (the controls live in the SFTP and
   // Port-Forwarding tab headers, persisted globally in localStorage under
-  // `submarine-separate-sftp` / `submarine-separate-fwd`, default OFF). When a
+  // `sshclientx-separate-sftp` / `sshclientx-separate-fwd`, default OFF). When a
   // toggle is on we open a dedicated secondary SSH connection — keyed
   // `${session.id}::sftp` / `${session.id}::fwd` — as a pure TRANSPORT: the
   // backend routes SFTP subsystems and tunnels over it when it exists, while
@@ -125,8 +125,8 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
   // rides the primary. Unexpected drops auto-retry with backoff, and each tab
   // header has a manual reconnect button for the dedicated connection.
   type SecondaryStatus = 'off' | 'connecting' | 'ready' | 'failed';
-  const [separateSftp, setSeparateSftp] = useState(localStorage.getItem('submarine-separate-sftp') === 'true');
-  const [separateFwd, setSeparateFwd] = useState(localStorage.getItem('submarine-separate-fwd') === 'true');
+  const [separateSftp, setSeparateSftp] = useState(localStorage.getItem('sshclientx-separate-sftp') === 'true');
+  const [separateFwd, setSeparateFwd] = useState(localStorage.getItem('sshclientx-separate-fwd') === 'true');
   const separateSftpRef = useRef(separateSftp);
   const separateFwdRef = useRef(separateFwd);
   useEffect(() => { separateSftpRef.current = separateSftp; }, [separateSftp]);
@@ -261,7 +261,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
     // toggle-off could read a stale "on" and auto-retry the connection the
     // user just closed.
     separateSftpRef.current = on;
-    localStorage.setItem('submarine-separate-sftp', String(on));
+    localStorage.setItem('sshclientx-separate-sftp', String(on));
     sftpRetryRef.current = 0;
     if (statusRef.current !== 'connected') return;
     if (on) {
@@ -277,7 +277,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
     setSeparateFwd(on);
     // Sync ref update — same stale-ref race as toggleSeparateSftp.
     separateFwdRef.current = on;
-    localStorage.setItem('submarine-separate-fwd', String(on));
+    localStorage.setItem('sshclientx-separate-fwd', String(on));
     fwdRetryRef.current = 0;
     if (statusRef.current !== 'connected') return;
     if (on) {
@@ -373,7 +373,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
   // First-time default is a quarter of the current window width — looks right
   // across both narrow and wide monitors without us picking a magic pixel.
   const [toolPanelWidth, setToolPanelWidth] = useState<number>(() => {
-    const saved = parseInt(localStorage.getItem('submarine-tool-panel-width') || '', 10);
+    const saved = parseInt(localStorage.getItem('sshclientx-tool-panel-width') || '', 10);
     if (Number.isFinite(saved) && saved >= 240) return saved;
     const quarter = Math.round((window.innerWidth || 1440) / 4);
     return Math.max(240, Math.min(900, quarter));
@@ -760,7 +760,7 @@ const SessionViewImpl = ({ session, onClose, addLog, onStatusChange, chromeless 
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
-      try { localStorage.setItem("submarine-tool-panel-width", String(toolWidthRef.current)); }
+      try { localStorage.setItem("sshclientx-tool-panel-width", String(toolWidthRef.current)); }
       catch { /* ignore */ }
     };
 

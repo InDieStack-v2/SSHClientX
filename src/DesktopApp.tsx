@@ -223,15 +223,15 @@ function DesktopApp() {
 
   const [newNode, setNewNode] = useState(defaultNode);
   const [appSettings, setAppSettings] = useState({
-    primaryColor: localStorage.getItem('submarine-primary-color') || '#60a5fa',
-    backgroundColor: localStorage.getItem('submarine-bg-color') || '#0a0a0c',
-    terminalFontSize: parseInt(localStorage.getItem('submarine-terminal-font-size') || '14'),
+    primaryColor: localStorage.getItem('sshclientx-primary-color') || '#60a5fa',
+    backgroundColor: localStorage.getItem('sshclientx-bg-color') || '#0a0a0c',
+    terminalFontSize: parseInt(localStorage.getItem('sshclientx-terminal-font-size') || '14'),
     // Auto-sync defaults ON. Per-device (localStorage), like the other prefs.
-    autoSync: localStorage.getItem('submarine-auto-sync') !== 'off',
+    autoSync: localStorage.getItem('sshclientx-auto-sync') !== 'off',
     // Background pull cadence in minutes (min 1). Only gates the periodic
     // "pull collaborators' changes" timer — your own edits still push ~6s after
     // you stop typing regardless of this.
-    syncIntervalMin: Math.max(1, parseInt(localStorage.getItem('submarine-sync-interval-min') || '5', 10) || 5),
+    syncIntervalMin: Math.max(1, parseInt(localStorage.getItem('sshclientx-sync-interval-min') || '5', 10) || 5),
   });
 
   useEffect(() => {
@@ -239,23 +239,23 @@ function DesktopApp() {
     document.documentElement.style.setProperty('--primary', rgb);
     document.documentElement.style.setProperty('--primary-hex', appSettings.primaryColor);
     document.documentElement.style.setProperty('--background', appSettings.backgroundColor);
-    localStorage.setItem('submarine-primary-color', appSettings.primaryColor);
-    localStorage.setItem('submarine-bg-color', appSettings.backgroundColor);
-    localStorage.setItem('submarine-terminal-font-size', appSettings.terminalFontSize.toString());
-    localStorage.setItem('submarine-auto-sync', appSettings.autoSync ? 'on' : 'off');
-    localStorage.setItem('submarine-sync-interval-min', String(appSettings.syncIntervalMin));
+    localStorage.setItem('sshclientx-primary-color', appSettings.primaryColor);
+    localStorage.setItem('sshclientx-bg-color', appSettings.backgroundColor);
+    localStorage.setItem('sshclientx-terminal-font-size', appSettings.terminalFontSize.toString());
+    localStorage.setItem('sshclientx-auto-sync', appSettings.autoSync ? 'on' : 'off');
+    localStorage.setItem('sshclientx-sync-interval-min', String(appSettings.syncIntervalMin));
     // Tell already-mounted terminals to re-fit with the new font size.
     // Without this dispatch the listener in TerminalView is dead code and
     // users have to close+reopen every terminal to see a size change.
-    window.dispatchEvent(new CustomEvent('submarine-settings-changed'));
+    window.dispatchEvent(new CustomEvent('sshclientx-settings-changed'));
   }, [appSettings]);
 
   useEffect(() => {
     const init = async () => {
       try {
         // Restore window size
-        const savedW = localStorage.getItem('submarine-window-width');
-        const savedH = localStorage.getItem('submarine-window-height');
+        const savedW = localStorage.getItem('sshclientx-window-width');
+        const savedH = localStorage.getItem('sshclientx-window-height');
         if (savedW && savedH) {
           try {
             await appWindow.setSize(new LogicalSize(parseInt(savedW), parseInt(savedH)));
@@ -266,8 +266,8 @@ function DesktopApp() {
         await appWindow.onResized(async () => {
           const size = await appWindow.innerSize();
           const logical = size.toLogical(await appWindow.scaleFactor());
-          localStorage.setItem('submarine-window-width', logical.width.toString());
-          localStorage.setItem('submarine-window-height', logical.height.toString());
+          localStorage.setItem('sshclientx-window-width', logical.width.toString());
+          localStorage.setItem('sshclientx-window-height', logical.height.toString());
         });
 
         // `isMobile` is now driven by `useIsNarrow()` (live viewport hook)
@@ -604,7 +604,7 @@ function DesktopApp() {
       if (n === 0) return; // nothing to lose — let the close proceed
       event.preventDefault();
       const ok = await confirm({
-        title: "Close Submarine?",
+        title: "Close SSHClientX?",
         message: `${n} SSH session${n === 1 ? "" : "s"} ${n === 1 ? "is" : "are"} still connected. Closing now disconnects ${n === 1 ? "it" : "them all"} and aborts any in-flight transfers.`,
         okLabel: "Close anyway",
         cancelLabel: "Stay",
@@ -774,7 +774,7 @@ function DesktopApp() {
           macOS traffic lights, plus the icon and brand. */}
       <div className="hidden sm:flex items-center gap-2 pr-4 pl-[75px] md:pl-2" data-tauri-drag-region>
         <img src={logoUrl} alt="" draggable={false} className="h-6 w-auto max-w-[24px] object-contain select-none" />
-        <span className="text-[12px] font-bold text-white tracking-tight">Submarine</span>
+        <span className="text-[12px] font-bold text-white tracking-tight">SSHClientX</span>
       </div>
 
       {/* Mobile session picker — replaces the horizontal tab strip on
@@ -1567,7 +1567,7 @@ function DesktopApp() {
                         // WebView — themed useTextPrompt works everywhere.
                         const name = await textPrompt({
                           title: "Generate SSH key",
-                          message: "Give this key a name — it's just for your reference here in Submarine.",
+                          message: "Give this key a name — it's just for your reference here in SSHClientX.",
                           placeholder: "e.g. laptop-2026",
                           okLabel: "Generate",
                           validate: (v) => v.length === 0 ? "Name is required" : null,

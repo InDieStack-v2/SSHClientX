@@ -8,15 +8,15 @@
 # download step.
 #
 # If you want to build it yourself: copy the release binary into this
-# directory as `submarine`, copy submarine.desktop and icon.png in, then
+# directory as `sshclientx`, copy sshclientx.desktop and icon.png in, then
 # run `makepkg -f`.
 
-pkgname=submarine
+pkgname=sshclientx
 pkgver=0.0.0
 pkgrel=1
 pkgdesc='A modern, secure SSH/SFTP desktop client'
 arch=('x86_64')
-url='https://github.com/sinaxhpm/submarine'
+url='https://github.com/InDieStack-v2/SSHClientX'
 license=('MIT')
 # Runtime libs the Tauri release binary links against. webkit2gtk-4.1 +
 # gtk3 + libsoup3 match the same triple the AppImage/.deb depends on.
@@ -27,7 +27,7 @@ optdepends=('libayatana-appindicator: system-tray icon support')
 options=('!strip')
 
 package() {
-  install -Dm755 "$startdir/submarine"         "$pkgdir/usr/bin/submarine"
-  install -Dm644 "$startdir/submarine.desktop" "$pkgdir/usr/share/applications/submarine.desktop"
-  install -Dm644 "$startdir/icon.png"          "$pkgdir/usr/share/icons/hicolor/512x512/apps/submarine.png"
+  install -Dm755 "$startdir/sshclientx"         "$pkgdir/usr/bin/sshclientx"
+  install -Dm644 "$startdir/sshclientx.desktop" "$pkgdir/usr/share/applications/sshclientx.desktop"
+  install -Dm644 "$startdir/icon.png"          "$pkgdir/usr/share/icons/hicolor/512x512/apps/sshclientx.png"
 }
