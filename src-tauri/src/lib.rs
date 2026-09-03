@@ -8,7 +8,7 @@ use rusqlite::{ffi, Connection, DatabaseName};
 use rusqlite::serialize::OwnedData;
 use std::ptr::NonNull;
 use std::sync::Mutex as StdMutex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::fs;
 use tauri::Manager;
 use serde_json::json;
@@ -55,8 +55,9 @@ pub struct DbState {
     pub salt: StdMutex<Option<[u8; SALT_LEN]>>,
     pub db_path: StdMutex<Option<PathBuf>>,
     /// Name of the profile the user picked on the launch screen. Drives the
-    /// path of `db_path` (under `<app_data>/profiles/<name>.submarine`) and is
-    /// cleared by `close_profile` so the app returns to the picker.
+    /// path of `db_path` (under `<app_data>/profiles/<name>.sshclientx`,
+    /// or a leftover `<name>.submarine`) and is cleared by `close_profile`
+    /// so the app returns to the picker.
     pub active_profile: StdMutex<Option<String>>,
     /// This profile's Hybrid Logical Clock, shared into the SQLite `hlc_now()`
     /// custom function so every row mutation auto-stamps `updated_at`. `Some`
@@ -70,8 +71,48 @@ pub struct DbState {
 // Profile path helpers
 // ---------------------------------------------------------------------------
 
+/// Current on-disk vault extension. Legacy `.submarine` files are still
+/// opened; the next save rewrites them as `.sshclientx`.
+const VAULT_EXT: &str = "sshclientx";
+const VAULT_EXT_LEGACY: &str = "submarine";
+
+fn is_vault_extension(ext: Option<&std::ffi::OsStr>) -> bool {
+    matches!(ext.and_then(|e| e.to_str()), Some(VAULT_EXT) | Some(VAULT_EXT_LEGACY))
+}
+
+fn vault_file(dir: &Path, name: &str, ext: &str) -> PathBuf {
+    dir.join(format!("{name}.{ext}"))
+}
+
+/// Prefer an existing `.sshclientx` file, else a leftover `.submarine`,
+/// else the path a newly created profile will be written to.
+fn resolve_profile_path(dir: &Path, name: &str) -> PathBuf {
+    let modern = vault_file(dir, name, VAULT_EXT);
+    if modern.exists() {
+        return modern;
+    }
+    let legacy = vault_file(dir, name, VAULT_EXT_LEGACY);
+    if legacy.exists() {
+        return legacy;
+    }
+    modern
+}
+
+fn migrate_vault_path(path: &Path) -> PathBuf {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some(VAULT_EXT_LEGACY) => path.with_extension(VAULT_EXT),
+        _ => path.to_path_buf(),
+    }
+}
+
+fn remove_profile_files(dir: &Path, name: &str) {
+    for ext in [VAULT_EXT, VAULT_EXT_LEGACY] {
+        let _ = fs::remove_file(vault_file(dir, name, ext));
+    }
+}
+
 /// Where all profile files live. Created on first use. Each profile is an
-/// independently encrypted `.submarine` file — no shared salt, no shared key.
+/// independently encrypted vault — no shared salt, no shared key.
 pub(crate) fn profiles_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let data_dir = app.path().app_data_dir()
         .map_err(|e| format!("[SYSTEM] APP_DATA_DIR_NOT_FOUND: {}", e))?;
@@ -81,7 +122,7 @@ pub(crate) fn profiles_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 /// Compute the on-disk path for a named profile. Caller has already
 /// validated the name with `validate_profile_name`.
 pub(crate) fn profile_path(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
-    Ok(profiles_dir(app)?.join(format!("{}.submarine", name)))
+    Ok(resolve_profile_path(&profiles_dir(app)?, name))
 }
 
 /// Reject names that would let a user escape the profiles dir or collide
@@ -236,12 +277,22 @@ fn save_vault_internal(state: &DbState) -> Result<(), String> {
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] MUTEX_POISON_CONN")?;
     let key_guard = state.master_key.lock().map_err(|_| "[STATE] MUTEX_POISON_KEY")?;
     let salt_guard = state.salt.lock().map_err(|_| "[STATE] MUTEX_POISON_SALT")?;
-    let path_guard = state.db_path.lock().map_err(|_| "[STATE] MUTEX_POISON_PATH")?;
+    let mut path_guard = state.db_path.lock().map_err(|_| "[STATE] MUTEX_POISON_PATH")?;
+    let path = match &*path_guard {
+        Some(p) => p.clone(),
+        None => return Err("[STATE] MISSING_REQUIRED_RESOURCES_FOR_SAVE".into()),
+    };
 
-    if let (Some(conn), Some(key), Some(salt), Some(path)) =
-        (&*conn_guard, &*key_guard, &*salt_guard, &*path_guard)
+    if let (Some(conn), Some(key), Some(salt)) =
+        (&*conn_guard, &*key_guard, &*salt_guard)
     {
-        save_vault_blocking(conn, key, salt, path)
+        let dest = migrate_vault_path(&path);
+        save_vault_blocking(conn, key, salt, &dest)?;
+        if dest != path {
+            let _ = fs::remove_file(&path);
+            *path_guard = Some(dest);
+        }
+        Ok(())
     } else {
         Err("[STATE] MISSING_REQUIRED_RESOURCES_FOR_SAVE".into())
     }
@@ -256,7 +307,7 @@ fn save_vault_blocking(
     conn: &Connection,
     key: &Zeroizing<[u8; 32]>,
     salt: &[u8; SALT_LEN],
-    path: &std::path::Path,
+    path: &Path,
 ) -> Result<(), String> {
     let serialized = conn.serialize(DatabaseName::Main)
         .map_err(|e| format!("[DATABASE] SERIALIZE_FAILED: {}", e))?;
@@ -1842,8 +1893,8 @@ fn discard_half_built_profile(app: &tauri::AppHandle, name: &str) {
     if let Ok(mut g) = state.db_path.lock() { *g = None; }
     if let Ok(mut g) = state.hlc.lock() { *g = None; }
     if let Ok(mut g) = state.active_profile.lock() { *g = None; }
-    if let Ok(p) = profile_path(app, name) {
-        let _ = fs::remove_file(p);
+    if let Ok(dir) = profiles_dir(app) {
+        remove_profile_files(&dir, name);
     }
 }
 
@@ -2774,12 +2825,12 @@ async fn list_profiles(app_handle: tauri::AppHandle) -> Result<Vec<String>, Stri
         let entry = match entry { Ok(e) => e, Err(_) => continue };
         let path = entry.path();
         if !path.is_file() { continue; }
-        if path.extension().and_then(|e| e.to_str()) != Some("submarine") { continue; }
+        if !is_vault_extension(path.extension()) { continue; }
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             // Hide anything that wouldn't pass our name validator — likely
             // a manually-placed file or stray artefact. We don't surface it
             // because the user has no way to act on it from the UI.
-            if validate_profile_name(stem).is_ok() {
+            if validate_profile_name(stem).is_ok() && !out.iter().any(|n| n == stem) {
                 out.push(stem.to_string());
             }
         }
@@ -2982,12 +3033,20 @@ async fn close_profile(
 #[tauri::command]
 async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<(), String> {
     validate_profile_name(&name)?;
-    let path = profile_path(&app_handle, &name)?;
-    if path.exists() {
-        fs::remove_file(&path)
-            .map_err(|e| format!("[FILE] DELETE_PROFILE_FAILED at {:?}: {}", path, e))?;
+    let dir = profiles_dir(&app_handle)?;
+    let mut last_err = None;
+    for ext in [VAULT_EXT, VAULT_EXT_LEGACY] {
+        let path = vault_file(&dir, &name, ext);
+        if path.exists() {
+            if let Err(e) = fs::remove_file(&path) {
+                last_err = Some(format!("[FILE] DELETE_PROFILE_FAILED at {:?}: {}", path, e));
+            }
+        }
     }
-    Ok(())
+    match last_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Copy a profile's encrypted file to a user-chosen location so it can be
@@ -3020,11 +3079,11 @@ async fn export_profile(
         // rfd's blocking dialog must not run on the main thread on macOS — we're
         // already off the UI thread in a tauri async command so a direct call is
         // fine. spawn_blocking would be needed if this was wrapped differently.
-        let default_name = format!("{}.submarine", name);
+        let default_name = format!("{}.{VAULT_EXT}", name);
         let chosen = rfd::FileDialog::new()
             .set_title("Export profile")
             .set_file_name(&default_name)
-            .add_filter("SSHClientX profile", &["submarine"])
+            .add_filter("SSHClientX profile", &[VAULT_EXT, VAULT_EXT_LEGACY])
             .save_file();
 
         let dst = match chosen {
@@ -3055,7 +3114,7 @@ async fn import_profile_pick() -> Result<Option<(String, String)>, String> {
     {
         let picked = rfd::FileDialog::new()
             .set_title("Import profile")
-            .add_filter("SSHClientX profile", &["submarine"])
+            .add_filter("SSHClientX profile", &[VAULT_EXT, VAULT_EXT_LEGACY])
             .pick_file();
 
         let path = match picked {
@@ -10572,5 +10631,28 @@ mod tests {
         ] {
             assert!(is_safe_dir_entry_name(ok), "should accept {:?}", ok);
         }
+    }
+
+    #[test]
+    fn resolve_profile_path_prefers_modern_over_legacy() {
+        let dir = std::env::temp_dir().join(format!(
+            "sshclientx-vault-ext-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let modern = dir.join("p.sshclientx");
+        let legacy = dir.join("p.submarine");
+        assert_eq!(resolve_profile_path(&dir, "p"), modern);
+        fs::write(&legacy, b"old").unwrap();
+        assert_eq!(resolve_profile_path(&dir, "p"), legacy);
+        fs::write(&modern, b"new").unwrap();
+        assert_eq!(resolve_profile_path(&dir, "p"), modern);
+        assert_eq!(migrate_vault_path(&legacy), modern);
+        assert_eq!(migrate_vault_path(&modern), modern);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

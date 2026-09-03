@@ -1,7 +1,7 @@
 //! Cloud sync client. Talks to the SSHClientX HTTP API for email-based
 //! account auth and encrypted-profile sync. The server never sees the
 //! per-profile encryption keys — we only ship the already-encrypted
-//! `.submarine` blobs (the same files `export_profile` produces locally).
+//! `.sshclientx` (or leftover `.submarine`) blobs (the same files `export_profile` produces locally).
 //!
 //! The contract this module targets is documented in PHASE 2 PLAN. Keep
 //! request / response shapes here as the single source of truth for the

@@ -1,14 +1,12 @@
 <!--
 Sync Impact Report
-- Version change: 1.0.0 → 1.0.1
-- Modified principles: none (product identity only)
+- Version change: 1.0.1 → 1.0.2
+- Modified principles: none
 - Added sections: none
 - Removed sections: none
 - Follow-up TODOs: none
-- Notes: product/crate/bundle renamed Submarine → SSHClientX.
-  Vault magic OMNV, `.submarine` profile extension, remote
-  `.submarine-trash` / `.submarine-tmp`, HKDF info, and backfill
-  domain strings are unchanged so existing profiles still open.
+- Notes: on-disk vault extension is `.sshclientx`; leftover
+  `.submarine` files are still opened. Magic OMNV unchanged.
 -->
 
 # SSHClientX Constitution
@@ -133,7 +131,8 @@ Unused plugins widen the XSS blast radius (Principle II).
 - Cloud API origin is the documented sync host (`CLOUD_API_BASE`).
   CSP `connect-src` and the client base URL MUST stay in lockstep.
   Bundle identifier is `com.sshclientx.app`. On-disk profile files
-  keep the `.submarine` extension and `OMNV` magic.
+  use the `.sshclientx` extension (legacy `.submarine` still readable)
+  and `OMNV` magic.
 - License is MIT for code. The SSHClientX name and logo are project
   marks and MUST NOT be treated as transferred by the MIT license.
 - Outbound network beyond the user's SSH targets is opt-in cloud sync
@@ -193,4 +192,4 @@ Compliance:
 - Runtime development follows this file; do not fork a parallel
   "guidance" document that can silently diverge.
 
-**Version**: 1.0.1 | **Ratified**: 2026-09-03 | **Last Amended**: 2026-09-03
+**Version**: 1.0.2 | **Ratified**: 2026-09-03 | **Last Amended**: 2026-09-03

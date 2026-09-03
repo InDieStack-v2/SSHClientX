@@ -458,7 +458,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
                 <button
                   onClick={startImport}
                   disabled={busy}
-                  title="Import an exported .submarine file"
+                  title="Import an exported .sshclientx or .submarine file"
                   className="flex-1 h-9 rounded-lg bg-white/[0.02] border border-white/5 hover:bg-white/5 hover:border-white/10 text-zinc-400 hover:text-zinc-100 text-[12px] font-medium transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
                 >
                   <Upload size={12} /> Import
@@ -573,7 +573,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
                 <button
                   onClick={startImport}
                   disabled={busy}
-                  title="Import an exported .submarine file"
+                  title="Import an exported .sshclientx or .submarine file"
                   className="flex-1 h-9 rounded-lg bg-white/[0.02] border border-white/5 hover:bg-white/5 hover:border-white/10 text-zinc-400 hover:text-zinc-100 text-[12px] font-medium transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
                 >
                   <Upload size={12} /> Import
