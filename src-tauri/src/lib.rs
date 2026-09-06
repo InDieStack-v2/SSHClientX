@@ -1516,8 +1516,51 @@ fn validate_ssh_private_key(private_key: &str) -> Result<(), String> {
     Err("[SSH] UNRECOGNIZED_KEY_FORMAT: Expected an OpenSSH-format private key (begins with -----BEGIN OPENSSH PRIVATE KEY-----) or RSA PEM.".into())
 }
 
+/// Open a native file picker for an SSH private key (e.g. `~/.ssh/id_ed25519`)
+/// so the "New SSH key" panel can be filled in without the user copy-pasting
+/// from a terminal. OpenSSH always writes the matching public key as the same
+/// filename with `.pub` appended, so we opportunistically read that too.
+///
+/// Returns `(private_key, public_key, suggested_name)`, or `None` if the user
+/// cancels the dialog.
 #[tauri::command]
-async fn add_ssh_key(state: tauri::State<'_, DbState>, name: String, public_key: String, private_key: String, passphrase: Option<String>) -> Result<(), String> {
+async fn pick_ssh_key_file() -> Result<Option<(String, Option<String>, String)>, String> {
+    #[cfg(target_os = "android")]
+    {
+        Err("Picking a key file is not available on Android — paste the key contents instead.".into())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let picked = rfd::FileDialog::new()
+            .set_title("Select SSH private key")
+            .pick_file();
+
+        let path = match picked {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        let private_key = fs::read_to_string(&path)
+            .map_err(|e| format!("[FILE] KEY_READ_FAILED: {}", e))?;
+
+        let mut pub_os = path.clone().into_os_string();
+        pub_os.push(".pub");
+        let public_key = fs::read_to_string(PathBuf::from(pub_os))
+            .ok()
+            .map(|s| s.trim().to_string());
+
+        let suggested = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "imported-key".to_string());
+
+        Ok(Some((private_key, public_key, suggested)))
+    }
+}
+
+#[tauri::command]
+async fn add_ssh_key(state: tauri::State<'_, DbState>, name: String, public_key: String, private_key: String, passphrase: Option<String>) -> Result<i32, String> {
     validate_ssh_private_key(&private_key)?;
 
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED")?;
@@ -1525,10 +1568,11 @@ async fn add_ssh_key(state: tauri::State<'_, DbState>, name: String, public_key:
 
     conn.execute("INSERT INTO ssh_keys (name, public_key, private_key, passphrase) VALUES (?1, ?2, ?3, ?4)", rusqlite::params![name, public_key, private_key, passphrase])
         .map_err(|e| format!("[DATABASE] KEY_INSERT_FAILED: {}", e))?;
+    let id = conn.last_insert_rowid() as i32;
 
     drop(conn_guard);
     save_vault_internal(&state)?;
-    Ok(())
+    Ok(id)
 }
 
 #[tauri::command]
@@ -7126,9 +7170,10 @@ struct ImportedHost {
     /// Resolved `User`. Empty string when unset — the frontend can fall
     /// back to whatever it uses elsewhere.
     user: String,
-    /// Resolved `IdentityFile`. Purely informational for now — the import
-    /// flow doesn't auto-attach keys because we'd need to also read and
-    /// register them in the vault, which is a separate feature.
+    /// Resolved `IdentityFile`. The import flow best-effort reads this via
+    /// `read_identity_file` and registers it as a vault key; shown to the
+    /// user either way since a permission error or missing file just falls
+    /// back to an unconfigured (password) row.
     identity_file: Option<String>,
     /// Resolved `ProxyJump`. Informational only; live proxy config still
     /// happens in the Server details panel.
@@ -7282,6 +7327,47 @@ fn parse_ssh_config(path: Option<String>) -> Result<Vec<ImportedHost>, String> {
         }
 
         Ok(out)
+    }
+}
+
+/// Best-effort read of an `IdentityFile` path resolved from `~/.ssh/config`
+/// (as returned by `parse_ssh_config`) so the import flow can register it as
+/// a vault key instead of leaving the imported server with no auth
+/// configured. Only expands a leading `~/` — OpenSSH's other tokens (`%d`,
+/// `%h`, ...) are out of scope, matching `parse_ssh_config`'s own limits.
+///
+/// Returns `Ok(None)` — never `Err` — whenever the file can't be used (missing,
+/// unreadable, no home dir), since a single bad path shouldn't fail the whole
+/// import batch; the caller just falls back to an unconfigured row.
+#[tauri::command]
+fn read_identity_file(path: String) -> Result<Option<(String, Option<String>)>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = path;
+        Ok(None)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let expanded = match path.strip_prefix("~/") {
+            Some(rest) => match directories::UserDirs::new() {
+                Some(u) => u.home_dir().join(rest),
+                None => return Ok(None),
+            },
+            None => PathBuf::from(&path),
+        };
+
+        let private_key = match fs::read_to_string(&expanded) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+
+        let mut pub_os = expanded.clone().into_os_string();
+        pub_os.push(".pub");
+        let public_key = fs::read_to_string(PathBuf::from(pub_os))
+            .ok()
+            .map(|s| s.trim().to_string());
+
+        Ok(Some((private_key, public_key)))
     }
 }
 
@@ -8346,7 +8432,7 @@ pub fn run() {
             add_note, edit_note, delete_note, get_notes,
             mirror_dry_run, start_mirror, stop_mirror, list_mirrors, pick_local_directory,
             add_credential, edit_credential, delete_credential,
-            add_ssh_key, edit_ssh_key, delete_ssh_key,
+            add_ssh_key, edit_ssh_key, delete_ssh_key, pick_ssh_key_file,
             initiate_connection, verify_fingerprint_response, submit_kbi_response, disconnect_session,
             start_tunnel, stop_tunnel, list_tunnels, restart_session_tunnels, persist_session_tunnels,
             open_terminal, write_terminal_data, resize_terminal, close_terminal,
@@ -8372,7 +8458,7 @@ pub fn run() {
             select_local_folder, local_list_dir,
             local_home_dir, local_desktop_dir, local_create_dir, local_remove, local_rename,
             android_quick_dirs, android_default_local_dir,
-            parse_ssh_config,
+            parse_ssh_config, read_identity_file,
             parse_client_import,
             sftp_list_dir, sftp_create_dir, sftp_remove_file, sftp_remove_dir,
             sftp_rename, sftp_set_permissions, sftp_set_owner,

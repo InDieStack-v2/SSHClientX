@@ -33,9 +33,33 @@ type ImportedHost = {
   proxy_jump: string | null;
 };
 
-const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, sshKeys, folders, refreshFolders, refreshServers, servers, isEditMode, formError, isMobile }: any) => {
+const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credentials, sshKeys, folders, refreshFolders, refreshServers, refreshSshKeys, servers, isEditMode, formError, isMobile }: any) => {
   const [isCreatingFolder, setIsCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
+  const [keyImportError, setKeyImportError] = useState<string | null>(null);
+
+  // "Browse a key file…" in the custom_key branch: picks a private key off
+  // disk, registers it as a new vault key (named after the file), and
+  // selects it — so the user doesn't have to leave Add Server, go to
+  // Settings → SSH keys, and paste the file contents in by hand.
+  const browseAndAddKey = async () => {
+    setKeyImportError(null);
+    try {
+      const picked = await invoke<[string, string | null, string] | null>("pick_ssh_key_file");
+      if (!picked) return;
+      const [privateKey, publicKey, suggestedName] = picked;
+      const keyId = await invoke<number>("add_ssh_key", {
+        name: suggestedName,
+        publicKey: publicKey || "",
+        privateKey,
+        passphrase: null,
+      });
+      if (refreshSshKeys) await refreshSshKeys();
+      setNewNode({ ...newNode, keyId: keyId.toString() });
+    } catch (e: any) {
+      setKeyImportError(typeof e === "string" ? e : (e?.message || String(e)));
+    }
+  };
 
   // SSH-config import modal state. Lives here so it's colocated with the
   // "Add server" flow — the button that triggers it sits in this panel's
@@ -143,11 +167,12 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     });
   };
 
-  // Fire one `add_server` per selected host. We use auth_type "custom_pass"
-  // with empty password so the row is valid but non-connecting until the
-  // user edits it — matches the spec that key/password stay unset. Errors
-  // per-host are surfaced but don't abort the batch; the modal shows how
-  // many landed and how many failed.
+  // Fire one `add_server` per selected host. When the config entry named an
+  // `IdentityFile` we can read, register it as a vault key and import the
+  // row as auth_type "custom_key"; otherwise fall back to "custom_pass" with
+  // an empty password so the row is still valid but non-connecting until the
+  // user edits it. Errors per-host are surfaced but don't abort the batch;
+  // the modal shows how many landed and how many failed.
   const importSelectedHosts = async () => {
     if (importSelected.size === 0 || importBusy) return;
     setImportBusy(true);
@@ -155,8 +180,52 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     let ok = 0;
     let failed = 0;
     let lastErr: string | null = null;
+    // Re-running the import shouldn't pile up a fresh key per run for the
+    // same host — reuse (and refresh the contents of) the key it created
+    // last time, keyed by name. Seeded from the current sshKeys list and
+    // updated as we go so a batch with repeated aliases doesn't double up
+    // within itself either.
+    const keyIdByName = new Map<string, number>(
+      (sshKeys || []).map((k: any) => [k.name, k.id])
+    );
     for (const host of importHosts) {
       if (!importSelected.has(host.host_alias)) continue;
+
+      let authType = "custom_pass";
+      let keyId: number | null = null;
+      if (host.identity_file) {
+        try {
+          const identity = await invoke<[string, string | null] | null>("read_identity_file", { path: host.identity_file });
+          if (identity) {
+            const [privateKey, publicKey] = identity;
+            const keyName = `${host.host_alias} (ssh config)`;
+            const existingId = keyIdByName.get(keyName);
+            if (existingId != null) {
+              await invoke("edit_ssh_key", {
+                id: existingId,
+                name: keyName,
+                publicKey: publicKey || "",
+                privateKey,
+                passphrase: null,
+              });
+              keyId = existingId;
+            } else {
+              keyId = await invoke<number>("add_ssh_key", {
+                name: keyName,
+                publicKey: publicKey || "",
+                privateKey,
+                passphrase: null,
+              });
+              keyIdByName.set(keyName, keyId);
+            }
+            authType = "custom_key";
+          }
+        } catch {
+          // Unreadable/unsupported key file — import the row anyway with no
+          // auth configured rather than failing the whole host.
+        }
+      }
+
       try {
         await invoke<number>("add_server", {
           name: host.host_alias,
@@ -170,8 +239,8 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
           proxyHost: "",
           proxyPort: 1080,
           tunnels: [],
-          authType: "custom_pass",
-          keyId: null,
+          authType,
+          keyId,
           autostart: false,
           mirrors: [],
           color: null,
@@ -182,6 +251,9 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
         lastErr = typeof e === "string" ? e : (e?.message || String(e));
       }
     }
+    if (refreshSshKeys && ok > 0) {
+      try { await refreshSshKeys(); } catch { /* refresh failure isn't fatal */ }
+    }
     setImportBusy(false);
     if (failed > 0) {
       setImportError(`${ok} imported, ${failed} failed${lastErr ? `: ${lastErr}` : ""}`);
@@ -191,6 +263,10 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
     }
     if (failed === 0) {
       closeImportModal();
+      // The imported hosts already landed as their own server rows — the
+      // "Add server" drawer underneath was just staging an unrelated blank
+      // form, so close it too instead of leaving it open behind the modal.
+      onClose();
     }
   };
 
@@ -381,11 +457,19 @@ const AddNodePanel = ({ isOpen, onClose, newNode, setNewNode, onSave, credential
                   <input type="text" placeholder="root" value={newNode.username || ""} onChange={e => setNewNode({ ...newNode, username: e.target.value })} className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-white border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" />
                 </div>
                 <div className="space-y-1.5">
-                  <label className="text-[11px] font-bold text-zinc-400 ml-1">SSH key</label>
+                  <div className="flex justify-between items-center ml-1">
+                    <label className="text-[11px] font-bold text-zinc-400">SSH key</label>
+                    <button type="button" onClick={browseAndAddKey} className="text-[11px] font-bold text-primary hover:text-primary/80 transition-colors">
+                      Browse a key file…
+                    </button>
+                  </div>
                   <select className="w-full h-9 bg-[#1a1a1e] rounded-lg px-3 text-[12px] text-zinc-300 border border-white/10 outline-none focus:border-primary/50 transition-all shadow-inner" value={newNode.keyId} onChange={e => setNewNode({ ...newNode, keyId: e.target.value })}>
                     <option value="" className="bg-[#1a1a1e] text-zinc-500">-- Pick a key --</option>
                     {sshKeys?.map((k: any) => <option key={k.id} value={k.id.toString()} className="bg-[#1a1a1e] text-zinc-300">{k.name}</option>)}
                   </select>
+                  {keyImportError && (
+                    <div className="text-[11px] font-mono text-red-400 break-words">{keyImportError}</div>
+                  )}
                 </div>
               </div>
             )}

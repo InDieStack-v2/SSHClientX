@@ -2234,7 +2234,7 @@ function DesktopApp() {
         }}
         formError={formError}
         credentials={credentials} sshKeys={sshKeys} folders={folders} refreshFolders={refreshFolders}
-        refreshServers={refreshServers}
+        refreshServers={refreshServers} refreshSshKeys={refreshSshKeys}
         servers={servers}
         isMobile={isMobile}
       />
@@ -2468,7 +2468,30 @@ function DesktopApp() {
               <textarea className="w-full h-24 bg-black rounded-lg p-3 text-[13px] text-zinc-400 font-mono border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner custom-scrollbar resize-none" placeholder="ssh-ed25519 ..." value={editKeyData.public_key} onChange={e => setEditKeyData({ ...editKeyData, public_key: e.target.value })} />
             </div>
             <div className="space-y-1.5">
-              <label className="text-[12px] font-bold text-zinc-400 ml-1">Private key</label>
+              <div className="flex justify-between items-center ml-1">
+                <label className="text-[12px] font-bold text-zinc-400">Private key</label>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      const picked = await invoke<[string, string | null, string] | null>("pick_ssh_key_file");
+                      if (!picked) return;
+                      const [privateKey, publicKey, suggestedName] = picked;
+                      setEditKeyData((prev: any) => ({
+                        ...prev,
+                        private_key: privateKey,
+                        public_key: publicKey || prev.public_key,
+                        name: prev.name || suggestedName,
+                      }));
+                    } catch (e) {
+                      addLog(`KEY_FILE_PICK_ERROR: ${e}`, "error");
+                    }
+                  }}
+                  className="text-[11px] font-bold text-primary hover:text-primary/80 transition-colors"
+                >
+                  Browse…
+                </button>
+              </div>
               <textarea className="w-full h-32 bg-black rounded-lg p-3 text-[13px] text-zinc-400 font-mono border border-white/10 outline-none focus:border-primary/50 focus:bg-zinc-900/50 transition-all shadow-inner custom-scrollbar resize-none" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" value={editKeyData.private_key} onChange={e => setEditKeyData({ ...editKeyData, private_key: e.target.value })} />
             </div>
             <div className="space-y-1.5">
