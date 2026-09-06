@@ -1,10 +1,9 @@
 use russh::client;
-use russh_keys::key::PublicKey;
+use russh::keys::{HashAlg, PublicKeyOrCertificate};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, oneshot, Mutex};
-use async_trait::async_trait;
 
 /// Per-terminal command. We deliberately split data from resize at the
 /// channel level: keystrokes flow through `Data` on an mpsc, while resizes
@@ -144,13 +143,19 @@ pub struct ClientHandler {
     pub fp_outcome: std::sync::Arc<std::sync::atomic::AtomicI8>,
 }
 
-#[async_trait]
 impl client::Handler for ClientHandler {
     type Error = russh::Error;
 
-    async fn check_server_key(mut self, server_public_key: &PublicKey) -> Result<(Self, bool), Self::Error> {
-        let fingerprint = server_public_key.fingerprint();
-        let key_type = server_public_key.name();
+    async fn check_server_key(&mut self, server_public_key: &PublicKeyOrCertificate) -> Result<bool, Self::Error> {
+        // `.public_key()` extracts the underlying key whether the server sent
+        // a bare key or a certificate — untested-in-the-wild for the cert
+        // case (this app has never handled host certificates), but it keeps
+        // existing TOFU logic working for both.
+        let public_key = server_public_key.public_key();
+        // Explicit SHA-256, matching OpenSSH's default and what every prior
+        // fingerprint already stored in `known_hosts` was computed with.
+        let fingerprint = public_key.fingerprint(HashAlg::Sha256);
+        let key_type = public_key.algorithm().to_string();
         let fp_str = fingerprint.to_string();
 
         let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
@@ -222,7 +227,7 @@ impl client::Handler for ClientHandler {
                 "msg": "Host-key DB lock is poisoned — refusing connection. Restart the app.",
                 "type": "error"
             }));
-            return Ok((self, false));
+            return Ok(false);
         }
 
         if is_known {
@@ -234,7 +239,7 @@ impl client::Handler for ClientHandler {
             // driver knows host-key wasn't the failure mode for any
             // downstream error.
             self.fp_outcome.store(1, std::sync::atomic::Ordering::SeqCst);
-            return Ok((self, true));
+            return Ok(true);
         }
 
         if mismatch {
@@ -315,7 +320,7 @@ impl client::Handler for ClientHandler {
                         "type": "success"
                     }));
                     self.fp_outcome.store(1, std::sync::atomic::Ordering::SeqCst);
-                    Ok((self, true))
+                    Ok(true)
                 }
                 Ok(Ok(false)) => {
                     let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
@@ -324,7 +329,7 @@ impl client::Handler for ClientHandler {
                     }));
                     let _ = self.app.emit(&format!("fingerprint-prompt-dismiss-{}", self.session_id), serde_json::json!({}));
                     self.fp_outcome.store(0, std::sync::atomic::Ordering::SeqCst);
-                    Ok((self, false))
+                    Ok(false)
                 }
                 Err(_) => {
                     let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
@@ -333,7 +338,7 @@ impl client::Handler for ClientHandler {
                     }));
                     let _ = self.app.emit(&format!("fingerprint-prompt-dismiss-{}", self.session_id), serde_json::json!({}));
                     self.fp_outcome.store(2, std::sync::atomic::Ordering::SeqCst);
-                    Ok((self, false))
+                    Ok(false)
                 }
                 _ => {
                     let _ = self.app.emit(&format!("session-log-{}", self.session_id), serde_json::json!({
@@ -342,11 +347,11 @@ impl client::Handler for ClientHandler {
                     }));
                     let _ = self.app.emit(&format!("fingerprint-prompt-dismiss-{}", self.session_id), serde_json::json!({}));
                     self.fp_outcome.store(0, std::sync::atomic::Ordering::SeqCst);
-                    Ok((self, false))
+                    Ok(false)
                 }
             }
         } else {
-            Ok((self, false))
+            Ok(false)
         }
     }
 
@@ -355,17 +360,23 @@ impl client::Handler for ClientHandler {
     /// outside connection on `connected_port`; we just need to bridge that
     /// channel to a local TCP socket pointed at the user's chosen target.
     async fn server_channel_open_forwarded_tcpip(
-        self,
+        &mut self,
         channel: russh::Channel<client::Msg>,
         _connected_address: &str,
         connected_port: u32,
         _originator_address: &str,
         _originator_port: u32,
-        session: client::Session,
-    ) -> Result<(Self, client::Session), Self::Error> {
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
         let entry = self.forwarded_targets.lock().await.get(&connected_port).cloned();
         match entry {
             Some(entry) => {
+                // Must accept explicitly (russh >=0.62) — the channel is
+                // rejected at the protocol level if `reply` is dropped
+                // without this, even though our bridging code below still
+                // runs against the (now-closed) local channel handle.
+                reply.accept().await;
                 // Spawn the bridge so we don't hold up russh's protocol task.
                 // `bridge_forwarded_channel` does the local connect and
                 // tokio::io::copy_bidirectional dance, plus bumps the
@@ -375,11 +386,14 @@ impl client::Handler for ClientHandler {
                 });
             }
             None => {
-                // No tunnel registered for this port — let the channel drop,
-                // which closes it on the server's side.
+                // No tunnel registered for this port — reject explicitly
+                // instead of relying on drop-implies-reject, so the reason
+                // sent to the server is meaningful rather than the generic
+                // AdministrativelyProhibited a bare drop would send.
+                reply.reject(russh::ChannelOpenFailure::ConnectFailed).await;
             }
         }
-        Ok((self, session))
+        Ok(())
     }
 }
 

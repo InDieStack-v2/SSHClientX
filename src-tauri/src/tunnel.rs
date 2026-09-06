@@ -903,14 +903,18 @@ async fn run_remote_forward(
 
     // Ask the server to start listening.
     let request = {
-        let mut h = handle.lock().await;
+        // russh >=0.58 moved tcpip_forward/cancel_tcpip_forward to &self.
+        let h = handle.lock().await;
         h.tcpip_forward(&bind_addr, server_port).await
     };
     match request {
-        Ok(true) => {
+        // russh >=0.58 returns the bound port (useful for port 0 = "let the
+        // server choose") instead of a bare bool; a refusal is now its own
+        // error variant rather than an `Ok(false)`.
+        Ok(_bound_port) => {
             set_state(&app, &status, "listening", None).await;
         }
-        Ok(false) => {
+        Err(russh::Error::RequestDenied) => {
             forwarded_targets.lock().await.remove(&server_port);
             return Err(format!(
                 "Server refused tcpip-forward on {}:{} — check sshd_config's `AllowTcpForwarding` / `GatewayPorts`",

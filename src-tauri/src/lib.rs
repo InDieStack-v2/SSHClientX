@@ -318,6 +318,15 @@ fn save_vault_blocking(
         use std::io::Write as _;
         let mut f = fs::File::create(&tmp_path)
             .map_err(|e| format!("[FILE] VAULT_TMP_CREATE_FAILED at {:?}: {}", tmp_path, e))?;
+        // The vault holds every saved private key/password; restrict it to the
+        // owner before writing any bytes so it's never briefly world/group
+        // readable via the process umask (matches app_temp_root's 0700 rationale).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("[FILE] VAULT_TMP_CHMOD_FAILED at {:?}: {}", tmp_path, e))?;
+        }
         f.write_all(&blob)
             .map_err(|e| format!("[FILE] VAULT_TMP_WRITE_FAILED at {:?}: {}", tmp_path, e))?;
         f.sync_all()
@@ -1312,6 +1321,12 @@ async fn setup_master_db_inner(
     }
 
     conn.execute("PRAGMA foreign_keys = ON", []).map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
+    // Deleted rows (e.g. a removed SSH key/credential/server) hold plaintext
+    // secrets until overwritten; without this, SQLite just marks their page
+    // free and the old private_key/passphrase/password bytes can still be
+    // sitting in the next `conn.serialize()` snapshot that gets encrypted to
+    // disk. secure_delete makes DELETE/UPDATE zero the vacated bytes instead.
+    conn.execute("PRAGMA secure_delete = ON", []).map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
 
     // ---- Per-entity sync instrumentation (schema v6) ----
     // A per-profile Hybrid Logical Clock backs the `hlc_now()` SQL function so
@@ -2748,7 +2763,7 @@ async fn run_keyboard_interactive<H: russh::client::Handler>(
     loop {
         match resp {
             KeyboardInteractiveAuthResponse::Success => return Some(Ok(true)),
-            KeyboardInteractiveAuthResponse::Failure => {
+            KeyboardInteractiveAuthResponse::Failure { .. } => {
                 if !asked_anything {
                     // Server declined the method outright — not really offered.
                     return None;
@@ -2870,14 +2885,19 @@ fn build_ssh_client_config() -> russh::client::Config {
     // streams keep the BDP full on high-latency links.
     config.window_size = 8 * 1024 * 1024;
     config.maximum_packet_size = 65535;
-    // Widen the negotiation set to match OpenSSH — but only in builds that
-    // include the OpenSSL backend (release CI via `full-ssh-algos`). See the
-    // long rationale that used to sit inline: legacy DH groups, the full RSA
-    // host-key family, and HMAC-SHA1 MAC variants for older/embedded servers.
+    // Widen the negotiation set to match OpenSSH — legacy DH groups, the full
+    // RSA host-key family, and HMAC-SHA1 MAC variants for older/embedded
+    // servers. Used to require the `full-ssh-algos` feature because it
+    // pulled in russh's now-removed OpenSSL backend; russh >=0.50 supports
+    // all of this with pure-Rust crypto, so `full-ssh-algos` now only adds
+    // `des`/`dsa` (see the [features] block in Cargo.toml) on top of what's
+    // configured here.
     #[cfg(feature = "full-ssh-algos")]
     {
+        use std::borrow::Cow;
+        use russh::keys::{Algorithm, EcdsaCurve, HashAlg};
         config.preferred = russh::Preferred {
-            kex: &[
+            kex: Cow::Borrowed(&[
                 russh::kex::CURVE25519,
                 russh::kex::CURVE25519_PRE_RFC_8731,
                 russh::kex::DH_G14_SHA256,
@@ -2885,30 +2905,37 @@ fn build_ssh_client_config() -> russh::client::Config {
                 russh::kex::DH_G1_SHA1,
                 russh::kex::EXTENSION_SUPPORT_AS_CLIENT,
                 russh::kex::EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT,
-            ],
-            key: &[
-                russh_keys::key::ED25519,
-                russh_keys::key::ECDSA_SHA2_NISTP256,
-                russh_keys::key::RSA_SHA2_512,
-                russh_keys::key::RSA_SHA2_256,
-                russh_keys::key::SSH_RSA,
-            ],
-            cipher: &[
+            ]),
+            key: Cow::Borrowed(&[
+                Algorithm::Ed25519,
+                Algorithm::Ecdsa { curve: EcdsaCurve::NistP256 },
+                Algorithm::Rsa { hash: Some(HashAlg::Sha512) },
+                Algorithm::Rsa { hash: Some(HashAlg::Sha256) },
+                Algorithm::Rsa { hash: None }, // legacy ssh-rsa (SHA-1)
+            ]),
+            cipher: Cow::Borrowed(&[
                 russh::cipher::CHACHA20_POLY1305,
                 russh::cipher::AES_256_GCM,
                 russh::cipher::AES_256_CTR,
                 russh::cipher::AES_192_CTR,
                 russh::cipher::AES_128_CTR,
-            ],
-            mac: &[
+            ]),
+            mac: Cow::Borrowed(&[
                 russh::mac::HMAC_SHA512_ETM,
                 russh::mac::HMAC_SHA256_ETM,
                 russh::mac::HMAC_SHA512,
                 russh::mac::HMAC_SHA256,
                 russh::mac::HMAC_SHA1_ETM,
                 russh::mac::HMAC_SHA1,
-            ],
-            compression: &["zlib@openssh.com", "zlib", "none"],
+            ]),
+            compression: Cow::Borrowed(&[
+                russh::compression::ZLIB_LEGACY,
+                russh::compression::ZLIB,
+                russh::compression::NONE,
+            ]),
+            // No host-certificate support in this app's TOFU model — leave
+            // empty (russh's own default).
+            ..Default::default()
         };
     }
     config
@@ -3109,13 +3136,17 @@ async fn connect_jump_host(
     let mut auth_res = if let Some((private_key, passphrase)) = key_data {
         log("Jump host: private key authentication...", "info");
         let normalized_key = private_key.replace("\r\n", "\n");
-        match russh_keys::decode_secret_key(&normalized_key, passphrase.as_deref()) {
-            Ok(keypair) => session.authenticate_publickey(&effective_user, std::sync::Arc::new(keypair)).await,
+        match russh::keys::decode_secret_key(&normalized_key, passphrase.as_deref()) {
+            Ok(keypair) => {
+                let hash_alg = session.best_supported_rsa_hash().await.ok().flatten().flatten();
+                let key = russh::keys::PrivateKeyWithHashAlg::new(std::sync::Arc::new(keypair), hash_alg);
+                session.authenticate_publickey(&effective_user, key).await.map(|r| r.success())
+            }
             Err(e) => Err(russh::Error::from(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))),
         }
     } else if let Some(pass) = password {
         log("Jump host: password authentication...", "info");
-        session.authenticate_password(&effective_user, pass).await
+        session.authenticate_password(&effective_user, pass).await.map(|r| r.success())
     } else {
         Ok(false)
     };
@@ -3757,26 +3788,17 @@ async fn initiate_connection(
                 let mut auth_res = if let Some((private_key, passphrase)) = key_data {
                     emit_log("Attempting Private Key Authentication...", "info");
                     let normalized_key = private_key.replace("\r\n", "\n");
-                    match russh_keys::decode_secret_key(&normalized_key, passphrase.as_deref()) {
+                    match russh::keys::decode_secret_key(&normalized_key, passphrase.as_deref()) {
                         Ok(keypair) => {
-                            let key_arc = std::sync::Arc::new(keypair);
-                            session.authenticate_publickey(&effective_user, key_arc).await
+                            // russh >=0.50 supports RSA host/auth keys via the
+                            // pure-Rust `rsa` crate (a default feature) — no more
+                            // OpenSSL backend, so this now works the same in
+                            // every build, debug or release.
+                            let hash_alg = session.best_supported_rsa_hash().await.ok().flatten().flatten();
+                            let key = russh::keys::PrivateKeyWithHashAlg::new(std::sync::Arc::new(keypair), hash_alg);
+                            session.authenticate_publickey(&effective_user, key).await.map(|r| r.success())
                         }
                         Err(e) => {
-                            // RSA private keys only work in builds that include the
-                            // OpenSSL backend (release CI). Local debug builds skip
-                            // OpenSSL to stay Perl-free, so surface a targeted hint
-                            // instead of the raw "Unsupported key type rsa" string.
-                            #[cfg(not(feature = "full-ssh-algos"))]
-                            {
-                                let err_str = e.to_string();
-                                if err_str.contains("Unsupported key type rsa")
-                                    || err_str.contains("rsa")
-                                    || private_key.contains("RSA PRIVATE KEY")
-                                {
-                                    emit_log("RSA private keys aren't supported in this debug build — use Ed25519 for local testing, or grab a release build from GitHub for full RSA support.", "error");
-                                }
-                            }
                             emit_log(&format!("Failed to parse private key: {}", e), "error");
                             Err(russh::Error::from(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -3786,7 +3808,7 @@ async fn initiate_connection(
                     }
                 } else if let Some(pass) = final_pass {
                     emit_log("Attempting Password Authentication...", "info");
-                    session.authenticate_password(&effective_user, pass).await
+                    session.authenticate_password(&effective_user, pass).await.map(|r| r.success())
                 } else {
                     emit_log("Neither private key nor password auth credentials provided.", "error");
                     Ok(false)
@@ -6542,10 +6564,9 @@ impl ConnectErrorKind {
 }
 
 /// Map a russh error onto a `ConnectErrorKind`. Uses enum variants when the
-/// information is available (russh 0.40 exposes them all), falling back to
-/// a string sniff only for the catch-all `_ =>` branch — so a russh upgrade
-/// that adds new variants degrades gracefully instead of misreporting them
-/// as auth failures.
+/// information is available, falling back to a string sniff only for the
+/// catch-all `_ =>` branch — so a russh upgrade that adds new variants
+/// degrades gracefully instead of misreporting them as auth failures.
 fn classify_russh_error(e: &russh::Error) -> ConnectErrorKind {
     use russh::Error::*;
     match e {
@@ -6554,10 +6575,9 @@ fn classify_russh_error(e: &russh::Error) -> ConnectErrorKind {
         NotAuthenticated | NoAuthMethod => ConnectErrorKind::Auth,
 
         // Algorithm negotiation — server's reachable, we just don't share
-        // the cipher / KEX / etc. it asked for.
-        NoCommonCipher | NoCommonKexAlgo | NoCommonKeyAlgo
-        | NoCommonCompression | NoCommonMac
-        | UnknownAlgo | UnknownKey => ConnectErrorKind::Algorithm,
+        // the cipher / KEX / etc. it asked for. russh >=0.50 collapsed the
+        // five separate NoCommon* variants into one struct variant.
+        NoCommonAlgo { .. } | UnknownAlgo | UnknownKey => ConnectErrorKind::Algorithm,
 
         // Host-key flow: the server's signature didn't verify. KeyChanged
         // carries data so it falls through to the catch-all branch which

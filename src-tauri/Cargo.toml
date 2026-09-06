@@ -5,7 +5,10 @@ description = "SSH and SFTP client"
 authors = ["Sina Xhpm (sinaxhpm.com)"]
 license = "MIT"
 edition = "2021"
-rust-version = "1.70"
+# russh 0.63's own crate declares rust-version = "1.85" / edition = "2024";
+# our crate stays on edition 2021 (no code needs 2024), but the toolchain
+# building it must still be >=1.85 to compile that dependency.
+rust-version = "1.85"
 
 # Library + binary dual target. The Tauri Builder, command registry, and
 # state setup live in `src/lib.rs::run()`. The bin entry point (`src/main.rs`)
@@ -43,21 +46,17 @@ opt-level = 3
 opt-level = 3
 
 [features]
-# Default build is OpenSSL-free so it compiles on any machine without Perl /
-# system libcrypto. The trade-off is reduced SSH compatibility: russh's
-# default only negotiates Ed25519 / ECDSA-P256 host keys + modern KEX /
-# MAC algorithms, so older Linux servers and most shared hosts still using
-# RSA host keys won't connect ("No common key algorithm").
+# russh >=0.50 dropped OpenSSL entirely — RSA host-key support (`rsa` feature)
+# is pure-Rust (RustCrypto's `rsa`/`pkcs1` crates) and is one of russh's own
+# default features, so a plain default build now already negotiates RSA host
+# keys with no Perl/C-compiler requirement. `full-ssh-algos` used to exist to
+# pull in russh's (now-removed) openssl backend for that; it's kept as a
+# feature name only so the release workflow's `--features full-ssh-algos`
+# invocation keeps working, and now just adds the two remaining
+# danger-flagged legacy algorithms (3DES, DSA) that russh still keeps off by
+# default for being weak, not for needing OpenSSL.
 default = []
-# Turned on by the release workflow (tauri-action `args: ... --features
-# full-ssh-algos`) so the shipped binaries can talk to essentially any SSH
-# server in production: full RSA host-key family, legacy DH groups, the
-# older HMAC-SHA1 family. Pulls in russh's openssl backend plus a vendored
-# (statically-linked, built-from-source) libcrypto so the resulting binary
-# has no runtime libssl dependency. Cost is a one-time perl + C compiler
-# requirement on the build host, which is why we don't make it default —
-# developers debugging locally shouldn't need to install Perl.
-full-ssh-algos = ["russh/openssl", "russh-keys/openssl", "dep:openssl-sys"]
+full-ssh-algos = ["russh/des", "russh/dsa"]
 
 [dependencies]
 tauri = { version = "2.1", features = [] }
@@ -87,17 +86,14 @@ aes-gcm = "0.10"
 rand = "0.8"
 rand_core = { version = "0.6", features = ["getrandom"] }
 directories = "5.0"
-# OpenSSL-backed features (RSA host keys, legacy KEX, full MAC suite) are
-# gated behind the `full-ssh-algos` feature so the default `cargo build`
-# stays Perl-free for local debugging. See the [features] block above.
-russh = "0.40.2"
-russh-keys = "0.40.1"
-openssl-sys = { version = "0.9", features = ["vendored"], optional = true }
+# russh-keys was merged into russh's own `russh::keys` module at 0.50 and no
+# longer exists as a separate crate. See the [features] block above for why
+# there's no more OpenSSL dependency here.
+russh = "0.63"
 ssh-key = { version = "0.6", features = ["alloc", "encryption", "getrandom", "ed25519", "rsa"] }
 tokio-socks = "0.5"
 async-http-proxy = { version = "1.2", features = ["runtime-tokio"] }
-async-trait = "0.1.89"
-russh-sftp = "2.1.2"
+russh-sftp = "2.4"
 notify = "6.1.1"
 # Debounces filesystem events so we don't try to upload a file mid-write.
 # Mirror watcher uses this — events for the same path within 500ms collapse
