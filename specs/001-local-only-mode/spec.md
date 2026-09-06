@@ -144,9 +144,14 @@ multi-device sync, or inviting/sharing with another account.
   to any account/sync backend and is unaffected by this feature). No
   background or startup network calls to any account/sync backend are
   permitted.
-- **FR-005**: The application MUST remove multi-device cloud
-  synchronization and cross-account profile-sharing/invite
-  functionality (and any UI for it).
+- **FR-005**: The application MUST remove the proprietary backend's
+  cloud synchronization and cross-account profile-sharing/invite
+  functionality (and any UI built against that backend). This bars any
+  sync/sharing mechanism that depends on a company-run account or
+  sync server; it does not preclude a possible future backend-free
+  mechanism (e.g. direct device-to-device pairing over the user's own
+  cloud storage, with no account and no server ever seeing key
+  material) — that would be a separate feature, out of scope here.
 - **FR-006**: All previously-supported local functionality (SSH/SFTP
   connections, port forwarding/tunnels, terminal, credential and key
   storage, folder mirroring, notes, command snippets) MUST continue to
@@ -225,10 +230,13 @@ multi-device sync, or inviting/sharing with another account.
   may keep existing or be decommissioned independently; that
   operational decision is out of scope for this specification, which
   covers only the application's behavior and user experience.
-- Removing multi-device sync and profile sharing is an intentional,
-  accepted product trade-off in exchange for the stronger security
-  posture of having no backend at all; no in-app replacement (e.g. a
-  new sync mechanism) is being requested.
+- Removing the backend's multi-device sync and profile sharing is an
+  intentional, accepted product trade-off in exchange for the stronger
+  security posture of having no backend at all; no backend-based
+  replacement is being requested here. A backend-free replacement
+  (device-to-device pairing over the user's own cloud storage) is a
+  distinct, separately-tracked idea — see `docs/features/spec-00-e2e-vault.md`
+  — and is out of scope for this spec.
 - Users who want to move a vault between their own devices will do so
   by manually copying the local vault file, which is already possible
   today and needs no new feature.
