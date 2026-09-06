@@ -18,7 +18,6 @@ unless it shows the tab strip) usually looks best.
 | `tunnels.png` | Port-forwarding panel with at least one local, one remote, and one dynamic/SOCKS tunnel listed. |
 | `mirror.png` | Folder-mirror panel showing the local ↔ remote pair, the conflict-resolution dropdown, and the watcher running. |
 | `notes.png` | Notes tab on the edit-node panel filled with a couple of paragraphs, OR the quick-commands list. |
-| `sync.png` | Cloud-sync screen showing "Connected to api.sinaxhpm.com" and the synced-profile count, OR the profile-select page with multiple machines. |
 | `android.png` | Phone screenshot: terminal tab open, or the node grid on mobile layout. Crop to phone aspect ratio. |
 
 ## Optional extras

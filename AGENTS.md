@@ -1,6 +1,6 @@
 # Repository Guidelines
 
-SSHClientX is a Tauri 2 + Rust + React SSH/SFTP client (terminal, dual-pane SFTP, tunnels, desktop folder-mirror, optional zero-knowledge vault sync) for Windows, macOS, Linux, and Android. Fork of Submarine; crate `sshclientx`, lib `sshclientx_lib`, bundle id `com.sshclientx.app`. MIT code (copyright Sina Xhpm); name/logo are marks. Governance: `.specify/memory/constitution.md` (wins over README).
+SSHClientX is a Tauri 2 + Rust + React SSH/SFTP client (terminal, dual-pane SFTP, tunnels, desktop folder-mirror) for Windows, macOS, Linux, and Android. Fully local — no account, no backend server; a vault never leaves the device it's on except by manual export/import. Fork of Submarine; crate `sshclientx`, lib `sshclientx_lib`, bundle id `com.sshclientx.app`. MIT code (copyright Sina Xhpm); name/logo are marks. Governance: `.specify/memory/constitution.md` (wins over README).
 
 ## Architecture & Data Flow
 
@@ -9,13 +9,12 @@ Thin desktop bin `src-tauri/src/main.rs` calls `sshclientx_lib::run()`. The same
 ```
 ProfileSelectPage --invoke select_profile / setup_master_db--> DbState (Argon2id → AES-256-GCM vault)
 DesktopApp --invoke snake_case { camelCase }--> Rust commands
-         <--listen kebab-id events-- SshState / MirrorMap / MonitorMap / CloudState
+         <--listen kebab-id events-- SshState / MirrorMap / MonitorMap
 vault save: sqlite serialize → zstd → AES-GCM → <app_data>/profiles/<name>.sshclientx
-sync_now: encrypt per-entity blobs under DEK → LWW exchange with CLOUD_API_BASE
 ```
 
-- Privileged work (crypto, russh, SFTP, local FS, tunnels, mirror, Docker, cloud HTTP) **must** stay in Rust `#[tauri::command]`s.
-- Do **not** implement Argon2/AES/X25519 in TS; do **not** persist credentials in `localStorage` / IndexedDB. Cloud token is `cloud_token.json` in app data.
+- Privileged work (crypto, russh, SFTP, local FS, tunnels, mirror, Docker) **must** stay in Rust `#[tauri::command]`s.
+- Do **not** implement Argon2/AES in TS; do **not** persist credentials in `localStorage` / IndexedDB.
 - TOFU: events `fingerprint-prompt-{sid}` require `verify_fingerprint_response({ nonce, accepted })`. Monitor pollers use `known_hosts` only — no fingerprint UX.
 - Terminal payload is **base64** on `terminal-output-{tid}`, not a JSON byte array.
 
@@ -23,8 +22,8 @@ sync_now: encrypt per-entity blobs under DEK → LWW exchange with CLOUD_API_BAS
 
 | Path | Owns |
 |------|------|
-| `src/DesktopApp.tsx` | Unlocked shell: sidebar views, session tabs, Wall, `bumpSync` → 6s debounce → `sync_now` |
-| `src/components/` | Session/terminal/SFTP/tunnels/mirror/Docker/Info/monitor/cloud/profile UI |
+| `src/DesktopApp.tsx` | Unlocked shell: sidebar views, session tabs, Wall |
+| `src/components/` | Session/terminal/SFTP/tunnels/mirror/Docker/Info/monitor UI |
 | `src/fs/` | `FileProvider`; transfers call `sftp_*` / `local_*` — bytes do not stream through JS |
 | `src/hooks/`, `src/ui/`, `src/util/platform.ts` | `useTauriListen`, viewport; confirm/broadcast; `IS_ANDROID` vs `useIsNarrow()` |
 | `src-tauri/src/lib.rs` | Vault, SQLite, most commands, `guard_local_path`, `generate_handler`, `run()` |
@@ -32,16 +31,14 @@ sync_now: encrypt per-entity blobs under DEK → LWW exchange with CLOUD_API_BAS
 | `src-tauri/src/tunnel.rs` | L/D/R forwards on `SshState` |
 | `src-tauri/src/mirror.rs` | Two-way sync + watcher; `.submarine-trash` / `.submarine-tmp` |
 | `src-tauri/src/docker.rs` | Allow-listed `docker` over exec; no `rm`/`remove`/`down` |
-| `src-tauri/src/cloud.rs` | `CLOUD_API_BASE`, bearer token, LWW transport |
-| `src-tauri/src/identity.rs` | X25519 wrap/seal (HKDF label frozen) |
-| `src-tauri/src/hlc.rs` | Hybrid logical clock for sync stamps |
+| `src-tauri/src/hlc.rs` | Hybrid logical clock; stamps `updated_at` locally (no backend consumes it) |
 | `src-tauri/src/monitor.rs` | Separate SSH pollers (not interactive `SshState`) |
 | `src-tauri/src/about.rs` | Version + GitHub `InDieStack-v2/SSHClientX` |
 | `src-tauri/capabilities/` | Minimal ACL |
 | `scripts/` | Android env + USB `adb reverse` helper |
 | `.specify/` | Spec Kit + constitution |
 
-New SSH/SFTP/crypto/sync behavior extends those Rust modules — do not grow ad-hoc JS.
+New SSH/SFTP/crypto behavior extends those Rust modules — do not grow ad-hoc JS. Do not reintroduce a network backend, account system, or cloud sync — see `.specify/memory/constitution.md` Principle I and `specs/001-local-only-mode/` for why they were removed.
 
 ## Development Commands
 
@@ -75,22 +72,22 @@ Release: `git tag vX.Y.Z && git push origin vX.Y.Z`. CI stamps `package.json` / 
 
 **IPC:** `invoke("setup_master_db", { password })`. Commands `snake_case`; args `camelCase` (`sessionId`, `serverId`). Events `kebab-case-{id}`.
 
-**Errors:** `Result<T, String>` with prefixes `[SYSTEM] [CRYPTO] [VAULT] [DATABASE] [STATE] [FILE] [CLOUD] [SHARE] [SYNC] [SSH] [UPDATE] [OPEN]`. Wrong vault password → `[CRYPTO] DECRYPT_FAILURE`. SFTP overwrite probe → `EXISTS:<path>` then retry `overwrite: true`.
+**Errors:** `Result<T, String>` with prefixes `[SYSTEM] [CRYPTO] [VAULT] [DATABASE] [STATE] [FILE] [SSH] [UPDATE] [OPEN]`. Wrong vault password → `[CRYPTO] DECRYPT_FAILURE`. SFTP overwrite probe → `EXISTS:<path>` then retry `overwrite: true`.
 
 **Async:** Tauri `async fn` + `tauri::async_runtime::spawn` for PTY/tunnels/mirror/monitor. `spawn_blocking` for Argon2, vault serialize/encrypt/fsync. Never hold a rusqlite `Mutex` across `.await`. Never run Argon2 on the tokio worker pool.
 
-**State:** Rust `.manage`: `DbState` (conn + `Zeroizing` master key), `SshState`, `CloudState`, `MirrorMap`, `MonitorMap`, `DockerStreams`. UI prefs only in `localStorage` under `sshclientx-*` (colors, font, auto-sync, SFTP layout). Dispatch `sshclientx-settings-changed` after font changes.
+**State:** Rust `.manage`: `DbState` (conn + `Zeroizing` master key), `SshState`, `MirrorMap`, `MonitorMap`, `DockerStreams`. UI prefs only in `localStorage` under `sshclientx-*` (colors, font, SFTP layout). Dispatch `sshclientx-settings-changed` after font changes.
 
 **Platform:** `isMobile` = `useIsNarrow() < 640` (resized desktop). `IS_ANDROID` gates export/import, folder picker, live-edit, Open/Reveal. Desktop-only crates (`rfd`, `open`, `window-state`) are `cfg(not(target_os = "android"))`. Secondary transports use real session ids `${id}::sftp` / `${id}::fwd`.
 
 **Security (non-negotiable):**
 
 - No `shell:*`, `fs:*`, or `webview:*` capabilities. `opener:allow-open-url` only. `window-state:default` stays in `capabilities/desktop.json`.
-- Do not widen CSP (`script-src 'self'`; `connect-src` self + IPC + `https://api.sinaxhpm.com`; `frame-src`/`object-src` none). Cloud HTTP is Rust reqwest, not the webview.
+- Do not widen CSP (`script-src 'self'`; `connect-src` self + IPC only — no network origin; `frame-src`/`object-src` none). There is no backend to add one for.
 - Path guards: `guard_local_path`, `is_safe_dir_entry_name`, `safe_temp_leaf_name`, `app_temp_root`. Docker: `shq` / `is_safe_name`; no string-built `sh -c`.
 - `open_external_url`: http(s) only.
 
-**Do not change (compat freeze):** vault magic `OMNV`; remote `.submarine-trash` / `.submarine-tmp`; HKDF `b"submarine-share-seal-v1"`; backfill domain `b"submarine-backfill-v1\0"`; `CLOUD_API_BASE` `https://submarine.sinaxhpm.com`; Argon2 params (`m_cost` 64 MiB, `t=3`, `p=4`); CI secrets `SUBMARINE_KEYSTORE_*`. Write vaults as `.sshclientx`; still **read** leftover `.submarine` files.
+**Do not change (compat freeze):** vault magic `OMNV`; remote `.submarine-trash` / `.submarine-tmp`; backfill domain `b"submarine-backfill-v1\0"`; Argon2 params (`m_cost` 64 MiB, `t=3`, `p=4`); CI secrets `SUBMARINE_KEYSTORE_*`. Write vaults as `.sshclientx`; still **read** leftover `.submarine` files.
 
 ## Important Files
 
@@ -115,17 +112,17 @@ Release: `git tag vX.Y.Z && git push origin vX.Y.Z`. CI stamps `package.json` / 
 
 ## Testing & QA
 
-Rust in-crate `#[cfg(test)]` only (~41 tests). No Jest/Vitest/Playwright; no `npm test`.
+Rust in-crate `#[cfg(test)]` only (~18 tests). No Jest/Vitest/Playwright; no `npm test`.
 
 ```bash
 cargo test --manifest-path src-tauri/Cargo.toml
-# modules: sync_trigger_tests, sync_engine_tests, tests (is_safe_dir_entry_name),
-#          hlc::tests, identity::tests, tunnel_tests
+# modules: sync_trigger_tests (local uuid/updated_at stamping, still used —
+#          see hlc.rs), tests (is_safe_dir_entry_name), hlc::tests, tunnel_tests
 npm run typecheck
 ```
 
-Covered: HLC, X25519 seal/wrap, sync LWW/tombstones/DEK escrow/FK backfill, tunnel bind/pump, SFTP name traversal.
+Covered: HLC, local sync-trigger stamping, tunnel bind/pump, SFTP name traversal.
 
-**Not covered:** UI, live SSH/TOFU, `guard_local_path`, vault disk I/O, `cloud.rs` HTTP, mirror, Docker, monitor, Android. Constitution still requires tests when you touch vault/sync/path guards/host keys.
+**Not covered:** UI, live SSH/TOFU, `guard_local_path`, vault disk I/O, mirror, Docker, monitor, Android. Constitution still requires tests when you touch vault/path guards/host keys.
 
 Manual smoke: `npm run tauri dev`; Android `npm run android:dev`. Release CI builds artifacts; it does not run `cargo test`.

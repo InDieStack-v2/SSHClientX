@@ -18,15 +18,15 @@
   <img src="docs/screenshots/hero.png" alt="SSHClientX main window — terminal session with dual-pane SFTP browser open on the right" width="900" />
 </div>
 
-> **TL;DR** — SSHClientX is a fast, free, open-source SSH and SFTP client for Windows, macOS, Linux, and Android. It replaces the typical PuTTY + WinSCP + tunnel-manager stack with one tabbed window per server: terminal, SFTP, port forwarding (SOCKS / HTTP / local / remote), folder mirror, and end-to-end encrypted profile sync. Built with Rust + Tauri. MIT licensed.
+> **TL;DR** — SSHClientX is a fast, free, open-source SSH and SFTP client for Windows, macOS, Linux, and Android. It replaces the typical PuTTY + WinSCP + tunnel-manager stack with one tabbed window per server: terminal, SFTP, port forwarding (SOCKS / HTTP / local / remote), and folder mirror. Fully local — no account, no backend, nothing ever leaves your device but your own SSH traffic. Built with Rust + Tauri. MIT licensed.
 
 ## At a glance
 
 - **One window, many tools per server** — terminal, SFTP, tunnels, folder mirror, Docker, live server info, and a per-server command library, all as tabs around the same session
 - **Watch many servers at once** — session **split view** to tile any two sessions side-by-side, plus a global **Wall** pinboard for arbitrary terminals across hosts in a grid you control
 - **Broadcast input** — type once, send to N selected sessions simultaneously (Tmux `synchronize-panes` for cross-server)
-- **Native and cross-platform** — Windows, macOS, Linux (`.deb` / `.rpm` / Arch / AppImage), and Android — same encrypted vault everywhere
-- **Zero-knowledge cloud sync** — profiles are Argon2id + AES-256-GCM sealed on your device before upload; the server (and everyone else) only sees ciphertext. Browser dashboard at [`api.sinaxhpm.com/account`](https://api.sinaxhpm.com/account/) to manage your account and stored profiles
+- **Native and cross-platform** — Windows, macOS, Linux (`.deb` / `.rpm` / Arch / AppImage), and Android — same encrypted vault format everywhere
+- **No account, no backend** — profiles are Argon2id + AES-256-GCM sealed on your device and never leave it. There's no server to breach, no sign-up, nothing to trust but your own machine
 - **Docker manager** — containers, logs (live tail), stats, prune, and `docker exec` shells as first-class session tabs
 - **Import from anywhere** — PuTTY `.reg`, MobaXterm `.mxtsessions`, OpenSSH config, and SSHClientX JSON exports all bulk-imported from the Servers page
 - **Secure by default** — TOFU host keys with per-connection nonce binding, strict CSP, minimal Tauri permission ACL, zeroized master key
@@ -74,11 +74,10 @@ If you're searching for one of these, SSHClientX is a direct fit:
 - a free **PuTTY alternative for macOS and Linux** (and a tabbed PuTTY replacement on Windows)
 - a **WinSCP alternative** that lives in the same window as your terminal
 - a **MobaXterm alternative** that isn't Windows-only and isn't 15-year-old GTK
-- a free **Termius alternative** without subscription gating or telemetry
+- a free **Termius alternative** without subscription gating, an account, or telemetry
 - a modern **Tabby / iTerm2 + SFTP** combo that's actually one app
-- a cross-device **Termius-style sync** without a paid plan — your encrypted profiles travel from desktop to your **Android phone** with the same master password
 - an **rsync GUI / Syncthing-lite** that mirrors a local folder to a remote SSH host with conflict resolution
-- an **Android SSH client** (ConnectBot / JuiceSSH style) that shares saved servers with your desktop
+- an **Android SSH client** (ConnectBot / JuiceSSH style) with the same encrypted vault format as desktop — export/import a profile between devices, no account needed
 
 ## Why SSHClientX
 
@@ -86,7 +85,7 @@ Most SSH clients feel like they were built a decade ago and never updated. SSHCl
 
 - **Native and fast.** Built with Rust + Tauri — boots in under a second, uses around 80 MB of RAM with several sessions open. No Electron, no battery drain.
 - **One window, everything you need.** Terminal, SFTP file browser, port tunnels, folder sync, and saved commands — all live as tabs around each server. No more juggling PuTTY plus WinSCP plus a tunnel app.
-- **Secure by default.** Saved servers are encrypted on disk. Optional cloud sync only ever sees encrypted blobs — your passwords and keys can't be read by anyone but you.
+- **Secure by default.** Saved servers are encrypted on disk. There's no account and no backend — nothing ever leaves your device but your own SSH traffic, so there's no server to breach.
 - **Truly cross-platform.** Same app on Windows, macOS (Apple Silicon + Intel via Rosetta), and every major Linux distro — `.deb`, `.rpm`, Arch package, and AppImage.
 
 ## Key Features
@@ -153,12 +152,6 @@ Manage Docker on any session host without typing a single `docker` command.
 - Dynamic supports **SOCKS4, SOCKS4a, SOCKS5, SOCKS5h, HTTP CONNECT, and plain HTTP proxy**
 - Each tunnel starts and stops independently, saved with the server profile
 
-### End-to-End Encrypted Profile Sync
-
-- Save servers once, access them on every machine you own
-- The sync server hosts an opaque encrypted blob — we have no way to read it (see [Security](#security))
-- No registration. No password recovery email. Your master password never leaves your device.
-
 ### Productivity
 
 - **Quick commands**: per-server snippet library, surfaced inside any open session
@@ -186,9 +179,9 @@ Pick a binary from the [latest release](https://github.com/InDieStack-v2/SSHClie
 
 ### Android
 
-SSHClientX on Android is a true native build of the same Rust core — same SSH stack, same encrypted vault, same profile sync. Reach a server from your phone with the same credentials you saved on your desktop.
+SSHClientX on Android is a true native build of the same Rust core — same SSH stack, same encrypted vault format. Reach a server from your phone with the same credentials you saved on your desktop.
 
-- **Same encrypted vault.** Cloud sync drops your profiles onto the phone exactly as they were on desktop. Nothing re-typed.
+- **Same encrypted vault format.** Export a profile from desktop and import that same file on your phone (or vice versa) — same master password, nothing re-typed, no account needed.
 - **Tabbed terminal optimised for touch.** Mobile soft keyboards don't have Ctrl / Alt / Shift / Esc / Tab — SSHClientX ships an inline **soft-key bar** between xterm and the OS keyboard with Termux-style sticky modifiers (tap to arm, double-tap to lock). Ctrl+letter, Alt+letter, and Shift+Tab all work as expected.
 - **Auto-scroll on focus.** Tap the terminal and the prompt scrolls into view; the same fires when the OS keyboard opens so the cursor row never sits hidden behind the keyboard.
 - **SFTP file browser** with multi-select, upload from the phone's storage, download into Downloads.
@@ -200,19 +193,18 @@ Tested on Android 8.0+ (API 26+). Phones, tablets, and Android-on-ChromeOS.
 
 ## Security
 
-Your data is encrypted on your machine before anything leaves it. SSHClientX and the sync server never see your passwords, private keys, or profile content.
+Your data is encrypted on your machine and never leaves it. There is no account, no backend, and no server that ever sees your passwords, private keys, or profile content — the strongest guarantee against a server-side breach is having no server at all.
 
 **How it works:**
 
 1. **Your master password becomes a vault key — on your device.** When you unlock, your password is run through Argon2id to derive a key. The password is wiped from memory the moment derivation finishes. It never goes anywhere.
 2. **Profiles are sealed with AES-256-GCM — on your device.** Every saved server (credentials, keys, tunnels, notes, mirrors) is compressed and encrypted with that key. What hits disk is opaque ciphertext.
-3. **Sync uploads that same ciphertext — byte for byte.** When you turn cloud sync on, the bytes uploaded are exactly the encrypted blob from your disk. The server stores ciphertext plus a random nonce. Nothing else.
+3. **Nothing is ever uploaded.** The encrypted vault file stays on your device. Moving it to another machine (desktop-to-desktop or desktop-to-Android) is a manual export/import of that same file — SSHClientX never sends it anywhere on your behalf.
 
-**Why the sync server can't read your profiles:**
+**Why there's nothing to breach:**
 
-- No registration with a server-side password. No recovery email. No "forgot password" flow. **There is nothing on the server that could be used to derive your key.**
-- Encryption happens before the upload call. By the time bytes hit the network they are already ciphertext with no key material attached.
-- Even with a full server breach, an attacker gets the same opaque blob they'd see if you uploaded a random file to S3. Same threat model.
+- No registration, no account, no password-recovery email, no "forgot password" flow — **there is no server-side anything.**
+- The only outbound network activity is your own SSH/SFTP connections to servers you add, plus an update check against GitHub releases.
 
 **Other defences:**
 
@@ -228,7 +220,7 @@ Yes. MIT-licensed. Use it personally, use it at work, fork it, redistribute it.
 
 ### Does it work offline?
 
-Yes. Cloud sync is opt-in. All profiles, mirrors, and tunnels live locally and are encrypted at rest.
+Yes — there's no backend at all. Every profile, mirror, and tunnel lives locally and is encrypted at rest.
 
 ### How is it different from PuTTY, WinSCP, or MobaXterm?
 
@@ -238,9 +230,9 @@ PuTTY and WinSCP are two separate apps you alt-tab between. MobaXterm bundles th
 
 Yes. File-based keys and pasted PEM/OpenSSH keys, with or without passphrase.
 
-### Can I sync profiles between Windows and macOS?
+### Can I move a profile between Windows and macOS?
 
-Yes. The encrypted vault is platform-portable. Enable sync on one machine, unlock on another with the same master password.
+Yes. The encrypted vault file is platform-portable — export it from one machine and import that same file on another, then unlock with the same master password.
 
 ### Why Rust and Tauri instead of Electron?
 
@@ -252,11 +244,11 @@ In a single encrypted file under your OS app-data directory. Nothing in plaintex
 
 ### Does SSHClientX collect telemetry or analytics?
 
-No. There's no analytics SDK, no crash reporter that sends data home, no "phone home" call on launch. The only outbound network call beyond your SSH targets is the optional cloud-sync endpoint at `api.sinaxhpm.com`, and that endpoint only ever receives opaque ciphertext.
+No. There's no analytics SDK, no crash reporter that sends data home, no account, and no backend at all. The only outbound network activity beyond your own SSH targets is an update check against GitHub releases.
 
 ### Can I use SSHClientX on my Android phone with the same servers as my desktop?
 
-Yes. Install the APK, unlock with the same master password you use on desktop, and the encrypted vault syncs. Every server, key, and saved tunnel appears on the phone. Folder mirror is desktop-only for now; everything else (terminal, SFTP, port forwarding) works on Android.
+Yes. Export your profile from desktop and import that same file on your phone, then unlock it with the same master password — every server, key, and saved tunnel comes across. Folder mirror is desktop-only for now; everything else (terminal, SFTP, port forwarding) works on Android.
 
 ### Is SSHClientX on the Play Store?
 
@@ -311,7 +303,7 @@ MIT — see [LICENSE](LICENSE).
 ---
 
 <sub>
-<b>Keywords</b>: SSH client, SFTP client, terminal emulator, port forwarding, SOCKS proxy, HTTP proxy, folder mirror, folder sync, remote file edit, encrypted profile sync, zero-knowledge cloud, Argon2id, AES-256-GCM, TOFU host keys, Rust, Tauri, React, xterm.js, Windows SSH client, macOS SSH client, Linux SSH client, Android SSH client, open source SSH, MIT licensed, PuTTY alternative, WinSCP alternative, MobaXterm alternative, Bitvise alternative, Termius alternative, SecureCRT alternative, Royal TSX alternative, ConnectBot alternative, JuiceSSH alternative, rsync GUI, sshfs alternative, Tabby alternative.
+<b>Keywords</b>: SSH client, SFTP client, terminal emulator, port forwarding, SOCKS proxy, HTTP proxy, folder mirror, folder sync, remote file edit, local-only, no account, offline SSH client, Argon2id, AES-256-GCM, TOFU host keys, Rust, Tauri, React, xterm.js, Windows SSH client, macOS SSH client, Linux SSH client, Android SSH client, open source SSH, MIT licensed, PuTTY alternative, WinSCP alternative, MobaXterm alternative, Bitvise alternative, Termius alternative, SecureCRT alternative, Royal TSX alternative, ConnectBot alternative, JuiceSSH alternative, rsync GUI, sshfs alternative, Tabby alternative.
 </sub>
 
 <sub><i>Bitvise, forever in my heart.</i></sub>

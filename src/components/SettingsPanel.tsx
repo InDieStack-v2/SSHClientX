@@ -1,4 +1,4 @@
-import { Settings, Palette, RefreshCw, Pipette, List, Cloud } from "lucide-react";
+import { Settings, Palette, RefreshCw, Pipette, List } from "lucide-react";
 
 const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
   const accentColors = [
@@ -28,7 +28,7 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
         <p className="text-[13px] text-zinc-400 mt-2">
           Tweak how SSHClientX looks and feels.
           {' '}
-          <span className="text-zinc-500 italic">Per-device — preferences live in this machine's local storage and don't sync with your cloud profile.</span>
+          <span className="text-zinc-500 italic">Per-device — preferences live in this machine's local storage.</span>
         </p>
       </header>
 
@@ -161,42 +161,6 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
             </div>
           </section>
         )}
-
-        {/* Cloud Section */}
-        <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
-          <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
-            <Cloud size={14} /> Cloud Sync
-          </div>
-
-          <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
-            <div className="flex items-center justify-between gap-4">
-              <div className="min-w-0">
-                <div className="text-sm font-semibold text-zinc-100">Auto-sync</div>
-                <p className="text-[12px] text-zinc-400 leading-relaxed mt-1">
-                  Keep open profiles synced in the background — shortly after you make a change, when
-                  you return to the window, and every few minutes to pull in others' edits on shared
-                  profiles. Turn off to sync only with the manual button.
-                </p>
-              </div>
-              <button
-                role="switch"
-                aria-checked={settings.autoSync !== false}
-                onClick={() => setSettings((s: any) => ({ ...s, autoSync: !(s.autoSync !== false) }))}
-                className={`relative shrink-0 w-11 h-6 rounded-full transition-colors ${settings.autoSync !== false ? 'bg-primary' : 'bg-zinc-700'}`}
-              >
-                <span className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-all ${settings.autoSync !== false ? 'left-[22px]' : 'left-0.5'}`} />
-              </button>
-            </div>
-
-            {settings.autoSync !== false && (
-              <div className="border-t border-white/5 pt-4 text-[12px] text-zinc-400">
-                Currently checking every{' '}
-                <span className="text-zinc-100 font-semibold">{settings.syncIntervalMin ?? 5} min</span>. Change it
-                on the Profile tab, next to Sync now.
-              </div>
-            )}
-          </div>
-        </section>
 
         {/* Maintenance Section */}
         <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">

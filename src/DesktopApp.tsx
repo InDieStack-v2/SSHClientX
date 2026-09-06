@@ -20,7 +20,6 @@ import { NodeGrid } from "./components/NodeGrid";
 import AddNodePanel from "./components/AddNodePanel";
 import TerminalView from "./components/TerminalView";
 import SettingsPanel from "./components/SettingsPanel";
-import ProfilePanel from "./components/ProfilePanel";
 import { SessionView } from "./components/SessionView";
 import MonitoringPanel from "./components/MonitoringPanel";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
@@ -52,10 +51,6 @@ function DesktopApp() {
   // until ProfileSelectPage's onUnlocked fires, at which point the app
   // flips straight into the main view — no intermediate state.
   const [activeProfile, setActiveProfile] = useState<string | null>(null);
-  // Per-entity cloud sync of the OPEN profile (the new Last-Write-Wins model).
-  // `cloudSyncing` gates the sidebar button; `lastSyncLabel` feeds its tooltip.
-  const [cloudSyncing, setCloudSyncing] = useState(false);
-  const [lastSyncLabel, setLastSyncLabel] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<string>("nodes");
   const [sessions, setSessions] = useState<Session[]>([]);
   // Tracks the live status of each open session ('connecting' | 'connected'
@@ -226,12 +221,6 @@ function DesktopApp() {
     primaryColor: localStorage.getItem('sshclientx-primary-color') || '#60a5fa',
     backgroundColor: localStorage.getItem('sshclientx-bg-color') || '#0a0a0c',
     terminalFontSize: parseInt(localStorage.getItem('sshclientx-terminal-font-size') || '14'),
-    // Auto-sync defaults ON. Per-device (localStorage), like the other prefs.
-    autoSync: localStorage.getItem('sshclientx-auto-sync') !== 'off',
-    // Background pull cadence in minutes (min 1). Only gates the periodic
-    // "pull collaborators' changes" timer — your own edits still push ~6s after
-    // you stop typing regardless of this.
-    syncIntervalMin: Math.max(1, parseInt(localStorage.getItem('sshclientx-sync-interval-min') || '5', 10) || 5),
   });
 
   useEffect(() => {
@@ -242,8 +231,6 @@ function DesktopApp() {
     localStorage.setItem('sshclientx-primary-color', appSettings.primaryColor);
     localStorage.setItem('sshclientx-bg-color', appSettings.backgroundColor);
     localStorage.setItem('sshclientx-terminal-font-size', appSettings.terminalFontSize.toString());
-    localStorage.setItem('sshclientx-auto-sync', appSettings.autoSync ? 'on' : 'off');
-    localStorage.setItem('sshclientx-sync-interval-min', String(appSettings.syncIntervalMin));
     // Tell already-mounted terminals to re-fit with the new font size.
     // Without this dispatch the listener in TerminalView is dead code and
     // users have to close+reopen every terminal to see a size change.
@@ -371,145 +358,10 @@ function DesktopApp() {
     ]);
   };
 
-  // Per-entity cloud sync of the currently-open profile. Pushes every locally
-  // changed record and merges back the server's view (Last-Write-Wins by HLC),
-  // without the server ever decrypting anything. A guard prevents overlapping
-  // runs; on success we reload all local lists so a pulled change shows at once.
-  const handleCloudSync = useCallback(async () => {
-    setCloudSyncing(true);
-    try {
-      const report = await invoke<{ pushed: number; pulled: number }>("sync_now");
-      await refreshAll();
-      setLastSyncLabel(`Last synced ${new Date().toLocaleTimeString()}`);
-      addLog(`Cloud sync complete — pushed ${report.pushed}, pulled ${report.pulled}.`, "success");
-    } catch (e) {
-      const msg = String(e);
-      if (/NO_TOKEN|invalid_token|Missing auth|401/i.test(msg)) {
-        addLog("Cloud sync: not signed in. Open the Cloud panel from the profile picker and sign in first.", "error");
-      } else if (/NO_PROFILE_OPEN|DB_NOT_OPEN|NO_KEY|NO_HLC/i.test(msg)) {
-        addLog("Cloud sync: no profile open — unlock a profile first.", "error");
-      } else {
-        addLog(`Cloud sync failed: ${msg}`, "error");
-      }
-    } finally {
-      setCloudSyncing(false);
-    }
-    // refreshAll closes over stable setters; addLog is memoised. Intentionally
-    // excluded to keep this handler identity stable across renders.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [addLog]);
-
-  // ---- Auto-sync (hybrid: after-edit debounce + window focus + interval) ----
-  //
-  // A quiet counterpart to handleCloudSync: it never toasts. Cloud sync is a
-  // background convenience, so a transient network blip or a not-signed-in state
-  // must not spew errors while the user is doing something else. Overlap is
-  // guarded by a ref (React state is too laggy for timer/event callbacks that
-  // fire between renders). Only the OUTCOME that matters — a pull that changed
-  // local data — refreshes the UI.
-  const autoSyncBusy = useRef(false);
-  const isUnlockedRef = useRef(isUnlocked);
-  useEffect(() => { isUnlockedRef.current = isUnlocked; }, [isUnlocked]);
-  // Mirror cloudSyncing into a ref so quietSync can see a manual sync in flight
-  // WITHOUT depending on the state — otherwise every sync would toggle
-  // cloudSyncing, change quietSync's identity, and tear down + restart the
-  // interval effect, resetting the periodic timer so it might never fire.
-  const cloudSyncingRef = useRef(cloudSyncing);
-  useEffect(() => { cloudSyncingRef.current = cloudSyncing; }, [cloudSyncing]);
-
-  // When the last background sync actually ran. The focus trigger reads this so
-  // it can't out-pace the cadence the user configured — see the interval effect.
-  const lastSyncAt = useRef(0);
-  // refreshAll is redefined every render, so quietSync (which is deliberately
-  // identity-stable) would otherwise capture the very first one forever and
-  // repopulate the lists through stale handlers after a pull.
-  const refreshAllRef = useRef(refreshAll);
-  refreshAllRef.current = refreshAll;
-
-  const quietSync = useCallback(async () => {
-    if (autoSyncBusy.current || cloudSyncingRef.current) return;
-    if (!isUnlockedRef.current) return;
-    autoSyncBusy.current = true;
-    setCloudSyncing(true);
-    try {
-      const report = await invoke<{ pushed: number; pulled: number }>("sync_now");
-      if (report.pulled > 0) await refreshAllRef.current();
-      setLastSyncLabel(`Last synced ${new Date().toLocaleTimeString()}`);
-    } catch {
-      // Silent by design — not signed in, offline, or a viewer with nothing to
-      // push. The manual Sync-now button is where errors surface loudly.
-    } finally {
-      // Stamped even on failure: a server that's down shouldn't turn every
-      // window focus into a fresh retry storm.
-      lastSyncAt.current = Date.now();
-      autoSyncBusy.current = false;
-      setCloudSyncing(false);
-    }
-    // All refs/setters are stable — quietSync keeps a fixed identity so the
-    // interval effect isn't rebuilt on every sync.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // After-edit push, debounced so a burst of edits collapses into one sync a few
-  // seconds after the user stops. Mutation handlers call this.
-  const bumpTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const bumpSync = useCallback(() => {
-    if (!appSettings.autoSync) return;
-    if (bumpTimer.current) clearTimeout(bumpTimer.current);
-    bumpTimer.current = setTimeout(() => { quietSync(); }, 6000);
-  }, [appSettings.autoSync, quietSync]);
-
-  // Turning auto-sync off has to cancel a push that's already armed. The check
-  // above only runs when the timer is SCHEDULED, so editing something and then
-  // switching auto-sync off within the six-second window still fired the sync —
-  // which is precisely the moment someone reaching for that switch (metered
-  // connection, about to go offline) most wants it not to.
-  useEffect(() => {
-    if (appSettings.autoSync) return;
-    if (bumpTimer.current) {
-      clearTimeout(bumpTimer.current);
-      bumpTimer.current = null;
-    }
-  }, [appSettings.autoSync]);
-
-  // Interval (pulls collaborators' changes on shared profiles) + on-focus fresh
-  // pull. Both are no-ops until a profile is unlocked and auto-sync is enabled.
-  useEffect(() => {
-    if (!isUnlocked || !appSettings.autoSync) return;
-    const INTERVAL_MS = Math.max(1, appSettings.syncIntervalMin || 5) * 60 * 1000;
-    // Pull once shortly after unlock so the app opens on fresh data (a delay so
-    // the unlock's own refresh + autostart settle first).
-    const initial = setTimeout(() => { quietSync(); }, 4000);
-    const id = setInterval(() => { quietSync(); }, INTERVAL_MS);
-    let focusTimer: ReturnType<typeof setTimeout> | null = null;
-    // Coming back to the window is a good moment to be fresh, but it used to be
-    // an UNCONDITIONAL sync — and on a desktop app you alt-tab back constantly,
-    // so this fired far more often than the interval ever did. The cadence the
-    // user picked was effectively decoration: set it to 30 minutes and you'd
-    // still sync every time you switched windows. Now focus only pulls when the
-    // interval is already due, so the setting means what it says.
-    const onFocus = () => {
-      if (document.visibilityState === "hidden") return;
-      if (Date.now() - lastSyncAt.current < INTERVAL_MS) return;
-      if (focusTimer) clearTimeout(focusTimer);
-      focusTimer = setTimeout(() => { quietSync(); }, 1500);
-    };
-    window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", onFocus);
-    return () => {
-      clearTimeout(initial);
-      clearInterval(id);
-      if (focusTimer) clearTimeout(focusTimer);
-      window.removeEventListener("focus", onFocus);
-      document.removeEventListener("visibilitychange", onFocus);
-    };
-  }, [isUnlocked, appSettings.autoSync, appSettings.syncIntervalMin, quietSync]);
-
   const removeServer = async (id: number) => {
     try {
       await invoke("delete_server", { id });
       refreshServers();
-      bumpSync();
       addLog("Server removed.", "info");
     } catch (e) { addLog(`DELETE_EXCEPTION: ${e}`, "error"); }
   };
@@ -519,7 +371,6 @@ function DesktopApp() {
       await invoke("delete_folder", { id });
       // delete_folder cascades to its servers (see main.rs), so refresh both.
       await Promise.all([refreshFolders(), refreshServers()]);
-      bumpSync();
       addLog("Folder removed.", "info");
     } catch (e) { addLog(`DELETE_EXCEPTION: ${e}`, "error"); }
   };
@@ -528,7 +379,6 @@ function DesktopApp() {
     try {
       await invoke("rename_folder", { id, name });
       await refreshFolders();
-      bumpSync();
       addLog(`Folder renamed to "${name}".`, "info");
     } catch (e) {
       addLog(`RENAME_EXCEPTION: ${e}`, "error");
@@ -545,12 +395,6 @@ function DesktopApp() {
     setIsUnlocked(true);
     addLog(`Profile "${name}" unlocked.`, "success");
     refreshAll();
-    // Attribute future edits to the signed-in cloud account so shared/multi-
-    // device profiles show "last edited by <email>". Best-effort; unattributed
-    // when not signed in.
-    invoke<{ signed_in: boolean; email: string | null }>("cloud_status")
-      .then((s) => invoke("set_editor_label", { label: s.signed_in && s.email ? s.email : "" }))
-      .catch(() => {});
     // Autostart sweep: load servers directly (refreshAll is also doing this
     // in parallel, but its state update is async and we can't read `servers`
     // back here without a stale-closure race), pick the ones flagged
@@ -692,7 +536,7 @@ function DesktopApp() {
     // Persist a root-level profile for reuse. Best-effort: a failure here must
     // never block the live connection the user just asked for.
     invoke("save_quick_connect_node", { auth })
-      .then(() => { refreshServers(); bumpSync(); addLog(`Saved node → ${displayName}`, "success"); })
+      .then(() => { refreshServers(); addLog(`Saved node → ${displayName}`, "success"); })
       .catch((e) => addLog(`QUICK_NODE_SAVE_FAILED: ${e}`, "error"));
   };
 
@@ -1478,7 +1322,7 @@ function DesktopApp() {
         // tab-order stays intuitive and <main> grabs the full screen width
         // (terminal gains the ~50px the vertical rail used to eat).
         <div className={`flex-1 flex ${isMobile ? 'flex-col-reverse' : ''} overflow-hidden pt-10`}>
-          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} profileName={activeProfile} syncing={cloudSyncing} />
+          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} />
 
           <main className="flex-1 flex flex-col min-w-0 min-h-0 bg-transparent relative">
             {activeView === "nodes" && (
@@ -1505,28 +1349,16 @@ function DesktopApp() {
                 onRemoveFolder={removeFolder}
                 onRenameFolder={renameFolder}
                 onCloneServer={async (id: number) => {
-                  try { await invoke("clone_server", { id }); refreshServers(); bumpSync(); addLog("Node cloned.", "success"); }
+                  try { await invoke("clone_server", { id }); refreshServers(); addLog("Node cloned.", "success"); }
                   catch (e) { addLog(`CLONE_ERROR: ${e}`, "error"); }
                 }}
                 onReorderServers={async (ids: number[]) => {
                   // Rethrow on failure so NodeGrid drops its optimistic order
                   // override and reverts to the real (unchanged) arrangement.
-                  try { await invoke("reorder_servers", { ids }); await refreshServers(); bumpSync(); }
+                  try { await invoke("reorder_servers", { ids }); await refreshServers(); }
                   catch (e) { addLog(`REORDER_ERROR: ${e}`, "error"); throw e; }
                 }}
                 isMobile={isMobile}
-              />
-            )}
-
-            {activeView === "profile" && (
-              <ProfilePanel
-                onSync={handleCloudSync}
-                syncing={cloudSyncing}
-                lastSyncLabel={lastSyncLabel}
-                autoSync={appSettings.autoSync}
-                syncIntervalMin={appSettings.syncIntervalMin}
-                onSetInterval={(m: number) => setAppSettings((s: any) => ({ ...s, syncIntervalMin: m }))}
-                onToggleAutoSync={() => setAppSettings((s: any) => ({ ...s, autoSync: !s.autoSync }))}
               />
             )}
 
@@ -1610,7 +1442,7 @@ function DesktopApp() {
                                 <button onClick={async () => {
                                   const ok = await confirm({ title: "Delete saved password?", message: `“${c.name}” will be removed. Servers using this login will lose it.`, destructive: true });
                                   if (!ok) return;
-                                  invoke("delete_credential", { id: c.id }).then(() => { refreshCredentials(); bumpSync(); });
+                                  invoke("delete_credential", { id: c.id }).then(() => { refreshCredentials(); });
                                 }} className="text-zinc-500 hover:text-red-500"><Trash2 size={14} /></button>
                               </div>
                             </div>
@@ -1659,7 +1491,7 @@ function DesktopApp() {
                                 <button onClick={async () => {
                                   const ok = await confirm({ title: "Delete SSH key?", message: `“${k.name}” will be removed. This key cannot be recovered.`, destructive: true });
                                   if (!ok) return;
-                                  invoke("delete_ssh_key", { id: k.id }).then(() => { refreshSshKeys(); bumpSync(); });
+                                  invoke("delete_ssh_key", { id: k.id }).then(() => { refreshSshKeys(); });
                                 }} className="text-zinc-500 hover:text-red-500"><Trash2 size={14} /></button>
                               </div>
                             </div>
@@ -2172,7 +2004,7 @@ function DesktopApp() {
                                 <button onClick={async () => {
                                   const ok = await confirm({ title: "Delete command?", message: `“${cmd.title}” will be removed.`, destructive: true });
                                   if (!ok) return;
-                                  invoke("delete_command", { id: cmd.id }).then(() => { refreshCommands(); bumpSync(); });
+                                  invoke("delete_command", { id: cmd.id }).then(() => { refreshCommands(); });
                                 }} className="text-zinc-500 hover:text-red-500 transition-colors"><Trash2 size={14} /></button>
                               </div>
                             </div>
@@ -2199,7 +2031,7 @@ function DesktopApp() {
                                 <button onClick={async () => {
                                   const ok = await confirm({ title: "Delete note?", message: `“${n.title || "Untitled"}” will be removed.`, destructive: true });
                                   if (!ok) return;
-                                  invoke("delete_note", { id: n.id }).then(() => { refreshNotes(); bumpSync(); });
+                                  invoke("delete_note", { id: n.id }).then(() => { refreshNotes(); });
                                 }} className="text-zinc-500 hover:text-red-500 transition-colors"><Trash2 size={14} /></button>
                               </div>
                             </div>
@@ -2386,7 +2218,6 @@ function DesktopApp() {
             setIsPanelOpen(false);
             setFormError("");
             refreshServers();
-            bumpSync();
             // If we just edited a node whose session is live, re-apply its saved
             // forwarding rules now so a changed/added tunnel comes up without a
             // manual reconnect. The backend cleared the stale tunnel cache when
@@ -2451,7 +2282,6 @@ function DesktopApp() {
                   await action;
                   setIsCommandPanelOpen(false);
                   refreshCommands();
-                  bumpSync();
                   addLog("Command saved.", "success");
                 } catch (e) {
                   setFormError(`Failed to save command: ${e}`);
@@ -2502,7 +2332,6 @@ function DesktopApp() {
                   await action;
                   setIsNotePanelOpen(false);
                   refreshNotes();
-                  bumpSync();
                   addLog("Note saved.", "success");
                 } catch (e) {
                   setFormError(`Failed to save note: ${e}`);
@@ -2603,7 +2432,6 @@ function DesktopApp() {
                   await action;
                   setIsCredPanelOpen(false);
                   refreshCredentials();
-                  bumpSync();
                   addLog("Credential saved.", "success");
                 } catch (e) {
                   setFormError(`Failed to save credential: ${e}`);
@@ -2672,7 +2500,6 @@ function DesktopApp() {
                   await action;
                   setIsKeyPanelOpen(false);
                   refreshSshKeys();
-                  bumpSync();
                   addLog("SSH Key saved.", "success");
                 } catch (e) {
                   setFormError(`Failed to save SSH Key: ${e}`);

@@ -28,10 +28,10 @@
     },
     {
       "@type": "Question",
-      "name": "Is profile sync end-to-end encrypted?",
+      "name": "Does SSHClientX have an account or a backend server?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "Yes. Your master password derives the vault key on your device with Argon2id. Profiles are encrypted with AES-256-GCM before upload. The sync server only ever stores opaque ciphertext — there is no recovery email, no server-side password, no way to decrypt without your master password."
+        "text": "No. SSHClientX has no account, no sign-up, and no backend of any kind. Your master password derives the vault key on your device with Argon2id, and every profile is sealed with AES-256-GCM before it touches disk. Nothing is ever uploaded — there is no server that could be breached."
       }
     },
     {
@@ -47,7 +47,7 @@
       "name": "Can I use the same servers on desktop and on my Android phone?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "Yes. The encrypted vault is platform-portable. Enable cloud sync on desktop, unlock the mobile app with the same master password, and every saved server, key, and tunnel appears on the phone."
+        "text": "Yes. The encrypted vault file is platform-portable. Export a profile from desktop and import that same file on the mobile app, then unlock it with the same master password — every saved server, key, and tunnel comes across."
       }
     },
     {
@@ -55,7 +55,7 @@
       "name": "Does SSHClientX collect telemetry or analytics?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "No. There is no analytics SDK, no crash reporter that sends data home, and no telemetry. The only outbound network call beyond your SSH targets is to the optional cloud-sync endpoint at api.sinaxhpm.com, and that endpoint only ever sees opaque ciphertext."
+        "text": "No. There is no analytics SDK, no crash reporter that sends data home, no telemetry, and no account or backend of any kind. The only outbound network activity beyond your own SSH targets is an update check against GitHub releases."
       }
     }
   ]
