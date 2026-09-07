@@ -5,10 +5,11 @@ description = "SSH and SFTP client"
 authors = ["Sina Xhpm (sinaxhpm.com)"]
 license = "MIT"
 edition = "2021"
-# russh 0.63's own crate declares rust-version = "1.85" / edition = "2024";
-# our crate stays on edition 2021 (no code needs 2024), but the toolchain
-# building it must still be >=1.85 to compile that dependency.
-rust-version = "1.85"
+# The floor here is set by two of our own deps, not russh (which only needs
+# 1.85): `keyring` 4.2 declares rust-version = "1.88", and the vault's
+# single-writer claim uses `std::fs::File::try_lock`, stabilized in 1.89.
+# our crate stays on edition 2021 (no code needs 2024).
+rust-version = "1.89"
 
 # Library + binary dual target. The Tauri Builder, command registry, and
 # state setup live in `src/lib.rs::run()`. The bin entry point (`src/main.rs`)
@@ -43,6 +44,16 @@ opt-level = 3
 [profile.dev.package.sha2]
 opt-level = 3
 [profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.chacha20]
+opt-level = 3
+[profile.dev.package.poly1305]
+opt-level = 3
+[profile.dev.package.keyring]
+opt-level = 3
+[profile.dev.package.bip39]
 opt-level = 3
 
 [features]
@@ -132,6 +143,26 @@ zstd = { version = "0.13", default-features = false }
 # String/Vec passed as args to argon2/aes-gcm are zeroized internally by
 # those crates.
 zeroize = { version = "1.8", features = ["zeroize_derive"] }
+# End-to-end vault (spec 002): OS secure store for the device-bound DEK.
+# Constitution v3.2.0 Technology & Architecture Constraints table, row 2 —
+# no stdlib equivalent, the three platform APIs share nothing.
+keyring = "4.2"
+# End-to-end vault (spec 002): XChaCha20-Poly1305, the preferred seal.
+# Constitution table row 1. Pinned to 0.10 (not 0.11) so it stays on the
+# same `aead` 0.5 family as our existing `aes-gcm` 0.10 — see
+# specs/002-e2e-vault-migration/research.md Decision 9.
+chacha20poly1305 = "0.10"
+# End-to-end vault (spec 002): recovery-kit phrase encoding. Constitution
+# table row 5. See research.md Decision 10 for why the phrase carries only
+# the 32-byte wrapped key and requires the vault file to unwrap.
+bip39 = "2.2"
+# End-to-end vault (spec 002): platform authentication (Touch ID / Windows
+# Hello) for the lock lifecycle's quick re-unlock. Constitution table row 4.
+# Its own Cargo.toml gates the Windows/macOS backends behind target cfgs;
+# our lock.rs additionally cfg's the call sites out on Linux entirely (no
+# portable mechanism exists there — research.md Decision 6), so this compiles
+# everywhere but is only ever invoked on macOS/Windows.
+robius-authentication = "0.3.1"
 
 # ---------------------------------------------------------------------------
 # Desktop-only deps. These crates either don't compile on Android at all
@@ -146,3 +177,96 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 tauri-plugin-window-state = "2"
 rfd = "0.14"
 open = "5.1"
+
+# ---------------------------------------------------------------------------
+# Linux-only deps for the end-to-end vault (spec 002).
+# ---------------------------------------------------------------------------
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))'.dependencies]
+# Error-type downcast only, to distinguish VAULT_NO_KEYSTORE (no secret
+# service at all) from VAULT_KEYSTORE_DENIED (present but this request was
+# refused/unavailable) — keyring_core::Error collapses that distinction.
+# default-features = false is MANDATORY: secret-service's default crypto
+# feature can pull in an OpenSSL backend, and cargo features are additive
+# across the whole dependency graph, so naming one here would unify it into
+# keyring's own (pure-Rust) copy. See constitution v3.1.0 table row 3 and
+# research.md Decision 8.
+secret-service = { version = "5", default-features = false }
+# Linux idle-time query for the vault's not-disableable idle-lock timeout
+# (constitution table row 6). x11rb's screensaver extension gives an exact
+# millisecond idle time with no Xlib and no Accessibility-style permission
+# prompt.
+#
+# Wayland has no equivalent API reachable without a NEW crate: the only
+# Wayland-protocol library in the tree is `gdkwayland-sys` (GTK's raw FFI,
+# transitively via tao), which exposes no usable Rust-level client for
+# `ext-idle-notify-v1` — that would need `wayland-client` +
+# `wayland-protocols`, a 7th/8th dependency and a Governance matter under
+# Principle I, not a code decision. lock.rs therefore only wires up X11 idle
+# detection; on a pure-Wayland session the idle timeout never fires
+# (explicit lock, OS screen-lock, and sleep detection via logind/zbus below
+# still work — this gap is documented, not silent, per research.md
+# Decision 12's "accepted gap" characterization).
+x11rb = { version = "0.14", features = ["screensaver"] }
+# Linux screen-lock/sleep detection (logind over D-Bus): `Manager.
+# PrepareForSleep` and `Session.Lock`/`Unlock`. zbus is already resolved in
+# this tree via `secret-service` and `robius-authentication`'s (unused-here)
+# Linux backend — a direct dep pins no new crate.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+# `StreamExt::next()` on the generated proxies' signal streams. Already
+# resolved at 0.3.32 via zbus/async-io's own dependency graph.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# ---------------------------------------------------------------------------
+# macOS-only deps for the end-to-end vault (spec 002): idle/screen-lock/sleep
+# detection (constitution table row 6, research.md Decision 12). `objc2`,
+# `block2`, and `objc2-foundation` are already resolved in this tree via
+# `robius-authentication`'s Apple backend; `objc2-app-kit` (NSWorkspace) is
+# already resolved via `tao`/`wry`/`muda` (Tauri's own window-management
+# stack). Direct deps here pin no new crate.
+# ---------------------------------------------------------------------------
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+block2 = { version = "0.6.1", default-features = false }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std", "NSString", "NSNotification", "NSOperation", "NSDistributedNotificationCenter", "block2",
+] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace"] }
+
+# ---------------------------------------------------------------------------
+# Windows-only deps for the end-to-end vault (spec 002): idle/session-lock/
+# power-event detection (constitution table row 6, research.md Decision 12).
+# Pinned to the exact version `robius-authentication`'s Windows backend
+# already resolves — a direct dep here pins no new crate version, only
+# reuses the one already in the tree.
+# ---------------------------------------------------------------------------
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.56", features = [
+    "Win32_Foundation", "Win32_System_RemoteDesktop", "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation", "Win32_Graphics_Gdi",
+] }
+
+# ---------------------------------------------------------------------------
+# Android-only deps for the end-to-end vault (spec 002 — T113, FR-038).
+# ---------------------------------------------------------------------------
+# `keyring`'s unconditional line above pulls in its "v1" default feature,
+# which only wires up the macOS/Windows/Linux backends (each gated by its
+# own target cfg inside the `keyring` crate itself, so enabling "v1"
+# elsewhere is a no-op, not a leak). Android needs its backend named
+# explicitly — Cargo unions the feature sets of every declaration of the
+# same crate+version, so this adds android-native-keyring-store ONLY on
+# Android, without disturbing what any other platform already gets.
+# `ndk-context`'s application_context (which this store needs) is
+# initialized by Tauri's own Android bootstrap — no extra Kotlin/JNI glue
+# needed on our side.
+[target.'cfg(target_os = "android")'.dependencies]
+keyring = { version = "4.2", features = ["android-native-keyring-store"] }
+# JNI bridge (android_bridge.rs) that initializes `ndk-context`'s global
+# Android context before the first `keyring::Entry` use — verified by
+# direct source inspection that neither Tauri nor tao/wry do this
+# themselves, despite android-native-keyring-store's README claiming
+# otherwise. Both versions already resolved elsewhere in this exact tree
+# (`jni` via `tao`, `ndk-context` via `android-native-keyring-store`
+# itself) — pinning them directly adds no new crate.
+jni = "0.21"
+ndk-context = "0.1"

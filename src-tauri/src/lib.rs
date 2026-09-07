@@ -1,7 +1,5 @@
 // windows_subsystem is bin-only; the matching attribute lives in main.rs.
 
-use aes_gcm::{aead::{Aead, KeyInit}, Aes256Gcm, Nonce};
-use argon2::{Algorithm, Argon2, Params, Version};
 use zeroize::{Zeroize, Zeroizing};
 use rand::Rng;
 use rusqlite::{ffi, Connection, DatabaseName};
@@ -20,6 +18,26 @@ mod about;
 mod mirror;
 mod docker;
 mod hlc;
+// End-to-end vault (spec 002-e2e-vault-migration): sealed container,
+// verification pipeline, migration, rollback, and the writer claim.
+mod vault;
+// OS secure-store wrapper: DEK storage, the VAULT_NO_KEYSTORE vs
+// VAULT_KEYSTORE_DENIED distinction, and the revision high-water mark.
+mod keystore;
+// Platform authentication (Touch ID / Windows Hello) for the lock
+// lifecycle's quick re-unlock. No-op path on Linux (see the module docs).
+mod platform_auth;
+// Lock state machine: idle timeout, focus loss, OS screen lock/sleep,
+// explicit lock, and the concealment/restore contract around them.
+mod lock;
+// Opt-in offline recovery kit: phrase and file forms, sealed under a
+// per-kit recovery passphrase distinct from any device's vault password.
+mod recovery;
+// T113: JNI bridge that initializes ndk-context's global Android context,
+// required by the Android keystore backend before first use. See the
+// module doc for why this exists — Tauri does not do this itself.
+#[cfg(target_os = "android")]
+mod android_bridge;
 use ssh_manager::SshState;
 use monitor::{MonitorMap, SharedSettings};
 use mirror::MirrorMap;
@@ -32,25 +50,35 @@ use tokio::io::AsyncReadExt;
 //   bytes 5..20  salt (16 bytes, per-profile)
 //   bytes 21..32 nonce (12 bytes, per-save)
 //   rest         AES-256-GCM(zstd(serialised-sqlite)) + 16-byte tag
-const VAULT_MAGIC: &[u8; 4] = b"OMNV";
-const VAULT_VERSION: u8 = 1;
-/// zstd compression level. 3 is the library default — fast enough that
-/// save latency is dominated by sqlite serialisation, with compression
-/// ratios within a couple percent of the slower levels for SQL-like data.
-const VAULT_COMPRESS_LEVEL: i32 = 3;
-const SALT_LEN: usize = 16;
-const NONCE_LEN: usize = 12;
-const HEADER_LEN: usize = 4 + 1 + SALT_LEN;
+// SALT_LEN is now an alias into `vault::LEGACY_SALT_LEN` (moved there in
+// the end-to-end vault migration, spec 002 — T008). The magic/version/
+// header/nonce aliases that used to sit alongside it were dropped once
+// Phase 6 (T103) deleted their last callers (the old `import_profile_pick`/
+// `import_profile_save` header-sniffing code) — new code reaches for
+// `vault::LEGACY_*` directly.
+use vault::LEGACY_SALT_LEN as SALT_LEN;
 
 pub struct DbState {
     pub conn: std::sync::Arc<StdMutex<Option<Connection>>>,
-    /// `Zeroizing` wipes the 32-byte AES-256-GCM key on drop. Without
-    /// this, the master key lives on in the heap allocator until the
-    /// slot is reused — long enough to land in a crash dump or swap
-    /// file. The mutex slot itself is overwritten with None on profile
-    /// close which triggers the Zeroize Drop.
-    pub master_key: StdMutex<Option<Zeroizing<[u8; 32]>>>,
-    pub salt: StdMutex<Option<[u8; SALT_LEN]>>,
+    /// The current profile's DEK (spec 002 — the end-to-end vault). Seals
+    /// and opens the sealed container directly; never written to disk in
+    /// this form (it lives wrapped, in the profile's `.keywrap` sidecar).
+    /// `Zeroizing` wipes it on drop — the mutex slot is overwritten with
+    /// `None` on profile close, which triggers that wipe.
+    pub dek: StdMutex<Option<Zeroizing<[u8; 32]>>>,
+    /// Key identifier derived from `dek` (`vault::derive_kid`). Cached
+    /// alongside it since every save's AAD needs it and it's a pure
+    /// function of the DEK.
+    pub kid: StdMutex<Option<[u8; vault::KID_LEN]>>,
+    /// Current revision counter. Advances by exactly one on every
+    /// successful save (FR-005).
+    pub generation: StdMutex<Option<u64>>,
+    /// This device's stable sender identifier (FR-011), loaded once via
+    /// `vault::load_or_create_sender_id` when a profile is unlocked and
+    /// cached here so an ordinary save never needs the `AppHandle` again —
+    /// it is device-wide, not per-profile, but reading it from disk on
+    /// every keystroke-triggered save would be wasteful.
+    pub sender_id: StdMutex<Option<[u8; vault::SENDER_ID_LEN]>>,
     pub db_path: StdMutex<Option<PathBuf>>,
     /// Name of the profile the user picked on the launch screen. Drives the
     /// path of `db_path` (under `<app_data>/profiles/<name>.sshclientx`,
@@ -63,6 +91,26 @@ pub struct DbState {
     /// same clock instance backs both the SQL function and any Rust-side sync
     /// code (the merge engine's `observe`).
     pub hlc: StdMutex<Option<std::sync::Arc<hlc::Hlc>>>,
+    /// Proof this process holds exclusive write access to `active_profile`
+    /// (FR-058, FR-059). Acquired in `select_profile`, released in
+    /// `close_profile` — a lock (FR-044) does NOT release it, since the
+    /// instance is still running and still owns the profile. Its mere
+    /// presence (`Some`) is what every save path requires before writing,
+    /// matching how `dek`/`kid`/`generation`/`sender_id`/`db_path` are
+    /// already required to be `Some` — one more entry in the same
+    /// all-or-nothing resource check, not a separate mechanism.
+    pub writer_claim: StdMutex<Option<vault::WriterClaim>>,
+    /// Vault lock lifecycle state (spec 002, data-model.md §2.10). Process
+    /// state only, never persisted — a restarted process always starts
+    /// `Unlocked`, which is harmless before a profile is even selected
+    /// since every content-bearing operation already separately requires
+    /// `dek`/`conn`/`db_path` to be `Some`.
+    pub lock_state: StdMutex<lock::LockState>,
+    /// Consecutive platform-authentication *failures* (not "unavailable"
+    /// attempts) since the last success or full unlock — FR-057's
+    /// threshold for falling back to the password (`platform_auth::
+    /// should_fall_back_to_password`).
+    pub platform_auth_failures: StdMutex<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -147,68 +195,36 @@ pub(crate) fn validate_profile_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-// Argon2id parameters for vault-key derivation:
-//   m_cost   64 MiB  — memory hardness; raises cost of GPU/ASIC attacks
-//   t_cost   3       — passes over the buffer
-//   p_cost   4       — parallelism; up to 4 lanes if available
-//   output   32 B    — AES-256-GCM key length
-// Tuned higher than OWASP's interactive-login defaults because this protects
-// the entire profile vault, not a single-request login. Changing these
-// values invalidates every existing vault — bump only on a deliberate
-// re-keying migration.
-const ARGON2_M_COST: u32 = 64 * 1024;
-const ARGON2_T_COST: u32 = 3;
-const ARGON2_P_COST: u32 = 4;
+fn save_vault_internal(state: &DbState) -> Result<(), String> {
+    let conn_guard = state.conn.lock().map_err(|_| "[STATE] MUTEX_POISON_CONN")?;
+    let dek_guard = state.dek.lock().map_err(|_| "[STATE] MUTEX_POISON_KEY")?;
+    let kid_guard = state.kid.lock().map_err(|_| "[STATE] MUTEX_POISON_KID")?;
+    let mut gen_guard = state.generation.lock().map_err(|_| "[STATE] MUTEX_POISON_GENERATION")?;
+    let sender_guard = state.sender_id.lock().map_err(|_| "[STATE] MUTEX_POISON_SENDER")?;
+    let path_guard = state.db_path.lock().map_err(|_| "[STATE] MUTEX_POISON_PATH")?;
+    let profile_guard = state.active_profile.lock().map_err(|_| "[STATE] MUTEX_POISON_PROFILE")?;
+    // T048 (FR-061): no claim, no write. The claim's mere presence is the
+    // check — held alongside every other required resource, not a
+    // separate mechanism.
+    let claim_guard = state.writer_claim.lock().map_err(|_| "[STATE] MUTEX_POISON_CLAIM")?;
+    let path = match &*path_guard {
+        Some(p) => p.clone(),
+        None => return Err("[STATE] MISSING_REQUIRED_RESOURCES_FOR_SAVE".into()),
+    };
 
-fn derive_key(password: &str, salt_bytes: &[u8]) -> Result<[u8; 32], String> {
-    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
-        .map_err(|e| format!("[CRYPTO] ARGON2_PARAMS: {}", e))?;
-    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = [0u8; 32];
-    // Raw API: write derived bytes directly into the key buffer. Avoids
-    // the PHC-string round-trip (encode then truncate b64) the previous
-    // implementation used, which was fragile and made parameter changes
-    // invisible to type-checking.
-    argon2
-        .hash_password_into(password.as_bytes(), salt_bytes, &mut key)
-        .map_err(|e| format!("[CRYPTO] HASH_FAILED: {}", e))?;
-    Ok(key)
-}
-
-fn encrypt_with_key(plaintext: &[u8], key: &[u8; 32]) -> Result<(Vec<u8>, [u8; NONCE_LEN]), String> {
-    let cipher = Aes256Gcm::new(key.into());
-    let nonce_bytes: [u8; NONCE_LEN] = rand::thread_rng().gen();
-    let nonce = Nonce::from_slice(&nonce_bytes);
-    let ciphertext = cipher.encrypt(nonce, plaintext)
-        .map_err(|e| format!("[CRYPTO] ENCRYPT_FAILED: {}", e))?;
-    Ok((ciphertext, nonce_bytes))
-}
-
-fn decrypt_with_key(ciphertext: &[u8], nonce_bytes: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, String> {
-    if nonce_bytes.len() != NONCE_LEN {
-        return Err("[CRYPTO] NONCE_LEN_INVALID".into());
+    if let (Some(conn), Some(dek), Some(kid), Some(generation), Some(sender_id), Some(profile_name), Some(_claim)) =
+        (&*conn_guard, &*dek_guard, &*kid_guard, &mut *gen_guard, &*sender_guard, &*profile_guard, &*claim_guard)
+    {
+        // Advance the revision counter only once the save actually
+        // succeeds — a failed attempt must not burn a generation number
+        // (that would make the next real save look like it skipped one).
+        let new_generation = *generation + 1;
+        save_vault_blocking(conn, dek, *kid, *sender_id, new_generation, &path, profile_name)?;
+        *generation = new_generation;
+        Ok(())
+    } else {
+        Err("[STATE] MISSING_REQUIRED_RESOURCES_FOR_SAVE".into())
     }
-    let cipher = Aes256Gcm::new(key.into());
-    let nonce = Nonce::from_slice(nonce_bytes);
-    cipher.decrypt(nonce, ciphertext)
-        .map_err(|e| format!("[CRYPTO] DECRYPT_FAILURE: Possible wrong key or corrupted data. Details: {}", e))
-}
-
-/// Returns (salt, nonce, ciphertext) parsed out of an on-disk vault blob.
-fn parse_vault_blob(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
-    if data.len() < HEADER_LEN + NONCE_LEN {
-        return Err("[VAULT] INVALID_FORMAT: Data too short".into());
-    }
-    if &data[..4] != VAULT_MAGIC {
-        return Err("[VAULT] BAD_MAGIC".into());
-    }
-    if data[4] != VAULT_VERSION {
-        return Err(format!("[VAULT] UNSUPPORTED_VERSION: {}", data[4]));
-    }
-    let salt = data[5..5 + SALT_LEN].to_vec();
-    let nonce = data[HEADER_LEN..HEADER_LEN + NONCE_LEN].to_vec();
-    let ct = data[HEADER_LEN + NONCE_LEN..].to_vec();
-    Ok((salt, nonce, ct))
 }
 
 /// Copies `data` into a sqlite-allocated buffer wrapped in `OwnedData`.
@@ -224,117 +240,28 @@ fn to_sqlite_owned(data: &[u8]) -> Result<OwnedData, String> {
     }
 }
 
-fn write_vault_blob(salt: &[u8; SALT_LEN], nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER_LEN + NONCE_LEN + ciphertext.len());
-    out.extend_from_slice(VAULT_MAGIC);
-    out.push(VAULT_VERSION);
-    out.extend_from_slice(salt);
-    out.extend_from_slice(nonce);
-    out.extend_from_slice(ciphertext);
-    out
-}
-
-/// Compress the plaintext SQLite serialisation for vault v2 writes.
-/// Errors here are surfaced as crypto-domain errors because the caller's
-/// invariant ("save the DB") is what's broken, not just I/O.
-fn vault_compress(plaintext: &[u8]) -> Result<Vec<u8>, String> {
-    zstd::stream::encode_all(plaintext, VAULT_COMPRESS_LEVEL)
-        .map_err(|e| format!("[VAULT] COMPRESS_FAILED: {}", e))
-}
-
-/// Decompress the post-decrypt body for vault v2 reads. Bounded by a
-/// generous max-size guard so a corrupt or hostile file can't make us
-/// allocate gigabytes — a real SSHClientX SQLite snapshot is well under
-/// 64 MiB even with thousands of nodes.
-fn vault_decompress(compressed: &[u8]) -> Result<Vec<u8>, String> {
-    const MAX_DECOMPRESSED: usize = 64 * 1024 * 1024;
-    let mut out = Vec::new();
-    let mut decoder = zstd::stream::Decoder::new(compressed)
-        .map_err(|e| format!("[VAULT] DECOMPRESS_INIT_FAILED: {}", e))?;
-    use std::io::Read;
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = decoder.read(&mut buf)
-            .map_err(|e| format!("[VAULT] DECOMPRESS_FAILED: {}", e))?;
-        if n == 0 { break; }
-        if out.len() + n > MAX_DECOMPRESSED {
-            return Err("[VAULT] DECOMPRESS_TOO_LARGE: refusing to inflate past 64 MiB".into());
-        }
-        out.extend_from_slice(&buf[..n]);
-    }
-    Ok(out)
-}
-
-fn save_vault_internal(state: &DbState) -> Result<(), String> {
-    let conn_guard = state.conn.lock().map_err(|_| "[STATE] MUTEX_POISON_CONN")?;
-    let key_guard = state.master_key.lock().map_err(|_| "[STATE] MUTEX_POISON_KEY")?;
-    let salt_guard = state.salt.lock().map_err(|_| "[STATE] MUTEX_POISON_SALT")?;
-    let mut path_guard = state.db_path.lock().map_err(|_| "[STATE] MUTEX_POISON_PATH")?;
-    let path = match &*path_guard {
-        Some(p) => p.clone(),
-        None => return Err("[STATE] MISSING_REQUIRED_RESOURCES_FOR_SAVE".into()),
-    };
-
-    if let (Some(conn), Some(key), Some(salt)) =
-        (&*conn_guard, &*key_guard, &*salt_guard)
-    {
-        let dest = migrate_vault_path(&path);
-        save_vault_blocking(conn, key, salt, &dest)?;
-        if dest != path {
-            let _ = fs::remove_file(&path);
-            *path_guard = Some(dest);
-        }
-        Ok(())
-    } else {
-        Err("[STATE] MISSING_REQUIRED_RESOURCES_FOR_SAVE".into())
-    }
-}
-
-/// Pure-sync vault serialise + encrypt + atomic write. Pulled out of
-/// `save_vault_internal` so the async wrapper below can hand it to
-/// `spawn_blocking` with owned snapshots — keeps the SQLite serialise,
-/// zstd compression, AES-GCM encrypt, and fsync off the tokio worker
+/// Pure-sync vault serialise + seal + atomic write, at `new_generation`.
+/// Pulled out of `save_vault_internal` so the async wrapper below can hand
+/// it to `spawn_blocking` with owned snapshots — keeps the SQLite
+/// serialise, zstd compression, AEAD seal, and fsync off the tokio worker
 /// pool during hot paths like the post-connect `persist_vault` call.
+///
+/// Writes the new sealed format only (`vault::seal_and_save`) — there is no
+/// legacy write path any more; a legacy vault is migrated to this format
+/// once, synchronously, during unlock (`setup_master_db_inner`), before any
+/// ordinary save is ever reachable.
 fn save_vault_blocking(
     conn: &Connection,
-    key: &Zeroizing<[u8; 32]>,
-    salt: &[u8; SALT_LEN],
+    dek: &Zeroizing<[u8; 32]>,
+    kid: [u8; vault::KID_LEN],
+    sender_id: [u8; vault::SENDER_ID_LEN],
+    new_generation: u64,
     path: &Path,
+    profile_name: &str,
 ) -> Result<(), String> {
     let serialized = conn.serialize(DatabaseName::Main)
         .map_err(|e| format!("[DATABASE] SERIALIZE_FAILED: {}", e))?;
-    // Compress-then-encrypt. Order matters: compressing AFTER encryption
-    // is useless because AES-GCM ciphertext is indistinguishable from
-    // random. Doing it before keeps the on-disk file small AND keeps
-    // ciphertext semantically secure.
-    let compressed = Zeroizing::new(vault_compress(&*serialized)?);
-    let (ciphertext, nonce) = encrypt_with_key(&compressed, key)?;
-    let blob = write_vault_blob(salt, &nonce, &ciphertext);
-    // Atomic write: tmp -> fsync -> rename. A crash / power loss in the
-    // middle of a direct fs::write would leave the vault truncated, and
-    // every saved credential would be unrecoverable on next launch.
-    let tmp_path = path.with_extension("sshclientx.tmp");
-    {
-        use std::io::Write as _;
-        let mut f = fs::File::create(&tmp_path)
-            .map_err(|e| format!("[FILE] VAULT_TMP_CREATE_FAILED at {:?}: {}", tmp_path, e))?;
-        // The vault holds every saved private key/password; restrict it to the
-        // owner before writing any bytes so it's never briefly world/group
-        // readable via the process umask (matches app_temp_root's 0700 rationale).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("[FILE] VAULT_TMP_CHMOD_FAILED at {:?}: {}", tmp_path, e))?;
-        }
-        f.write_all(&blob)
-            .map_err(|e| format!("[FILE] VAULT_TMP_WRITE_FAILED at {:?}: {}", tmp_path, e))?;
-        f.sync_all()
-            .map_err(|e| format!("[FILE] VAULT_TMP_SYNC_FAILED at {:?}: {}", tmp_path, e))?;
-    }
-    fs::rename(&tmp_path, path)
-        .map_err(|e| format!("[FILE] VAULT_RENAME_FAILED {:?} -> {:?}: {}", tmp_path, path, e))?;
-    Ok(())
+    vault::seal_and_save(dek, kid, sender_id, "", new_generation, &serialized, path, profile_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -727,32 +654,54 @@ mod sync_trigger_tests {
 /// and keystrokes don't stall on the tokio worker pool.
 async fn save_vault_async(state: &DbState) -> Result<(), String> {
     let conn_arc = std::sync::Arc::clone(&state.conn);
-    let (key, salt, path) = {
-        let kg = state.master_key.lock().map_err(|_| "[STATE] MUTEX_POISON_KEY")?;
-        let sg = state.salt.lock().map_err(|_| "[STATE] MUTEX_POISON_SALT")?;
+    let (dek, kid, new_generation, sender_id, path, profile_name) = {
+        let dk = state.dek.lock().map_err(|_| "[STATE] MUTEX_POISON_KEY")?;
+        let kg = state.kid.lock().map_err(|_| "[STATE] MUTEX_POISON_KID")?;
+        let gg = state.generation.lock().map_err(|_| "[STATE] MUTEX_POISON_GENERATION")?;
+        let sg = state.sender_id.lock().map_err(|_| "[STATE] MUTEX_POISON_SENDER")?;
         let pg = state.db_path.lock().map_err(|_| "[STATE] MUTEX_POISON_PATH")?;
-        match (kg.as_ref(), sg.as_ref(), pg.as_ref()) {
-            (Some(k), Some(s), Some(p)) => (k.clone(), *s, p.clone()),
+        let profg = state.active_profile.lock().map_err(|_| "[STATE] MUTEX_POISON_PROFILE")?;
+        // T048 (FR-061): no claim, no write — checked for presence here
+        // alongside every other required resource. The claim itself isn't
+        // `Clone`/moved into the blocking closure; it doesn't need to be —
+        // only its existence in `state` for the duration of this call is
+        // the guarantee, and `state` outlives this whole async function.
+        let claimg = state.writer_claim.lock().map_err(|_| "[STATE] MUTEX_POISON_CLAIM")?;
+        match (dk.as_ref(), kg.as_ref(), gg.as_ref(), sg.as_ref(), pg.as_ref(), profg.as_ref(), claimg.as_ref()) {
+            (Some(d), Some(k), Some(g), Some(s), Some(p), Some(profile), Some(_claim)) =>
+                (d.clone(), *k, *g + 1, *s, p.clone(), profile.clone()),
             _ => return Err("[STATE] MISSING_REQUIRED_RESOURCES_FOR_SAVE".into()),
         }
     };
     tokio::task::spawn_blocking(move || {
         let cg = conn_arc.lock().map_err(|_| "[STATE] MUTEX_POISON_CONN")?;
         let conn = cg.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
-        save_vault_blocking(conn, &key, &salt, &path)
+        save_vault_blocking(conn, &dek, kid, sender_id, new_generation, &path, &profile_name)
     })
     .await
-    .map_err(|e| format!("[CRYPTO] VAULT_JOIN: {}", e))?
+    .map_err(|e| format!("[CRYPTO] VAULT_JOIN: {}", e))??;
+    // Only advance the cached generation counter after the write actually
+    // succeeded — a failed save must not burn a generation number, or the
+    // next real save would look like it silently skipped one.
+    *state.generation.lock().map_err(|_| "[STATE] MUTEX_POISON_GENERATION")? = Some(new_generation);
+    Ok(())
 }
 
 /// Returns the list of available profile names (sorted, lowercased not enforced).
 #[tauri::command]
-async fn list_profiles(app_handle: tauri::AppHandle) -> Result<Vec<String>, String> {
+/// T121 (contracts/tauri-command-contract.md §1): what the picker needs
+/// without opening anything. `revision` reads straight from the sealed
+/// header — no key required — and is `0` for a legacy file, which has no
+/// revision concept at all. `busy` is a non-blocking probe: acquiring and
+/// immediately dropping a `WriterClaim` releases the OS lock right away,
+/// so this never holds the claim past the check and never blocks another
+/// instance from picking the same profile a moment later.
+async fn list_profiles(app_handle: tauri::AppHandle) -> Result<Vec<serde_json::Value>, String> {
     let dir = profiles_dir(&app_handle)?;
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let mut out = Vec::new();
+    let mut names = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|e| format!("[FILE] READ_DIR_FAILED: {}", e))? {
         let entry = match entry { Ok(e) => e, Err(_) => continue };
         let path = entry.path();
@@ -762,21 +711,82 @@ async fn list_profiles(app_handle: tauri::AppHandle) -> Result<Vec<String>, Stri
             // Hide anything that wouldn't pass our name validator — likely
             // a manually-placed file or stray artefact. We don't surface it
             // because the user has no way to act on it from the UI.
-            if validate_profile_name(stem).is_ok() && !out.iter().any(|n| n == stem) {
-                out.push(stem.to_string());
+            if validate_profile_name(stem).is_ok() && !names.iter().any(|n: &String| n == stem) {
+                names.push(stem.to_string());
             }
         }
     }
-    out.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        let path = profile_path(&app_handle, &name)?;
+        let (format, revision) = match fs::read(&path) {
+            Ok(bytes) => match vault::discriminate_format(&bytes) {
+                vault::DiscriminatedFormat::Sealed => match vault::SealedVaultFile::parse(&bytes) {
+                    Ok(sealed) => ("sealed", sealed.generation),
+                    Err(_) => ("sealed", 0),
+                },
+                vault::DiscriminatedFormat::Legacy => ("legacy", 0),
+                vault::DiscriminatedFormat::Unknown => ("legacy", 0),
+            },
+            // Unreadable is surfaced as "legacy, revision 0" rather than
+            // failing the whole listing — whatever's actually wrong shows
+            // up properly the moment the user tries to open it.
+            Err(_) => ("legacy", 0),
+        };
+        let busy = match vault::WriterClaim::acquire(&path) {
+            Ok(_claim) => false, // dropped immediately: releases the OS lock right away
+            Err(vault::Outcome::VaultBusy) => true,
+            Err(_) => false,
+        };
+        // Frontend-only addition beyond contract §1's ProfileSummary: the
+        // rollback-resolution dialog needs to name BOTH revisions (the
+        // file's own, above, and this device's last-seen high-water mark)
+        // without inventing a structured-error mechanism the rest of the
+        // codebase doesn't have. Needs no key, same as everything else here.
+        let high_water = keystore::load_high_water(&name).unwrap_or(0);
+        out.push(serde_json::json!({ "name": name, "format": format, "revision": revision, "busy": busy, "high_water": high_water }));
+    }
     Ok(out)
 }
 
+/// T114: exposes the profiles directory path so the picker can warn when it
+/// appears to sit inside a cloud-synced folder (`flock` gives no
+/// cross-machine exclusion there — research.md Decision 11). Read-only,
+/// no key material, just the same path every other profile command already
+/// resolves internally.
+#[tauri::command]
+async fn profiles_dir_path(app_handle: tauri::AppHandle) -> Result<String, String> {
+    Ok(profiles_dir(&app_handle)?.to_string_lossy().into_owned())
+}
+
+/// T046/T047: acquire this profile's writer claim, replacing any claim
+/// already held (e.g. for a previously selected profile — `close_profile`
+/// is expected to have released it first, but dropping the old `Some`
+/// here releases it regardless, since a `WriterClaim`'s `Drop` closes its
+/// file handle and frees the OS lock).
+///
+/// FR-058: refuses with a `VAULT_BUSY`-shaped message naming the profile
+/// when another live instance already holds it — the caller (`select_profile`,
+/// `create_profile`) is where the profile name is known; this helper just
+/// resolves the claim.
+fn acquire_writer_claim(state: &DbState, vault_path: &Path, name: &str) -> Result<(), String> {
+    let claim = vault::WriterClaim::acquire(vault_path).map_err(|o| match o {
+        vault::Outcome::VaultBusy => format!("[VAULT] VAULT_BUSY: '{}' is already open in another running copy of SSHClientX.", name),
+        other => other.to_string(),
+    })?;
+    *state.writer_claim.lock().map_err(|_| "[STATE] LOCK_FAILED_CLAIM")? = Some(claim);
+    Ok(())
+}
 
 /// Mark a profile as the active one. Subsequent `check_db_exists` /
 /// `setup_master_db` calls operate against that profile's file. Returns
 /// whether the profile's encrypted file already exists (caller uses this
 /// to decide between "ask for password" and "this profile is empty / not
-/// yet created" flows).
+/// yet created" flows). Also acquires the writer claim (T046) — a profile
+/// already open in another running instance is refused here, before
+/// anything else about it is touched.
 #[tauri::command]
 async fn select_profile(
     app_handle: tauri::AppHandle,
@@ -784,8 +794,10 @@ async fn select_profile(
     name: String,
 ) -> Result<bool, String> {
     validate_profile_name(&name)?;
+    let path = profile_path(&app_handle, &name)?;
+    acquire_writer_claim(&state, &path, &name)?;
     *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name.clone());
-    Ok(profile_path(&app_handle, &name)?.exists())
+    Ok(path.exists())
 }
 
 /// Drop in-memory state so the UI can return to the profile picker without
@@ -870,11 +882,26 @@ async fn close_profile(
     // 6. Drop DB state last, so any in-flight write triggered by a
     // disconnecting handler above had a valid DB to land in.
     *state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED_CONN")? = None;
-    *state.master_key.lock().map_err(|_| "[STATE] LOCK_FAILED_KEY")? = None;
-    *state.salt.lock().map_err(|_| "[STATE] LOCK_FAILED_SALT")? = None;
+    *state.dek.lock().map_err(|_| "[STATE] LOCK_FAILED_KEY")? = None;
+    *state.kid.lock().map_err(|_| "[STATE] LOCK_FAILED_KID")? = None;
+    *state.generation.lock().map_err(|_| "[STATE] LOCK_FAILED_GENERATION")? = None;
+    *state.sender_id.lock().map_err(|_| "[STATE] LOCK_FAILED_SENDER")? = None;
     *state.db_path.lock().map_err(|_| "[STATE] LOCK_FAILED_PATH")? = None;
     *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE")? = None;
     *state.hlc.lock().map_err(|_| "[STATE] LOCK_FAILED_HLC")? = None;
+    // Reset lock state too — without this, locking then closing the
+    // profile (without unlocking first) would leave `locked_soft`/
+    // `locked_hard` stale in `DbState` for whatever profile is opened
+    // next, making a fresh, successful unlock immediately look locked
+    // again to the frontend.
+    *state.lock_state.lock().map_err(|_| "[STATE] LOCK_FAILED_LOCKSTATE")? = lock::LockState::Unlocked;
+    *state.platform_auth_failures.lock().map_err(|_| "[STATE] LOCK_FAILED_AUTHFAIL")? = 0;
+    // T046 (FR-059): release the writer claim LAST, after every other
+    // piece of teardown above has completed — so a second instance that
+    // was waiting on `VAULT_BUSY` cannot start writing until this
+    // instance has genuinely finished with the profile, not merely
+    // decided to leave.
+    *state.writer_claim.lock().map_err(|_| "[STATE] LOCK_FAILED_CLAIM")? = None;
     Ok(())
 }
 
@@ -901,6 +928,503 @@ async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<()
     }
 }
 
+/// T038 (FR-015a): the user has seen the one-time migration notice. Deletes
+/// the pre-migration legacy file. Until this is called, that file is left
+/// alone — it is the only thing standing between a crash mid-migration and
+/// a lost vault (see `run` on the `Legacy` branch of `setup_master_db_inner`,
+/// which never touches it). A retained legacy file opens with the password
+/// alone on any machine, which would nullify the whole point of this
+/// feature, so this is the deliberate moment that stops being true.
+///
+/// A no-op (not an error) if no legacy file exists for this profile — the
+/// notice may be acknowledged for a profile that was never migrated, or
+/// acknowledged twice.
+#[tauri::command]
+async fn migration_notice_ack(app_handle: tauri::AppHandle, name: String) -> Result<(), String> {
+    validate_profile_name(&name)?;
+    let dir = profiles_dir(&app_handle)?;
+    let legacy_path = vault_file(&dir, &name, VAULT_EXT_LEGACY);
+    if legacy_path.exists() {
+        fs::remove_file(&legacy_path)
+            .map_err(|e| format!("[FILE] LEGACY_DELETE_FAILED at {:?}: {}", legacy_path, e))?;
+    }
+    Ok(())
+}
+
+/// T043 (FR-064, FR-065): resolve a possible-rollback outcome the user has
+/// already been shown by `setup_master_db`. `choice` is `"accept_older"` —
+/// use the file as-is and stop warning about it — or `"restore_newer"`,
+/// which requires `revision` and restores that generation from local
+/// history over the current (rolled-back) file.
+///
+/// Does not itself re-attempt unlock — the caller re-invokes
+/// `setup_master_db` afterward, which will now see a file whose revision
+/// is no longer below the high-water mark either way.
+#[tauri::command]
+async fn rollback_resolve(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, DbState>,
+    name: String,
+    choice: String,
+    revision: Option<u64>,
+) -> Result<(), String> {
+    validate_profile_name(&name)?;
+    let path = profile_path(&app_handle, &name)?;
+    let file_bytes = fs::read(&path).map_err(|e| format!("[FILE] VAULT_READ_FAILED: {}", e))?;
+    let sealed = vault::SealedVaultFile::parse(&file_bytes).map_err(|o| o.to_string())?;
+
+    match choice.as_str() {
+        "accept_older" => {
+            vault::accept_rollback(&name, sealed.generation).map_err(|o| o.to_string())
+        }
+        "restore_newer" => {
+            let revision = revision.ok_or("[VALIDATION] RESTORE_NEWER_REQUIRES_A_REVISION")?;
+            let history_path = vault::revisions_dir(&path).join(format!("g{}.sshclientx", revision));
+            if !history_path.exists() {
+                return Err(format!(
+                    "[VAULT] REVISION_NOT_IN_HISTORY: no local copy of generation {} exists to restore.",
+                    revision
+                ));
+            }
+            // FR-058/FR-061: this writes the profile file directly, same as
+            // any other vault write, and must not bypass the single-writer
+            // guarantee. If this IS the currently-open profile,
+            // `state.writer_claim` already proves exclusive access —
+            // acquiring a SECOND claim on the same path from this same
+            // process would itself report VAULT_BUSY (a fresh `File`
+            // handle to an already-locked path conflicts even within one
+            // process, per `WriterClaim`'s own doc comment). Otherwise,
+            // acquire-and-drop a claim to prove no OTHER instance holds it.
+            let active = state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE")?.clone();
+            let _claim = if active.as_deref() == Some(name.as_str()) {
+                None
+            } else {
+                Some(vault::WriterClaim::acquire(&path).map_err(|o| match o {
+                    vault::Outcome::VaultBusy => format!("[VAULT] VAULT_BUSY: '{}' is already open in another running copy of SSHClientX.", name),
+                    other => other.to_string(),
+                })?)
+            };
+            // Atomic replace: tmp -> fsync -> rename, same discipline as an
+            // ordinary save, so an interruption here leaves either the
+            // rolled-back file or the restored one intact — never neither.
+            let tmp_path = path.with_extension("sshclientx.tmp");
+            fs::copy(&history_path, &tmp_path)
+                .map_err(|e| format!("[FILE] REVISION_RESTORE_COPY_FAILED: {}", e))?;
+            fs::rename(&tmp_path, &path)
+                .map_err(|e| format!("[FILE] REVISION_RESTORE_RENAME_FAILED: {}", e))?;
+            Ok(())
+        }
+        _ => Err("[VALIDATION] UNKNOWN_ROLLBACK_CHOICE".into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lock lifecycle commands (T066, T067) — contracts/tauri-command-contract.md §4
+// ---------------------------------------------------------------------------
+
+/// Explicit lock. `hard: true` is what the UI's lock button always sends
+/// (contract §4) and reaches `locked_hard` regardless of the current state;
+/// `hard: false` drives the same soft-lock path a window focus-loss event
+/// does (T052), kept for parity/testability even though the renderer never
+/// calls it that way.
+#[tauri::command]
+async fn vault_lock(app_handle: tauri::AppHandle, state: tauri::State<'_, DbState>, hard: bool) -> Result<(), String> {
+    let event = if hard { lock::LockEvent::ExplicitLock } else { lock::LockEvent::FocusLost };
+    lock::perform_lock(&app_handle, &state, event).await?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn vault_lock_state(state: tauri::State<'_, DbState>) -> Result<String, String> {
+    Ok(state.lock_state.lock().map_err(|_| "[STATE] LOCK_FAILED_LOCKSTATE")?.as_str().to_string())
+}
+
+#[tauri::command]
+async fn idle_timeout_get(app_handle: tauri::AppHandle) -> Result<u32, String> {
+    Ok(lock::idle_timeout_get(&app_handle))
+}
+
+#[tauri::command]
+async fn idle_timeout_set(app_handle: tauri::AppHandle, minutes: u32) -> Result<(), String> {
+    lock::idle_timeout_set(&app_handle, minutes)
+}
+
+/// Platform authentication only (FR-054). Valid solely from `locked_soft`
+/// (FR-054, T069) — `locked_hard` and `unlocked` both return `VAULT_AUTH`,
+/// which is exactly what forces the password in the cases FR-053 lists.
+///
+/// A failed (not merely unavailable) attempt counts toward FR-057's
+/// consecutive-failure threshold (`platform_auth::
+/// should_fall_back_to_password`); the caller (renderer) is expected to
+/// stop offering this command and fall back to `vault_unlock_full` once
+/// that threshold is reached — there is no limit enforced on the password
+/// path itself, so the vault can never become permanently unopenable.
+#[tauri::command]
+async fn vault_unlock_quick(app_handle: tauri::AppHandle, state: tauri::State<'_, DbState>) -> Result<(), String> {
+    // T107/FR-067: every unlock after the first goes through here or
+    // `vault_unlock_full` — both need the same diagnostic coverage
+    // `setup_master_db` (the first unlock) already has.
+    let result = vault_unlock_quick_inner(&app_handle, &state).await;
+    vault::record_outcome(&app_handle, result)
+}
+
+async fn vault_unlock_quick_inner(app_handle: &tauri::AppHandle, state: &DbState) -> Result<(), String> {
+    if *state.lock_state.lock().map_err(|_| "[STATE] LOCK_FAILED_LOCKSTATE")? != lock::LockState::LockedSoft {
+        return Err(vault::Outcome::VaultAuth.to_string());
+    }
+    // T065 (FR-057): after enough consecutive failures, stop even offering
+    // the prompt — the caller must switch to `vault_unlock_full`. This is
+    // never a permanent lock-out: the counter only ever gates THIS command,
+    // and resets to 0 on any success (quick or full), so the password path
+    // is always available with no attempt limit of its own.
+    let failures = *state.platform_auth_failures.lock().map_err(|_| "[STATE] LOCK_FAILED_AUTHFAIL")?;
+    if platform_auth::should_fall_back_to_password(failures) {
+        return Err(vault::Outcome::VaultAuth.to_string());
+    }
+    let profile_name = state.active_profile.lock()
+        .map_err(|_| "[STATE] LOCK_FAILED_PROFILE")?
+        .clone()
+        .ok_or("[STATE] NO_PROFILE_SELECTED")?;
+    let expected_kid = state.kid.lock()
+        .map_err(|_| "[STATE] LOCK_FAILED_KID")?
+        .ok_or_else(|| vault::Outcome::VaultLocked.to_string())?;
+
+    match platform_auth::authenticate("unlock SSHClientX").await {
+        platform_auth::AuthOutcome::Success => {
+            let dek = tokio::task::spawn_blocking({
+                let profile_name = profile_name.clone();
+                move || keystore::load_quick_unlock(&profile_name)
+            })
+                .await
+                .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))?
+                .map_err(|o| o.to_string())?;
+            // The quick-unlock entry is written by this same process
+            // (`lock::perform_lock`) and never by anything else, but this
+            // check is cheap insurance against a stale entry from an old
+            // profile/DEK generation surviving a keystore restore.
+            if vault::derive_kid(&dek) != expected_kid {
+                return Err(vault::Outcome::VaultCorrupt.to_string());
+            }
+            *state.dek.lock().map_err(|_| "[STATE] LOCK_FAILED_KEY")? = Some(Zeroizing::new(dek));
+            *state.platform_auth_failures.lock().map_err(|_| "[STATE] LOCK_FAILED_AUTHFAIL")? = 0;
+            lock::apply_unlock(app_handle, state, lock::LockEvent::PlatformAuthSucceeded)
+        }
+        platform_auth::AuthOutcome::Failed => {
+            if let Ok(mut count) = state.platform_auth_failures.lock() {
+                *count += 1;
+            }
+            Err(vault::Outcome::VaultAuth.to_string())
+        }
+        platform_auth::AuthOutcome::Unavailable => Err(vault::Outcome::VaultAuth.to_string()),
+    }
+}
+
+/// Password plus secure store. Valid from either locked state (FR-053) —
+/// re-derives the DEK exactly like the initial unlock in
+/// `setup_master_db_inner`, but reuses the already-open `conn`/`db_path`
+/// rather than re-reading and re-deserialising the vault file, since a
+/// lock never closes either of those (T058).
+#[tauri::command]
+async fn vault_unlock_full(app_handle: tauri::AppHandle, state: tauri::State<'_, DbState>, password: String) -> Result<(), String> {
+    // T107/FR-067: same diagnostic coverage as `vault_unlock_quick` and the
+    // very first unlock (`setup_master_db`).
+    let result = vault_unlock_full_inner(&app_handle, &state, password).await;
+    vault::record_outcome(&app_handle, result)
+}
+
+async fn vault_unlock_full_inner(app_handle: &tauri::AppHandle, state: &DbState, mut password: String) -> Result<(), String> {
+    let profile_name = state.active_profile.lock()
+        .map_err(|_| "[STATE] LOCK_FAILED_PROFILE")?
+        .clone()
+        .ok_or("[STATE] NO_PROFILE_SELECTED")?;
+    let path = state.db_path.lock()
+        .map_err(|_| "[STATE] LOCK_FAILED_PATH")?
+        .clone()
+        .ok_or("[STATE] MISSING_REQUIRED_RESOURCES_FOR_SAVE")?;
+    let expected_kid = state.kid.lock()
+        .map_err(|_| "[STATE] LOCK_FAILED_KID")?
+        .ok_or_else(|| vault::Outcome::VaultLocked.to_string())?;
+
+    let device_factor = keystore::load_device_factor(&profile_name).map_err(|o| o.to_string())?;
+    let keywrap_bytes = fs::read(vault::keywrap_path(&path))
+        .map_err(|e| format!("[FILE] KEYWRAP_READ_FAILED: {}", e))?;
+    let keywrap = vault::KeyWrapFile::parse(&keywrap_bytes).map_err(|o| o.to_string())?;
+
+    let mut password_owned = std::mem::take(&mut password);
+    let unwrapped = tokio::task::spawn_blocking(move || {
+        let res = keywrap.unwrap_dek(&device_factor, &password_owned);
+        password_owned.zeroize();
+        res
+    })
+        .await
+        .map_err(|e| format!("[CRYPTO] KDF_JOIN: {}", e))?
+        .map_err(|o| o.to_string())?;
+
+    if vault::derive_kid(&unwrapped) != expected_kid {
+        return Err(vault::Outcome::VaultAuth.to_string());
+    }
+
+    *state.dek.lock().map_err(|_| "[STATE] LOCK_FAILED_KEY")? = Some(unwrapped);
+    *state.platform_auth_failures.lock().map_err(|_| "[STATE] LOCK_FAILED_AUTHFAIL")? = 0;
+    lock::apply_unlock(app_handle, state, lock::LockEvent::FullUnlockSucceeded)
+}
+
+/// Password half of FR-055 identity confirmation — the other half,
+/// platform authentication, is `confirm_identity` below, which wraps this.
+///
+/// Verifies `password` actually unwraps to the SAME DEK already held in
+/// `state` — re-derives independently from the on-disk key-wrap and the
+/// keystore's device factor rather than trusting anything cached, so a
+/// wrong password is caught even if in-memory state were somehow stale.
+/// Touches no session state either way; only the caller decides what a
+/// confirmed identity is allowed to do next.
+async fn confirm_identity_by_password(state: &DbState, password: String) -> Result<(), String> {
+    let profile_name = state.active_profile.lock()
+        .map_err(|_| "[STATE] LOCK_FAILED_PROFILE")?
+        .clone()
+        .ok_or("[STATE] NO_PROFILE_SELECTED")?;
+    let current_dek = state.dek.lock()
+        .map_err(|_| "[STATE] LOCK_FAILED_KEY")?
+        .clone()
+        .ok_or_else(|| vault::Outcome::VaultLocked.to_string())?;
+    let path = state.db_path.lock()
+        .map_err(|_| "[STATE] LOCK_FAILED_PATH")?
+        .clone()
+        .ok_or("[STATE] MISSING_REQUIRED_RESOURCES_FOR_SAVE")?;
+
+    let device_factor = keystore::load_device_factor(&profile_name).map_err(|o| o.to_string())?;
+    let keywrap_bytes = fs::read(vault::keywrap_path(&path))
+        .map_err(|e| format!("[FILE] KEYWRAP_READ_FAILED: {}", e))?;
+    let keywrap = vault::KeyWrapFile::parse(&keywrap_bytes).map_err(|o| o.to_string())?;
+
+    let mut password_owned = password;
+    let unwrapped = tokio::task::spawn_blocking(move || {
+        let res = keywrap.unwrap_dek(&device_factor, &password_owned);
+        password_owned.zeroize();
+        res
+    })
+        .await
+        .map_err(|e| format!("[CRYPTO] KDF_JOIN: {}", e))?
+        .map_err(|o| o.to_string())?;
+
+    if *unwrapped != *current_dek {
+        return Err(vault::Outcome::VaultAuth.to_string());
+    }
+    Ok(())
+}
+
+/// T068: the shared FR-055 identity-confirmation helper, satisfiable by
+/// platform authentication OR the vault password — never an in-app dialog
+/// of our own design, since either of these is already an OS- or
+/// cryptographically-verified proof of the same identity a dialog could
+/// only ask the user to assert. `password: None` attempts platform auth;
+/// `Some(password)` re-derives and compares the DEK as above.
+#[allow(dead_code)] // not yet reachable from a command that offers the platform-auth branch (frontend, deferred)
+async fn confirm_identity(state: &DbState, password: Option<String>) -> Result<(), String> {
+    match password {
+        Some(password) => confirm_identity_by_password(state, password).await,
+        None => match platform_auth::authenticate("confirm your identity").await {
+            platform_auth::AuthOutcome::Success => Ok(()),
+            _ => Err(vault::Outcome::VaultAuth.to_string()),
+        },
+    }
+}
+
+/// T079: create a recovery kit for the currently open profile, in either
+/// form. Requires identity confirmation first (FR-020) — the kit, once
+/// created, is one of the two things (with the vault file) that together
+/// grant full access to every secret, so this is not a decision to make
+/// on a background thread with no fresh proof of identity.
+#[tauri::command]
+async fn recovery_kit_create(
+    state: tauri::State<'_, DbState>,
+    form: String,
+    mut recovery_passphrase: String,
+    password: String,
+) -> Result<serde_json::Value, String> {
+    confirm_identity_by_password(&state, password).await?;
+
+    let dek = state.dek.lock().map_err(|_| "[STATE] LOCK_FAILED_KEY")?
+        .clone().ok_or_else(|| vault::Outcome::VaultLocked.to_string())?;
+    let kid = state.kid.lock().map_err(|_| "[STATE] LOCK_FAILED_KID")?
+        .ok_or_else(|| vault::Outcome::VaultLocked.to_string())?;
+
+    let passphrase_owned = std::mem::take(&mut recovery_passphrase);
+    let result = tokio::task::spawn_blocking(move || {
+        let outcome = match form.as_str() {
+            "phrase" => recovery::create_phrase_kit(&dek, kid, &passphrase_owned)
+                .map(|words| serde_json::json!({ "form": "phrase", "words": words })),
+            "file" => recovery::create_file_kit(&dek, kid, &passphrase_owned)
+                .map(|bytes| serde_json::json!({ "form": "file", "bytes": bytes })),
+            _ => Err(vault::Outcome::VaultKdf), // unreachable in practice; caller passes a fixed enum-like string
+        };
+        outcome
+    })
+        .await
+        .map_err(|e| format!("[CRYPTO] KDF_JOIN: {}", e))?
+        .map_err(|o| o.to_string())?;
+
+    // The file form's actual save-to-disk step (with the FR-019f
+    // non-cloud-synced-default save dialog) is a separate, desktop-only
+    // step — see `recovery_kit_save_file` below — kept apart so this
+    // command stays platform-agnostic and testable without a real dialog.
+    Ok(result)
+}
+
+/// T079 continued: write a created file-form kit to a user-chosen
+/// location. Desktop only. No explicit starting directory is set — same
+/// convention `export_profile` already uses — so the native dialog uses
+/// its own default rather than being steered toward a specific folder;
+/// FR-019f's actual requirement (don't point at Desktop/Documents/iCloud
+/// by name) is satisfied by not adding that steering, not by trying to
+/// detect live sync status, which no cross-platform API exposes reliably.
+#[tauri::command]
+async fn recovery_kit_save_file(bytes: Vec<u8>) -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = bytes;
+        return Err("Recovery kit export is not available on Android.".into());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let chosen = rfd::FileDialog::new()
+            .set_title("Save recovery kit")
+            .set_file_name("recovery.sshclientx-kit")
+            .add_filter("SSHClientX recovery kit", &["sshclientx-kit"])
+            .save_file();
+        let Some(dest) = chosen else { return Ok(None) };
+        fs::write(&dest, &bytes)
+            .map_err(|e| format!("[FILE] KIT_WRITE_FAILED at {:?}: {}", dest, e))?;
+        Ok(Some(dest.to_string_lossy().to_string()))
+    }
+}
+
+/// Generic native "pick a file, return its raw bytes" — used by the
+/// recovery-kit consume flow (T087) for both the picked kit file and the
+/// vault file it needs alongside it (FR-019g). Desktop only, matching
+/// `pick_ssh_key_file`'s existing Android refusal — `rfd` has no Android
+/// backend at all (no native OS picker to show). Android's recovery flow
+/// (contract §7, FR-041) instead drives the frontend's own in-app file
+/// browser (the same `local_list_dir`/`android_quick_dirs` commands
+/// `FilePanel` already uses) and calls `read_local_file_bytes` below once
+/// the user has navigated to a file, rather than this command.
+#[tauri::command]
+async fn pick_and_read_file(title: String, extensions: Vec<String>) -> Result<Option<Vec<u8>>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = (title, extensions);
+        Err("Picking a file is not available on Android yet.".into())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let ext_refs: Vec<&str> = extensions.iter().map(|s| s.as_str()).collect();
+        let picked = rfd::FileDialog::new()
+            .set_title(&title)
+            .add_filter("file", &ext_refs)
+            .pick_file();
+        let Some(path) = picked else { return Ok(None) };
+        let bytes = fs::read(&path).map_err(|e| format!("[FILE] PICKED_FILE_READ_FAILED: {}", e))?;
+        Ok(Some(bytes))
+    }
+}
+
+/// T113: reads an arbitrary local file's raw bytes given a path the user
+/// already navigated to via the frontend's own in-app file browser
+/// (`local_list_dir`/`android_quick_dirs` — the same commands `FilePanel`
+/// uses for SFTP-side local browsing). This is Android's substitute for
+/// `pick_and_read_file`'s native dialog, which `rfd` cannot show there, but
+/// it works identically on desktop too. Guarded the same way `sftp_upload_
+/// file` guards its local source — refuses a path outside anywhere the
+/// user could plausibly own (`/etc/shadow`, the Windows SAM hive, etc.).
+#[tauri::command]
+async fn read_local_file_bytes(path: String) -> Result<Vec<u8>, String> {
+    let guarded = guard_local_path(&path, false)?;
+    fs::read(&guarded).map_err(|e| format!("[FILE] LOCAL_FILE_READ_FAILED: {}", e))
+}
+
+/// T080/T084: consume a recovery kit (either form) and establish its DEK
+/// as an **unclaimed** key on this device — a fresh device factor in the
+/// keystore, and a key-wrap sidecar sealed under `new_vault_password`, a
+/// password chosen for THIS device (FR-021, FR-021a). Does not import any
+/// vault content; that is a separate, later step (US4) once the user
+/// picks a vault file to import against the now-unclaimed key.
+///
+/// Exactly one of `phrase` or `kit_file_bytes` must be supplied. The
+/// phrase form additionally requires `vault_file_bytes` (FR-019g) — its
+/// salt is derived from the vault's `kid`, which only the vault file can
+/// supply; the file form is self-contained and needs neither.
+#[tauri::command]
+async fn recovery_kit_consume(
+    app_handle: tauri::AppHandle,
+    phrase: Option<String>,
+    kit_file_bytes: Option<Vec<u8>>,
+    vault_file_bytes: Option<Vec<u8>>,
+    recovery_passphrase: String,
+    new_vault_password: String,
+) -> Result<serde_json::Value, String> {
+    // T107/FR-067: recovery-kit consumption is one of the four categories
+    // diagnostics must cover.
+    let result = recovery_kit_consume_inner(
+        app_handle.clone(), phrase, kit_file_bytes, vault_file_bytes,
+        recovery_passphrase, new_vault_password,
+    ).await;
+    vault::record_outcome(&app_handle, result)
+}
+
+async fn recovery_kit_consume_inner(
+    app_handle: tauri::AppHandle,
+    phrase: Option<String>,
+    kit_file_bytes: Option<Vec<u8>>,
+    vault_file_bytes: Option<Vec<u8>>,
+    mut recovery_passphrase: String,
+    mut new_vault_password: String,
+) -> Result<serde_json::Value, String> {
+    let profiles_dir = profiles_dir(&app_handle)?;
+    let passphrase_owned = std::mem::take(&mut recovery_passphrase);
+    let password_owned = std::mem::take(&mut new_vault_password);
+
+    let (dek, kid) = tokio::task::spawn_blocking(move || -> Result<_, vault::Outcome> {
+        let result = match (phrase, kit_file_bytes) {
+            (Some(_), Some(_)) => Err(vault::Outcome::KitMalformed),
+            (Some(phrase), None) => {
+                // FR-019g: phrase form requires the vault file — its `kid`
+                // (a structural header field, not decrypted content) is
+                // the only source of this kit's salt.
+                let vault_bytes = vault_file_bytes.ok_or(vault::Outcome::KitMalformed)?;
+                let sealed = vault::SealedVaultFile::parse(&vault_bytes)?;
+                let recovered = recovery::consume_phrase_kit(&phrase, &passphrase_owned, sealed.kid)?;
+                Ok((recovered, sealed.kid))
+            }
+            (None, Some(kit_bytes)) => recovery::consume_file_kit(&kit_bytes, &passphrase_owned),
+            (None, None) => Err(vault::Outcome::KitMalformed),
+        };
+        result
+    })
+        .await
+        .map_err(|e| format!("[CRYPTO] KIT_JOIN: {}", e))?
+        .map_err(|o| o.to_string())?;
+
+    recovery::establish_unclaimed_key(&profiles_dir, &dek, kid, &password_owned)
+        .map_err(|o| o.to_string())?;
+
+    Ok(serde_json::json!({ "kid": hex::encode(kid) }))
+}
+
+/// T085: unclaimed keys waiting for a matching vault file to be imported.
+#[tauri::command]
+async fn unclaimed_keys_list(app_handle: tauri::AppHandle) -> Result<Vec<String>, String> {
+    let dir = profiles_dir(&app_handle)?;
+    Ok(recovery::list_unclaimed_keys(&dir).into_iter().map(|k| k.kid_hex).collect())
+}
+
+/// T085: discard an unclaimed key the user decides they no longer want —
+/// removes both its key-wrap sidecar and its keystore device-factor entry.
+#[tauri::command]
+async fn unclaimed_key_discard(app_handle: tauri::AppHandle, kid_hex: String) -> Result<(), String> {
+    let dir = profiles_dir(&app_handle)?;
+    recovery::discard_unclaimed_key(&dir, &kid_hex).map_err(|o| o.to_string())
+}
+
 /// Copy a profile's encrypted file to a user-chosen location so it can be
 /// backed up or moved between machines. The file is already encrypted at
 /// rest — we just copy bytes; we never decrypt or re-encrypt.
@@ -910,7 +1434,9 @@ async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<()
 #[tauri::command]
 async fn export_profile(
     app_handle: tauri::AppHandle,
+    state: tauri::State<'_, DbState>,
     name: String,
+    password: String,
 ) -> Result<Option<String>, String> {
     validate_profile_name(&name)?;
     let src = profile_path(&app_handle, &name)?;
@@ -923,15 +1449,48 @@ async fn export_profile(
     // the mobile UI isn't a wired feature yet, so the command just refuses.
     #[cfg(target_os = "android")]
     {
-        let _ = src;
+        let _ = (src, state, password);
         return Err("Profile export is not available on Android.".into());
     }
     #[cfg(not(target_os = "android"))]
     {
+        // T091 (FR-023): identity confirmation before export, even though
+        // the exported bytes are already encrypted. Reuses the same
+        // password re-entry check kit creation uses (FR-055) — this only
+        // works for the CURRENTLY OPEN profile, which the confirmation
+        // helper verifies against; exporting a *different*, not-currently-open
+        // profile has no live DEK to compare against, so it is refused
+        // rather than silently skipping confirmation.
+        let active = state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE")?.clone();
+        if active.as_deref() != Some(name.as_str()) {
+            return Err("[VALIDATION] EXPORT_REQUIRES_THE_OPEN_PROFILE: select and unlock this profile first.".into());
+        }
+        confirm_identity_by_password(&state, password).await?;
+
+        // T092: export the file exactly as sealed on disk — read once,
+        // never unlocked, never re-encrypted. T095: reading the FINAL path
+        // (never the `.tmp` write target) is what makes this safe against
+        // a concurrent save — `seal_and_save`'s tmp-write-then-fsync-then-
+        // rename discipline means this path is always either the complete
+        // prior revision or the complete new one, never a partial write;
+        // a save in progress is invisible here until its rename commits.
+        let bytes = fs::read(&src).map_err(|e| format!("[FILE] EXPORT_READ_FAILED: {}", e))?;
+
+        // T093: suggested filename identifies the app, date, time, and
+        // revision. A not-yet-migrated (legacy) file has no generation
+        // counter — FR-013 migrates on next unlock regardless, so this is
+        // a transient case, covered by generation 0 rather than omitting
+        // the field and giving the filename a different shape.
+        let generation = match vault::SealedVaultFile::parse(&bytes) {
+            Ok(sealed) => sealed.generation,
+            Err(_) => 0,
+        };
+        let now = chrono_like_timestamp();
+        let default_name = format!("SSHClientX-{}-g{}.{VAULT_EXT}", now, generation);
+
         // rfd's blocking dialog must not run on the main thread on macOS — we're
         // already off the UI thread in a tauri async command so a direct call is
         // fine. spawn_blocking would be needed if this was wrapped differently.
-        let default_name = format!("{}.{VAULT_EXT}", name);
         let chosen = rfd::FileDialog::new()
             .set_title("Export profile")
             .set_file_name(&default_name)
@@ -940,110 +1499,399 @@ async fn export_profile(
 
         let dst = match chosen {
             Some(p) => p,
+            // T094: nothing was ever staged to a temp/cache location on
+            // this path — `bytes` lives only in process memory and is
+            // dropped here on cancel, never written anywhere.
             None => return Ok(None),
         };
 
-        fs::copy(&src, &dst)
-            .map_err(|e| format!("[FILE] EXPORT_COPY_FAILED to {:?}: {}", dst, e))?;
+        fs::write(&dst, &bytes)
+            .map_err(|e| format!("[FILE] EXPORT_WRITE_FAILED to {:?}: {}", dst, e))?;
+        // T094: no temp/cache copy exists to clean up on success either —
+        // `bytes` was written directly to the user-chosen destination.
         Ok(Some(dst.to_string_lossy().to_string()))
     }
 }
 
-/// Open a file picker and verify the chosen file looks like a SSHClientX
-/// vault (right header bytes). We do NOT decrypt — that requires the
-/// profile password, which the user enters after import via the regular
-/// unlock flow.
+/// `{YYYYMMDD}-{HHmm}` in local time, with no chrono/time dependency —
+/// this repo has neither, and pulling one in for a filename timestamp
+/// would fail Principle V. `std::time::SystemTime` plus a hand-rolled
+/// Gregorian civil-calendar conversion (Howard Hinnant's well-known
+/// `days_from_civil` algorithm) covers this exactly.
+#[cfg(not(target_os = "android"))]
+fn chrono_like_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    civil_timestamp_from_unix_secs(secs)
+}
+
+/// Pure civil-calendar conversion, split out from `chrono_like_timestamp`
+/// specifically so it has a seam for direct testing against known
+/// reference dates rather than only being reachable through
+/// `SystemTime::now()`. Howard Hinnant's well-known `civil_from_days`
+/// algorithm — the Gregorian calendar has enough irregularity (leap years,
+/// century exceptions) that "obviously correct" arithmetic here is worth
+/// distrusting until checked against real dates, not just re-derived by
+/// inspection.
+#[cfg(not(target_os = "android"))]
+fn civil_timestamp_from_unix_secs(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let time_of_day = secs.rem_euclid(86400);
+    let (hh, mm) = (time_of_day / 3600, (time_of_day % 3600) / 60);
+
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!("{:04}{:02}{:02}-{:02}{:02}", y, m, d, hh, mm)
+}
+
+/// T101: staged imports awaiting commit or discard, keyed by a random
+/// staging id. Holds only a path under `app_temp_root` — never decrypted
+/// content — so nothing sensitive outlives a single command call in
+/// memory; `import_vault_commit`/`import_vault_pick` re-run
+/// `verify_and_import` fresh each time rather than trusting a cached
+/// disposition, which also naturally satisfies T100 (a commit still
+/// missing its confirmation re-derives and re-refuses with the same code).
+#[derive(Default)]
+pub struct ImportStagingState {
+    pub staged: StdMutex<std::collections::HashMap<String, PathBuf>>,
+}
+
+/// T102 (FR-031, FR-032, FR-032a): resolve what key, if any, this device
+/// holds for `kid` — checked in order:
+/// 1. The currently open profile, if its `kid` matches. Its DEK is
+///    already unlocked in `state`; no extra password is asked for.
+/// 2. An unclaimed key established by a previously-consumed recovery kit,
+///    if `unclaimed_password` (the password chosen when that key was
+///    established) is supplied.
+/// 3. Otherwise, unknown to this device.
 ///
-/// Returns `(source_path, suggested_name)` so the UI can confirm or rename
-/// before committing the copy.
+/// Deliberately out of scope here: restoring over a profile *other than*
+/// the one currently open. That case needs the target profile's own
+/// password too, which doesn't fit this single-password call shape —
+/// select and unlock that profile first, then import.
+fn resolve_key_lookup(
+    state: &DbState,
+    profiles_dir_path: &Path,
+    kid: [u8; vault::KID_LEN],
+    unclaimed_password: Option<&str>,
+) -> Result<vault::KeyLookup, String> {
+    {
+        let open_kid = state.kid.lock().map_err(|_| "[STATE] LOCK_FAILED_KID")?;
+        let open_dek = state.dek.lock().map_err(|_| "[STATE] LOCK_FAILED_KEY")?;
+        let open_gen = state.generation.lock().map_err(|_| "[STATE] LOCK_FAILED_GENERATION")?;
+        let open_profile = state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE")?;
+        let open_path = state.db_path.lock().map_err(|_| "[STATE] LOCK_FAILED_PATH")?;
+        if let (Some(ok), Some(od), Some(og), Some(op), Some(pth)) =
+            (open_kid.as_ref(), open_dek.as_ref(), open_gen.as_ref(), open_profile.as_ref(), open_path.as_ref())
+        {
+            if *ok == kid {
+                let current_bytes = fs::read(pth).map_err(|e| format!("[FILE] CURRENT_VAULT_READ_FAILED: {}", e))?;
+                let current_sealed = vault::SealedVaultFile::parse(&current_bytes).map_err(|o| o.to_string())?;
+                let current_plain = current_sealed
+                    .open(&vault::SealKey { alg: current_sealed.alg, key: od })
+                    .map_err(|o| o.to_string())?;
+                use sha2::{Digest, Sha256};
+                let current_content_hash: [u8; 32] = Sha256::digest(&current_plain).into();
+                return Ok(vault::KeyLookup::Owned {
+                    profile: op.clone(),
+                    key: **od,
+                    current_revision: *og,
+                    current_content_hash,
+                });
+            }
+        }
+    }
+
+    let keywrap_path = recovery::unclaimed_dir(profiles_dir_path).join(format!("{}.keywrap", hex::encode(kid)));
+    if keywrap_path.exists() {
+        if let Some(password) = unclaimed_password {
+            let device_factor = keystore::load_device_factor(&recovery::unclaimed_keystore_id(&kid))
+                .map_err(|o| o.to_string())?;
+            let keywrap_bytes = fs::read(&keywrap_path).map_err(|e| format!("[FILE] UNCLAIMED_KEYWRAP_READ_FAILED: {}", e))?;
+            let keywrap = vault::KeyWrapFile::parse(&keywrap_bytes).map_err(|o| o.to_string())?;
+            let dek = keywrap.unwrap_dek(&device_factor, password).map_err(|o| o.to_string())?;
+            return Ok(vault::KeyLookup::Unclaimed { key: *dek });
+        }
+        // A matching unclaimed key exists but no password was supplied for
+        // it this call — collapses to Unknown rather than a distinct
+        // outcome. A real (if minor) UX rough edge: retrying with the
+        // password succeeds, but a bare attempt reads identically to a
+        // genuinely unrecognised file. Not a correctness gap — BOX_UNKNOWN_KEY
+        // still correctly points at the recovery-kit flow either way.
+    }
+
+    Ok(vault::KeyLookup::Unknown)
+}
+
+/// T097 (FR-030): open a file picker, copy the picked file into the app
+/// sandbox, and verify THAT copy — never the original source again, which
+/// is what makes this immune to a TOCTOU swap between pick and read.
+/// `unclaimed_password` is the password for an unclaimed key this file
+/// might match (see `resolve_key_lookup`); pass `None` for the common case
+/// of restoring over the currently open profile.
 #[tauri::command]
-async fn import_profile_pick() -> Result<Option<(String, String)>, String> {
+async fn import_vault_pick(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, DbState>,
+    staging: tauri::State<'_, ImportStagingState>,
+    unclaimed_password: Option<String>,
+) -> Result<Option<serde_json::Value>, String> {
     #[cfg(target_os = "android")]
     {
-        return Err("Profile import is not available on Android.".into());
+        let _ = (app_handle, state, staging, unclaimed_password);
+        return Err("Vault import is not available on Android.".into());
     }
     #[cfg(not(target_os = "android"))]
     {
         let picked = rfd::FileDialog::new()
-            .set_title("Import profile")
-            .add_filter("SSHClientX profile", &[VAULT_EXT, VAULT_EXT_LEGACY])
+            .set_title("Import vault")
+            .add_filter("SSHClientX vault", &[VAULT_EXT, VAULT_EXT_LEGACY])
             .pick_file();
-
-        let path = match picked {
+        let source_path = match picked {
             Some(p) => p,
             None => return Ok(None),
         };
 
-        // Cheap header check (no decryption). If the file isn't a vault we want
-        // to fail before the user picks a name and gets a confusing error later.
-        let mut header = [0u8; 5];
-        let mut f = fs::File::open(&path).map_err(|e| format!("[FILE] IMPORT_OPEN_FAILED: {}", e))?;
-        use std::io::Read;
-        let n = f.read(&mut header).map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?;
-        if n < 5 || &header[..4] != VAULT_MAGIC {
-            return Err("Selected file is not a SSHClientX profile (bad header).".into());
-        }
-        if header[4] != VAULT_VERSION {
-            return Err(format!(
-                "Profile uses an unsupported vault version ({}). Update SSHClientX first.",
-                header[4]
-            ));
-        }
+        let source_bytes = fs::read(&source_path).map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?;
+        let staging_id = {
+            let mut b = [0u8; 16];
+            rand::thread_rng().fill(&mut b);
+            hex::encode(b)
+        };
+        let staged_dir = app_temp_root().join("import_staging");
+        fs::create_dir_all(&staged_dir).map_err(|e| format!("[FILE] STAGING_MKDIR_FAILED: {}", e))?;
+        let staged_path = staged_dir.join(format!("{}.sshclientx", staging_id));
+        fs::write(&staged_path, &source_bytes).map_err(|e| format!("[FILE] STAGING_WRITE_FAILED: {}", e))?;
+        drop(source_bytes); // the copy on disk is what gets verified from here on
 
-        // Suggest a name from the file stem, sanitized to our profile-name rules
-        // so the user can hit Enter without re-typing in the common case.
-        let suggested = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| {
-                s.chars()
-                    .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-                    .take(32)
-                    .collect::<String>()
-            })
-            .unwrap_or_else(|| "imported".to_string());
+        let staged_bytes = fs::read(&staged_path).map_err(|e| format!("[FILE] STAGED_READ_FAILED: {}", e))?;
 
-        Ok(Some((path.to_string_lossy().to_string(), suggested)))
+        let dir = profiles_dir(&app_handle)?;
+        let registry = |k: &[u8; vault::KID_LEN]| -> vault::KeyLookup {
+            resolve_key_lookup(&state, &dir, *k, unclaimed_password.as_deref())
+                .unwrap_or(vault::KeyLookup::Unknown)
+        };
+        // Identity confirmation for import is the existing-profile match's
+        // own unlock (the profile is already open) or an unclaimed key's
+        // own password (just supplied above) — both are already a form of
+        // "prove you have a right to this key," so this call is always
+        // `identity_confirmed = true` at the staging step; nothing is
+        // decrypted for a kid this device does not already have proven
+        // access to.
+        let decision = match vault::verify_and_import(&staged_bytes, &registry, true) {
+            Ok(d) => d,
+            Err(o) => {
+                let _ = fs::remove_file(&staged_path);
+                // T107/FR-067: import is one of the four diagnostic
+                // categories. The hash prefix is the one thing always
+                // available here, even when the file failed before any
+                // `kid`/revision could be read out of it.
+                use sha2::{Digest, Sha256};
+                let hash = Sha256::digest(&staged_bytes);
+                vault::record_diagnostic(
+                    &app_handle,
+                    &vault::DiagnosticEntry::new(o.code()).with_hash(&hash),
+                );
+                return Err(o.to_string());
+            }
+        };
+
+        staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?
+            .insert(staging_id.clone(), staged_path);
+
+        let (disposition_str, profile_name) = match &decision.disposition {
+            vault::Disposition::CreateProfile => ("create_profile", None),
+            vault::Disposition::RestoreOver { profile } => ("restore_over", Some(profile.clone())),
+            vault::Disposition::NoOp => ("no_op", None),
+        };
+        let confirmation_str = match decision.confirmation_needed {
+            vault::ConfirmationNeeded::None => "none",
+            vault::ConfirmationNeeded::Older => "older",
+            vault::ConfirmationNeeded::Conflict => "conflict",
+        };
+
+        Ok(Some(serde_json::json!({
+            "staging_id": staging_id,
+            "disposition": disposition_str,
+            "profile": profile_name,
+            "confirmation_needed": confirmation_str,
+            "incoming_revision": decision.sealed.generation,
+            "sender_name": decision.sealed.sender_name,
+            "created_at": decision.sealed.created_at,
+        })))
     }
 }
 
-/// Commit a picked vault file into the profiles dir under `name`. Refuses
-/// to overwrite an existing profile — the UI must prompt the user to pick
-/// a different name (or delete the existing one) in that case.
+/// T099/T100 (FR-033, FR-034): perform the write staging decided. `name`
+/// is required for `create_profile`. `confirm_older`/`resolve_conflict`
+/// must be `true` when the staged disposition needs that specific
+/// confirmation — a commit missing the matching one re-derives the
+/// decision fresh and refuses with the same code again, rather than a
+/// stale cached one letting a second call quietly slip through.
 #[tauri::command]
-async fn import_profile_save(
+async fn import_vault_commit(
     app_handle: tauri::AppHandle,
-    source_path: String,
-    name: String,
+    state: tauri::State<'_, DbState>,
+    staging: tauri::State<'_, ImportStagingState>,
+    staging_id: String,
+    name: Option<String>,
+    confirm_older: bool,
+    resolve_conflict: bool,
 ) -> Result<(), String> {
-    validate_profile_name(&name)?;
-    let src = PathBuf::from(&source_path);
-    if !src.exists() {
-        return Err("Source file no longer exists.".into());
+    #[cfg(target_os = "android")]
+    {
+        let _ = (app_handle, state, staging, staging_id, name, confirm_older, resolve_conflict);
+        return Err("Vault import is not available on Android.".into());
     }
+    #[cfg(not(target_os = "android"))]
+    {
+        let staged_path = staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?
+            .get(&staging_id).cloned()
+            .ok_or("[VALIDATION] UNKNOWN_STAGING_ID")?;
+        let staged_bytes = fs::read(&staged_path).map_err(|e| format!("[FILE] STAGED_READ_FAILED: {}", e))?;
 
-    let dir = profiles_dir(&app_handle)?;
-    fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
-    let dst = profile_path(&app_handle, &name)?;
-    if dst.exists() {
-        return Err(format!("Profile '{}' already exists", name));
-    }
+        let dir = profiles_dir(&app_handle)?;
+        // Re-resolve without an unclaimed password: the pick step already
+        // proved access if this was an unclaimed-key match, and re-asking
+        // for it here would be redundant. If this genuinely is an
+        // unclaimed-key disposition being committed, the disposition
+        // itself was already decided at pick time; commit only needs to
+        // re-run the SAME pipeline for the (older/conflict) confirmation
+        // check, not re-authenticate.
+        let registry = |k: &[u8; vault::KID_LEN]| -> vault::KeyLookup {
+            resolve_key_lookup(&state, &dir, *k, None).unwrap_or(vault::KeyLookup::Unknown)
+        };
+        let decision = vault::verify_and_import(&staged_bytes, &registry, true)
+            .map_err(|o| {
+                // T107/FR-067: a genuine verification failure re-surfacing
+                // at commit (the pick step already logged its own copy of
+                // this if it happened there instead).
+                vault::record_diagnostic(&app_handle, &vault::DiagnosticEntry::new(o.code()));
+                o.to_string()
+            })?;
 
-    // Single-read import: load the file into memory ONCE, validate the
-    // header on the in-memory bytes, then write to the destination. The
-    // previous "read 5 bytes to validate, then fs::copy" was TOCTOU —
-    // an attacker (or a script running in parallel) could swap the file
-    // between the header read and the copy and we'd import garbage.
-    let bytes = fs::read(&src).map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?;
-    if bytes.len() < 5 || &bytes[..4] != VAULT_MAGIC || bytes[4] != VAULT_VERSION {
-        return Err("Source file is no longer a valid SSHClientX profile.".into());
-    }
-    if bytes.len() < HEADER_LEN + NONCE_LEN + 16 {
-        return Err("Source file is truncated — header is valid but the body is too small.".into());
-    }
+        match decision.confirmation_needed {
+            vault::ConfirmationNeeded::Older if !confirm_older => {
+                vault::record_diagnostic(
+                    &app_handle,
+                    &vault::DiagnosticEntry::new(vault::Outcome::BoxOlder.code())
+                        .with_revisions(None, Some(decision.sealed.generation))
+                        .with_kid(&decision.sealed.kid),
+                );
+                return Err(vault::Outcome::BoxOlder.to_string());
+            }
+            vault::ConfirmationNeeded::Conflict if !resolve_conflict => {
+                vault::record_diagnostic(
+                    &app_handle,
+                    &vault::DiagnosticEntry::new(vault::Outcome::BoxConflict.code())
+                        .with_revisions(None, Some(decision.sealed.generation))
+                        .with_kid(&decision.sealed.kid),
+                );
+                return Err(vault::Outcome::BoxConflict.to_string());
+            }
+            _ => {}
+        }
 
-    fs::write(&dst, &bytes)
-        .map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED to {:?}: {}", dst, e))?;
+        match &decision.disposition {
+            vault::Disposition::CreateProfile => {
+                let profile_name = name.ok_or("[VALIDATION] CREATE_PROFILE_REQUIRES_A_NAME")?;
+                validate_profile_name(&profile_name)?;
+                fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
+                let dest = vault_file(&dir, &profile_name, VAULT_EXT);
+                // FR-058/FR-061: claim the sidecar BEFORE checking existence
+                // — closes the TOCTOU window where two instances importing
+                // the same new name at once could otherwise both pass the
+                // `exists()` check and race to create/overwrite it. The
+                // claim's own sidecar file can be created regardless of
+                // whether `dest` itself exists yet.
+                let _claim = vault::WriterClaim::acquire(&dest).map_err(|o| match o {
+                    vault::Outcome::VaultBusy => format!("[VAULT] VAULT_BUSY: '{}' is already being imported by another running copy of SSHClientX.", profile_name),
+                    other => other.to_string(),
+                })?;
+                if dest.exists() {
+                    return Err(format!("Profile '{}' already exists", profile_name));
+                }
+                // Atomic: tmp -> rename, same discipline as an ordinary save.
+                let tmp = dest.with_extension("sshclientx.tmp");
+                fs::write(&tmp, &staged_bytes).map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED: {}", e))?;
+                fs::rename(&tmp, &dest).map_err(|e| format!("[FILE] IMPORT_RENAME_FAILED: {}", e))?;
+
+                // T085: this key is no longer unclaimed — remove its
+                // unclaimed-state sidecar now that a profile owns it. The
+                // keystore device-factor entry stays (it's what the new
+                // profile's future unlocks will read); only the unclaimed
+                // *bookkeeping* is retired.
+                let kid = decision.sealed.kid;
+                let unclaimed_sidecar = recovery::unclaimed_dir(&dir).join(format!("{}.keywrap", hex::encode(kid)));
+                let _ = fs::remove_file(&unclaimed_sidecar);
+            }
+            vault::Disposition::RestoreOver { profile } => {
+                let dest = profile_path(&app_handle, profile)?;
+
+                // FR-058/FR-061: same single-writer guarantee every other
+                // vault write requires. If this IS the currently-open
+                // profile, `state.writer_claim` already proves exclusive
+                // access — acquiring a second claim on the same path from
+                // this same process would itself report VAULT_BUSY (see
+                // `WriterClaim`'s own doc comment on same-process
+                // handle-vs-handle conflict). Otherwise, acquire-and-drop a
+                // claim to prove no OTHER instance holds it before writing.
+                let active = state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE")?.clone();
+                let is_currently_open = active.as_deref() == Some(profile.as_str());
+                let _claim = if is_currently_open {
+                    None
+                } else {
+                    Some(vault::WriterClaim::acquire(&dest).map_err(|o| match o {
+                        vault::Outcome::VaultBusy => format!("[VAULT] VAULT_BUSY: '{}' is already open in another running copy of SSHClientX.", profile),
+                        other => other.to_string(),
+                    })?)
+                };
+
+                if dest.exists() {
+                    vault::rotate_into_history(&dest)?;
+                }
+                let tmp = dest.with_extension("sshclientx.tmp");
+                fs::write(&tmp, &staged_bytes).map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED: {}", e))?;
+                fs::rename(&tmp, &dest).map_err(|e| format!("[FILE] IMPORT_RENAME_FAILED: {}", e))?;
+
+                // If the profile being restored over is the currently open
+                // one, the cached generation in `state` is now stale —
+                // refresh it so the next save advances from the imported
+                // file's revision, not the pre-import one.
+                if is_currently_open {
+                    *state.generation.lock().map_err(|_| "[STATE] LOCK_FAILED_GENERATION")? = Some(decision.sealed.generation);
+                }
+            }
+            vault::Disposition::NoOp => {
+                // Nothing to write — importing the same file twice is a
+                // deliberate no-op, not an error.
+            }
+        }
+
+        staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?.remove(&staging_id);
+        let _ = fs::remove_file(&staged_path);
+        Ok(())
+    }
+}
+
+/// T101 (FR-035): discard a staged import without committing it.
+#[tauri::command]
+async fn import_vault_discard(staging: tauri::State<'_, ImportStagingState>, staging_id: String) -> Result<(), String> {
+    if let Some(path) = staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?.remove(&staging_id) {
+        let _ = fs::remove_file(&path);
+    }
     Ok(())
 }
 
@@ -1064,7 +1912,165 @@ async fn check_db_exists(
 
 #[tauri::command]
 async fn setup_master_db(app_handle: tauri::AppHandle, password: String, state: tauri::State<'_, DbState>) -> Result<(), String> {
-    setup_master_db_inner(app_handle, password, state).await
+    // T107/FR-067: covers both unlock and migration failures — the one
+    // command both funnel through.
+    let result = setup_master_db_inner(app_handle.clone(), password, state).await;
+    vault::record_outcome(&app_handle, result)
+}
+
+/// Every schema migration a vault opened from an existing serialized
+/// database might need — added tables, added columns, the schema_meta
+/// version check. Shared between the two paths that start from EXISTING
+/// data (reopening an already-sealed vault, and migrating a legacy one),
+/// since both can be missing a column a newer binary introduced; a freshly
+/// created vault already has the complete schema and never calls this.
+fn run_schema_migrations(conn: &Connection) -> Result<(), String> {
+    // Schema migration for vaults created before the Notes feature shipped.
+    // Existing tables are untouched; only the new ones get materialised.
+    // Idempotent — running it on a fresh vault that already has `notes`
+    // (from the schema batch below) is a no-op.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT)",
+        [],
+    ).map_err(|e| format!("[DATABASE] NOTES_MIGRATION_FAILED: {}", e))?;
+    // Schema migration for the autostart-on-launch flag added later. We
+    // can't use `IF NOT EXISTS` on ALTER, so swallow the "duplicate
+    // column" error specifically — anything else propagates.
+    if let Err(e) = conn.execute(
+        "ALTER TABLE servers ADD COLUMN autostart INTEGER NOT NULL DEFAULT 0",
+        [],
+    ) {
+        let s = e.to_string();
+        if !s.contains("duplicate column name") {
+            return Err(format!("[DATABASE] AUTOSTART_MIGRATION_FAILED: {}", s));
+        }
+    }
+    // Schema migration for the mirror-config column.
+    if let Err(e) = conn.execute(
+        "ALTER TABLE servers ADD COLUMN mirrors TEXT NOT NULL DEFAULT '[]'",
+        [],
+    ) {
+        let s = e.to_string();
+        if !s.contains("duplicate column name") {
+            return Err(format!("[DATABASE] MIRRORS_MIGRATION_FAILED: {}", s));
+        }
+    }
+    // Schema version metadata. A single-row `schema_meta` table records
+    // the highest column-migration the running binary knows about. If a
+    // user opens an older binary against a newer vault, we surface a
+    // clear warning instead of silently swallowing "duplicate column"
+    // errors and risking write-side schema drift. Bump SCHEMA_VERSION
+    // here every time a new ALTER lands in this block.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        [],
+    ).map_err(|e| format!("[DATABASE] META_TABLE_FAILED: {}", e))?;
+    // v5 — command history table for the Ctrl+R overlay. Best-effort
+    // captured per-Enter by TerminalView; unencrypted-within-vault since
+    // it's not a secret (the vault itself is encrypted at rest).
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cmd_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            server_id INTEGER,
+            server_name TEXT,
+            command TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            exit_code INTEGER
+        )",
+        [],
+    ).map_err(|e| format!("[DATABASE] CMD_HISTORY_TABLE_FAILED: {}", e))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cmd_history_ts ON cmd_history(ts DESC)",
+        [],
+    ).map_err(|e| format!("[DATABASE] CMD_HISTORY_INDEX_FAILED: {}", e))?;
+    const SCHEMA_VERSION: i64 = 6;
+    let stored: i64 = conn.query_row(
+        "SELECT CAST(value AS INTEGER) FROM schema_meta WHERE key = 'schema_version'",
+        [],
+        |row| row.get(0),
+    ).unwrap_or(0);
+    if stored > SCHEMA_VERSION {
+        return Err(format!(
+            "[DATABASE] SCHEMA_AHEAD_OF_BINARY: vault was written by a newer build (schema v{}), this binary only understands v{}. Upgrade the app before opening this profile.",
+            stored, SCHEMA_VERSION,
+        ));
+    }
+    conn.execute(
+        "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![SCHEMA_VERSION.to_string()],
+    ).map_err(|e| format!("[DATABASE] META_WRITE_FAILED: {}", e))?;
+
+    // Schema migrations for the per-node and per-folder colour bar. NULL
+    // means "use the default ring" — the UI treats absence as the same
+    // visual as before this column existed.
+    for stmt in [
+        "ALTER TABLE servers ADD COLUMN color TEXT",
+        "ALTER TABLE folders ADD COLUMN color TEXT",
+        // v4: per-node free-form description / runbook. Defaults to empty
+        // so existing rows don't need backfill. NOT NULL keeps the read
+        // path branchless.
+        "ALTER TABLE servers ADD COLUMN notes TEXT NOT NULL DEFAULT ''",
+        // Commands auto-typed into the FIRST terminal on the INITIAL
+        // connect (never on reconnect / extra shells). Empty = nothing.
+        "ALTER TABLE servers ADD COLUMN run_on_connect TEXT NOT NULL DEFAULT ''",
+        // ProxyJump: optional id of another server to bounce through. NULL
+        // = connect directly. Nullable + additive so old binaries ignore
+        // it (no SCHEMA_VERSION bump, matching run_on_connect above).
+        "ALTER TABLE servers ADD COLUMN jump_host_id INTEGER",
+        // Per-algorithm host-key tracking. Legacy rows keep key_type NULL
+        // (treated conservatively as "same type" so a real key rotation is
+        // never downgraded to a benign first-time prompt); rows recorded
+        // after this migration store the host-key algorithm so a server
+        // ADDING a new algorithm no longer looks like a MITM key change.
+        "ALTER TABLE known_hosts ADD COLUMN key_type TEXT",
+        // Per-entity sync columns (schema v6). Nullable uuid/updated_at get
+        // backfilled row-by-row just below; deleted is a plain constant
+        // default so it's a safe single-statement ADD.
+        "ALTER TABLE folders ADD COLUMN uuid TEXT",
+        "ALTER TABLE folders ADD COLUMN updated_at TEXT",
+        "ALTER TABLE folders ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ssh_keys ADD COLUMN uuid TEXT",
+        "ALTER TABLE ssh_keys ADD COLUMN updated_at TEXT",
+        "ALTER TABLE ssh_keys ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE credentials ADD COLUMN uuid TEXT",
+        "ALTER TABLE credentials ADD COLUMN updated_at TEXT",
+        "ALTER TABLE credentials ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE servers ADD COLUMN uuid TEXT",
+        "ALTER TABLE servers ADD COLUMN updated_at TEXT",
+        "ALTER TABLE servers ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE commands ADD COLUMN uuid TEXT",
+        "ALTER TABLE commands ADD COLUMN updated_at TEXT",
+        "ALTER TABLE commands ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE notes ADD COLUMN uuid TEXT",
+        "ALTER TABLE notes ADD COLUMN updated_at TEXT",
+        "ALTER TABLE notes ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE monitor_configs ADD COLUMN uuid TEXT",
+        "ALTER TABLE monitor_configs ADD COLUMN updated_at TEXT",
+        "ALTER TABLE monitor_configs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+        // Per-person attribution (schema v6+). The auto-stamp triggers set
+        // this to the editor label at mutation time; NULL on legacy rows.
+        "ALTER TABLE folders ADD COLUMN edited_by TEXT",
+        "ALTER TABLE ssh_keys ADD COLUMN edited_by TEXT",
+        "ALTER TABLE credentials ADD COLUMN edited_by TEXT",
+        "ALTER TABLE servers ADD COLUMN edited_by TEXT",
+        "ALTER TABLE commands ADD COLUMN edited_by TEXT",
+        "ALTER TABLE notes ADD COLUMN edited_by TEXT",
+        "ALTER TABLE monitor_configs ADD COLUMN edited_by TEXT",
+        // Manual drag-to-reorder of the node grid. Default 0 keeps the
+        // pre-existing implicit rowid order until the user first reorders;
+        // `get_servers` sorts by (position, id) so ties fall back to id.
+        // Synced (it's in the servers ENTITIES cols), so order LWW-merges.
+        "ALTER TABLE servers ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
+    ] {
+        if let Err(e) = conn.execute(stmt, []) {
+            let s = e.to_string();
+            if !s.contains("duplicate column name") {
+                return Err(format!("[DATABASE] COLUMN_MIGRATION_FAILED: {}", s));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn setup_master_db_inner(
@@ -1072,6 +2078,7 @@ async fn setup_master_db_inner(
     mut password: String,
     state: tauri::State<'_, DbState>,
 ) -> Result<(), String> {
+    use tauri::Emitter;
     // The active profile must be picked before this command — the UI does
     // it from the picker screen. Refuse early instead of silently writing
     // to a default path.
@@ -1085,196 +2092,175 @@ async fn setup_master_db_inner(
         fs::create_dir_all(&dir).map_err(|e| format!("[FILE] DIR_CREATION_FAILED: {}", e))?;
     }
 
-    let path = profile_path(&app_handle, &profile_name)?;
+    let mut path = profile_path(&app_handle, &profile_name)?;
     let mut conn;
-    let salt_bytes: [u8; SALT_LEN];
-    // Wrap the derived AES key so it's wiped on every early-return path
-    // and at the natural end of this function. Once it lands in DbState
-    // the StdMutex<Option<Zeroizing<...>>> takes over the same guarantee.
-    let key: Zeroizing<[u8; 32]>;
+    let dek: Zeroizing<[u8; 32]>;
+    let kid: [u8; vault::KID_LEN];
+    let generation: u64;
+    let sender_id: [u8; vault::SENDER_ID_LEN];
     let mut needs_resave;
+    let mut migrated_this_unlock = false;
 
     if path.exists() {
-        let encrypted_data = fs::read(&path)
+        let file_bytes = fs::read(&path)
             .map_err(|e| format!("[FILE] VAULT_READ_FAILED: {}", e))?;
-        let (parsed_salt, nonce, ciphertext) = parse_vault_blob(&encrypted_data)?;
-        // Normalise the Vec<u8> salt into a fixed-size array up front so we
-        // can copy it into both the spawn_blocking closure (move-by-Copy) and
-        // the salt_bytes slot later, without juggling clones or lifetimes.
-        let mut salt_fixed = [0u8; SALT_LEN];
-        salt_fixed.copy_from_slice(&parsed_salt);
-        // Argon2id with m=64MiB is CPU-heavy (≈0.5–2s depending on hardware).
-        // Running it directly on the async runtime thread blocks every other
-        // Tauri command for that duration — UI freezes, IPC backs up. Hand
-        // it off to the blocking pool so the runtime stays responsive. The
-        // closure also zeroizes the password buffer once the derivation is
-        // done, preserving the secret-hygiene the original sync path had.
-        let mut password_owned = std::mem::take(&mut password);
-        let derived = tokio::task::spawn_blocking(move || {
-            let res = derive_key(&password_owned, &salt_fixed);
-            password_owned.zeroize();
-            res
-        })
-            .await
-            .map_err(|e| format!("[CRYPTO] KDF_JOIN: {}", e))??;
-        key = Zeroizing::new(derived);
-        let raw = Zeroizing::new(decrypt_with_key(&ciphertext, &nonce, &key)?);
-        let decrypted_data = Zeroizing::new(vault_decompress(&raw)?);
 
-        salt_bytes = salt_fixed;
-        needs_resave = false;
+        match vault::discriminate_format(&file_bytes) {
+            vault::DiscriminatedFormat::Sealed => {
+                let sealed = vault::SealedVaultFile::parse(&file_bytes).map_err(|o| o.to_string())?;
 
-        conn = Connection::open_in_memory()
-            .map_err(|e| format!("[DATABASE] MEM_INIT_FAILED: {}", e))?;
-        let owned = to_sqlite_owned(&decrypted_data)?;
-        conn.deserialize(DatabaseName::Main, owned, false)
-            .map_err(|e| format!("[DATABASE] DESERIALIZE_FAILED: {}", e))?;
-        // Schema migration for vaults created before the Notes feature shipped.
-        // Existing tables are untouched; only the new ones get materialised.
-        // Idempotent — running it on a fresh vault that already has `notes`
-        // (from the schema batch below) is a no-op.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT)",
-            [],
-        ).map_err(|e| format!("[DATABASE] NOTES_MIGRATION_FAILED: {}", e))?;
-        // Schema migration for the autostart-on-launch flag added later. We
-        // can't use `IF NOT EXISTS` on ALTER, so swallow the "duplicate
-        // column" error specifically — anything else propagates.
-        if let Err(e) = conn.execute(
-            "ALTER TABLE servers ADD COLUMN autostart INTEGER NOT NULL DEFAULT 0",
-            [],
-        ) {
-            let s = e.to_string();
-            if !s.contains("duplicate column name") {
-                return Err(format!("[DATABASE] AUTOSTART_MIGRATION_FAILED: {}", s));
+                // T042 (FR-064): compare the file's OWN revision against
+                // the recorded high-water mark BEFORE asking for a
+                // password — this needs no key material at all (the
+                // generation is a structural header field), so a file
+                // restored from an old backup is caught as early as
+                // possible, before the user spends any effort on it.
+                // Resolved via a separate `rollback_resolve` call
+                // (T043) — this function does not decide for the user.
+                vault::check_rollback(&profile_name, sealed.generation).map_err(|o| o.to_string())?;
+
+                // T029/T030 (FR-003/FR-003a): no state has been mutated yet
+                // at this point, so a VAULT_NO_KEYSTORE (terminal) or
+                // VAULT_KEYSTORE_DENIED (retryable) failure here loses
+                // nothing — the user sees the distinct outcome and can
+                // retry a denied request with no cleanup needed.
+                let device_factor = keystore::load_device_factor(&profile_name).map_err(|o| {
+                    // `load_device_factor` deliberately collapses "this
+                    // profile's entry is missing" into VAULT_NO_KEYSTORE for
+                    // most callers (see its own doc comment). But reaching
+                    // HERE already means a sealed FILE exists at this path
+                    // with no matching device factor — on a machine whose
+                    // secure store otherwise works fine, that's almost
+                    // always a vault sealed for a DIFFERENT device (e.g. a
+                    // file copied in directly rather than through Import),
+                    // not "this machine has no secure store at all". A
+                    // plain re-throw would tell the user their whole
+                    // machine's keystore is broken when it isn't.
+                    if matches!(o, vault::Outcome::VaultNoKeystore) && keystore::store_available().is_ok() {
+                        vault::Outcome::VaultUnknownKid.to_string()
+                    } else {
+                        o.to_string()
+                    }
+                })?;
+                let keywrap_bytes = fs::read(vault::keywrap_path(&path))
+                    .map_err(|e| format!("[FILE] KEYWRAP_READ_FAILED: {}", e))?;
+                let keywrap = vault::KeyWrapFile::parse(&keywrap_bytes).map_err(|o| o.to_string())?;
+
+                // Argon2id inside `unwrap_dek` is CPU-heavy — same
+                // spawn_blocking reasoning as the legacy path below.
+                let mut password_owned = std::mem::take(&mut password);
+                let unwrapped = tokio::task::spawn_blocking(move || {
+                    let res = keywrap.unwrap_dek(&device_factor, &password_owned);
+                    password_owned.zeroize();
+                    res
+                })
+                    .await
+                    .map_err(|e| format!("[CRYPTO] KDF_JOIN: {}", e))?
+                    .map_err(|o| o.to_string())?;
+
+                let opened = sealed
+                    .open(&vault::SealKey { alg: sealed.alg, key: &unwrapped })
+                    .map_err(|o| o.to_string())?;
+                let decompressed = Zeroizing::new(vault::vault_decompress(&opened)?);
+
+                sender_id = vault::load_or_create_sender_id(&app_handle);
+                kid = sealed.kid;
+                generation = sealed.generation;
+                dek = unwrapped;
+                needs_resave = false;
+
+                conn = Connection::open_in_memory()
+                    .map_err(|e| format!("[DATABASE] MEM_INIT_FAILED: {}", e))?;
+                let owned = to_sqlite_owned(&decompressed)?;
+                conn.deserialize(DatabaseName::Main, owned, false)
+                    .map_err(|e| format!("[DATABASE] DESERIALIZE_FAILED: {}", e))?;
+                run_schema_migrations(&conn)?;
             }
-        }
-        // Schema migration for the mirror-config column.
-        if let Err(e) = conn.execute(
-            "ALTER TABLE servers ADD COLUMN mirrors TEXT NOT NULL DEFAULT '[]'",
-            [],
-        ) {
-            let s = e.to_string();
-            if !s.contains("duplicate column name") {
-                return Err(format!("[DATABASE] MIRRORS_MIGRATION_FAILED: {}", s));
+            // T112/FR-039: migration must happen on a desktop machine —
+            // refuse with a named-platform message, not a generic failure,
+            // before touching anything (no device-factor generation, no
+            // keystore write). A separate match arm (not a cfg'd early
+            // `return` inside the shared one) so the desktop body below
+            // never has to typecheck against Android at all.
+            #[cfg(target_os = "android")]
+            vault::DiscriminatedFormat::Legacy => {
+                return Err("[VAULT] DESKTOP_ONLY: migrating this vault to the new format must be done on a desktop machine (macOS, Windows, or Linux) — Android can open it afterward once its key is established via a recovery kit.".into());
             }
-        }
-        // Schema version metadata. A single-row `schema_meta` table records
-        // the highest column-migration the running binary knows about. If a
-        // user opens an older binary against a newer vault, we surface a
-        // clear warning instead of silently swallowing "duplicate column"
-        // errors and risking write-side schema drift. Bump SCHEMA_VERSION
-        // here every time a new ALTER lands in this block.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            [],
-        ).map_err(|e| format!("[DATABASE] META_TABLE_FAILED: {}", e))?;
-        // v5 — command history table for the Ctrl+R overlay. Best-effort
-        // captured per-Enter by TerminalView; unencrypted-within-vault since
-        // it's not a secret (the vault itself is encrypted at rest).
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS cmd_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                server_id INTEGER,
-                server_name TEXT,
-                command TEXT NOT NULL,
-                ts INTEGER NOT NULL,
-                exit_code INTEGER
-            )",
-            [],
-        ).map_err(|e| format!("[DATABASE] CMD_HISTORY_TABLE_FAILED: {}", e))?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_cmd_history_ts ON cmd_history(ts DESC)",
-            [],
-        ).map_err(|e| format!("[DATABASE] CMD_HISTORY_INDEX_FAILED: {}", e))?;
-        const SCHEMA_VERSION: i64 = 6;
-        let stored: i64 = conn.query_row(
-            "SELECT CAST(value AS INTEGER) FROM schema_meta WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(0);
-        if stored > SCHEMA_VERSION {
-            return Err(format!(
-                "[DATABASE] SCHEMA_AHEAD_OF_BINARY: vault was written by a newer build (schema v{}), this binary only understands v{}. Upgrade the app before opening this profile.",
-                stored, SCHEMA_VERSION,
-            ));
-        }
-        conn.execute(
-            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            rusqlite::params![SCHEMA_VERSION.to_string()],
-        ).map_err(|e| format!("[DATABASE] META_WRITE_FAILED: {}", e))?;
+            #[cfg(not(target_os = "android"))]
+            vault::DiscriminatedFormat::Legacy => {
+                let (parsed_salt, nonce, ciphertext) = vault::legacy_parse_blob(&file_bytes)?;
+                let mut salt_fixed = [0u8; SALT_LEN];
+                salt_fixed.copy_from_slice(&parsed_salt);
 
-        // Schema migrations for the per-node and per-folder colour bar. NULL
-        // means "use the default ring" — the UI treats absence as the same
-        // visual as before this column existed.
-        for stmt in [
-            "ALTER TABLE servers ADD COLUMN color TEXT",
-            "ALTER TABLE folders ADD COLUMN color TEXT",
-            // v4: per-node free-form description / runbook. Defaults to empty
-            // so existing rows don't need backfill. NOT NULL keeps the read
-            // path branchless.
-            "ALTER TABLE servers ADD COLUMN notes TEXT NOT NULL DEFAULT ''",
-            // Commands auto-typed into the FIRST terminal on the INITIAL
-            // connect (never on reconnect / extra shells). Empty = nothing.
-            "ALTER TABLE servers ADD COLUMN run_on_connect TEXT NOT NULL DEFAULT ''",
-            // ProxyJump: optional id of another server to bounce through. NULL
-            // = connect directly. Nullable + additive so old binaries ignore
-            // it (no SCHEMA_VERSION bump, matching run_on_connect above).
-            "ALTER TABLE servers ADD COLUMN jump_host_id INTEGER",
-            // Per-algorithm host-key tracking. Legacy rows keep key_type NULL
-            // (treated conservatively as "same type" so a real key rotation is
-            // never downgraded to a benign first-time prompt); rows recorded
-            // after this migration store the host-key algorithm so a server
-            // ADDING a new algorithm no longer looks like a MITM key change.
-            "ALTER TABLE known_hosts ADD COLUMN key_type TEXT",
-            // Per-entity sync columns (schema v6). Nullable uuid/updated_at get
-            // backfilled row-by-row just below; deleted is a plain constant
-            // default so it's a safe single-statement ADD.
-            "ALTER TABLE folders ADD COLUMN uuid TEXT",
-            "ALTER TABLE folders ADD COLUMN updated_at TEXT",
-            "ALTER TABLE folders ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE ssh_keys ADD COLUMN uuid TEXT",
-            "ALTER TABLE ssh_keys ADD COLUMN updated_at TEXT",
-            "ALTER TABLE ssh_keys ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE credentials ADD COLUMN uuid TEXT",
-            "ALTER TABLE credentials ADD COLUMN updated_at TEXT",
-            "ALTER TABLE credentials ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE servers ADD COLUMN uuid TEXT",
-            "ALTER TABLE servers ADD COLUMN updated_at TEXT",
-            "ALTER TABLE servers ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE commands ADD COLUMN uuid TEXT",
-            "ALTER TABLE commands ADD COLUMN updated_at TEXT",
-            "ALTER TABLE commands ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE notes ADD COLUMN uuid TEXT",
-            "ALTER TABLE notes ADD COLUMN updated_at TEXT",
-            "ALTER TABLE notes ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE monitor_configs ADD COLUMN uuid TEXT",
-            "ALTER TABLE monitor_configs ADD COLUMN updated_at TEXT",
-            "ALTER TABLE monitor_configs ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
-            // Per-person attribution (schema v6+). The auto-stamp triggers set
-            // this to the editor label at mutation time; NULL on legacy rows.
-            "ALTER TABLE folders ADD COLUMN edited_by TEXT",
-            "ALTER TABLE ssh_keys ADD COLUMN edited_by TEXT",
-            "ALTER TABLE credentials ADD COLUMN edited_by TEXT",
-            "ALTER TABLE servers ADD COLUMN edited_by TEXT",
-            "ALTER TABLE commands ADD COLUMN edited_by TEXT",
-            "ALTER TABLE notes ADD COLUMN edited_by TEXT",
-            "ALTER TABLE monitor_configs ADD COLUMN edited_by TEXT",
-            // Manual drag-to-reorder of the node grid. Default 0 keeps the
-            // pre-existing implicit rowid order until the user first reorders;
-            // `get_servers` sorts by (position, id) so ties fall back to id.
-            // Synced (it's in the servers ENTITIES cols), so order LWW-merges.
-            "ALTER TABLE servers ADD COLUMN position INTEGER NOT NULL DEFAULT 0",
-        ] {
-            if let Err(e) = conn.execute(stmt, []) {
-                let s = e.to_string();
-                if !s.contains("duplicate column name") {
-                    return Err(format!("[DATABASE] COLUMN_MIGRATION_FAILED: {}", s));
-                }
+                // T029/T030: generate and store the device factor BEFORE
+                // any sealed file is written. If the keystore write fails
+                // here, NOTHING has been written to disk yet — the legacy
+                // file is still the only vault file, `path.exists()` still
+                // resolves to it on the next attempt, and migration simply
+                // retries from scratch. Storing the factor only after a
+                // sealed file existed would risk a sealed file on disk with
+                // no way to ever unwrap it again.
+                let device_factor = vault::generate_device_factor();
+                keystore::store_device_factor(&profile_name, &device_factor)
+                    .map_err(|o| o.to_string())?;
+
+                let new_vault_path = migrate_vault_path(&path);
+                let sender_id_for_migration = vault::load_or_create_sender_id(&app_handle);
+                let mut password_owned = std::mem::take(&mut password);
+                let (decompressed_vec, migrated) = tokio::task::spawn_blocking({
+                    let new_vault_path = new_vault_path.clone();
+                    let profile_name_for_migration = profile_name.clone();
+                    move || {
+                        let legacy_key = vault::legacy_derive_key(&password_owned, &salt_fixed)?;
+                        let raw = Zeroizing::new(vault::legacy_decrypt(&ciphertext, &nonce, &legacy_key)?);
+                        let decompressed = Zeroizing::new(vault::vault_decompress(&raw)?);
+                        let result = vault::migrate_to_sealed(
+                            &decompressed, &password_owned, &new_vault_path,
+                            sender_id_for_migration, device_factor, &profile_name_for_migration,
+                        );
+                        password_owned.zeroize();
+                        result
+                            .map(|m| (decompressed.to_vec(), m))
+                            .map_err(|o| o.to_string())
+                    }
+                })
+                    .await
+                    .map_err(|e| format!("[CRYPTO] MIGRATION_JOIN: {}", e))??;
+
+                sender_id = sender_id_for_migration;
+                kid = migrated.kid;
+                generation = 1;
+                dek = migrated.dek;
+                // T034: `migrate_to_sealed` already verified the re-sealed
+                // vault opens and matches before returning success, so
+                // there is nothing further to resave here.
+                needs_resave = false;
+                migrated_this_unlock = true;
+                // T036: the sealed vault now lives at the renamed path
+                // (`.submarine` -> `.sshclientx`), not the legacy path this
+                // function started with — everything from here on (DbState
+                // population, the caller's picture of "where is this
+                // profile") must use the new path.
+                path = new_vault_path;
+
+                conn = Connection::open_in_memory()
+                    .map_err(|e| format!("[DATABASE] MEM_INIT_FAILED: {}", e))?;
+                let owned = to_sqlite_owned(&decompressed_vec)?;
+                conn.deserialize(DatabaseName::Main, owned, false)
+                    .map_err(|e| format!("[DATABASE] DESERIALIZE_FAILED: {}", e))?;
+                run_schema_migrations(&conn)?;
+            }
+            vault::DiscriminatedFormat::Unknown => {
+                return Err(vault::Outcome::BoxBadMagic.to_string());
             }
         }
     } else {
+        // T112/FR-039: creating a new-format vault from scratch must
+        // happen on a desktop machine — refuse with a named-platform
+        // message before anything is generated or written.
+        #[cfg(target_os = "android")]
+        return Err("[VAULT] DESKTOP_ONLY: creating a new vault must be done on a desktop machine (macOS, Windows, or Linux) — Android can open one afterward once its key is established via a recovery kit.".into());
+
         // Master-password strength floor — enforced ONLY at vault CREATION, not
         // on unlock (an existing vault with a short password must still open).
         // This password is the single cryptographic root protecting every
@@ -1285,20 +2271,42 @@ async fn setup_master_db_inner(
             password.zeroize();
             return Err("[CRYPTO] WEAK_MASTER_PASSWORD: choose at least 8 characters — this password protects every saved credential.".into());
         }
-        let mut fresh = [0u8; SALT_LEN];
-        rand::thread_rng().fill(&mut fresh);
-        salt_bytes = fresh;
-        // Same reasoning as the unlock path above — keep the async runtime
-        // unblocked during the Argon2 derivation on fresh-profile creation.
+
+        // T029/T030: generate and store the device factor BEFORE sealing
+        // anything, for the same reason as the migration path above — a
+        // keystore failure here must leave no half-created vault behind.
+        let device_factor = vault::generate_device_factor();
+        keystore::store_device_factor(&profile_name, &device_factor)
+            .map_err(|o| o.to_string())?;
+
+        let fresh_dek = vault::generate_dek();
+        let fresh_kid = vault::derive_kid(&fresh_dek);
+        let mut salt = [0u8; vault::KEYWRAP_SALT_LEN];
+        rand::thread_rng().fill(&mut salt[..]);
+
+        // Argon2id inside `KeyWrapFile::create` is CPU-heavy — same
+        // spawn_blocking reasoning as everywhere else Argon2 runs.
         let mut password_owned = std::mem::take(&mut password);
-        let derived = tokio::task::spawn_blocking(move || {
-            let res = derive_key(&password_owned, &salt_bytes);
+        let keywrap = tokio::task::spawn_blocking(move || {
+            let res = vault::KeyWrapFile::create(&device_factor, &password_owned, salt, &fresh_dek);
             password_owned.zeroize();
-            res
+            res.map(|k| (k, fresh_dek))
         })
             .await
             .map_err(|e| format!("[CRYPTO] KDF_JOIN: {}", e))??;
-        key = Zeroizing::new(derived);
+        let (keywrap, fresh_dek) = keywrap;
+
+        let keywrap_dest = vault::keywrap_path(&path);
+        let keywrap_tmp = keywrap_dest.with_extension("keywrap.tmp");
+        fs::write(&keywrap_tmp, keywrap.to_bytes())
+            .map_err(|e| format!("[FILE] KEYWRAP_WRITE_FAILED: {}", e))?;
+        fs::rename(&keywrap_tmp, &keywrap_dest)
+            .map_err(|e| format!("[FILE] KEYWRAP_RENAME_FAILED: {}", e))?;
+
+        sender_id = vault::load_or_create_sender_id(&app_handle);
+        kid = fresh_kid;
+        generation = 1;
+        dek = fresh_dek;
         needs_resave = true;
 
         conn = Connection::open_in_memory()
@@ -1384,31 +2392,47 @@ async fn setup_master_db_inner(
     // truthful and matches the user's preference for explicit start.
     let _ = conn.execute("UPDATE monitor_configs SET paused = 1", []);
 
-    // Acquire all four slot locks FIRST, then populate them in one go.
-    // The previous "lock-populate, lock-populate, ..." pattern could
-    // leave DbState half-initialised on a poisoned-mutex error from any
-    // step but the first — later commands would see e.g. db_path set
-    // but no master_key and fail in save_vault_internal with a
-    // confusing MISSING_REQUIRED_RESOURCES error.
+    // Acquire all slot locks FIRST, then populate them in one go. Avoids
+    // leaving DbState half-initialised on a poisoned-mutex error from any
+    // step but the first.
     let mut conn_guard = state.conn.lock().map_err(|_| "[STATE] LOCK_FAILED_CONN")?;
-    let mut key_guard = state.master_key.lock().map_err(|_| "[STATE] LOCK_FAILED_KEY")?;
-    let mut salt_guard = state.salt.lock().map_err(|_| "[STATE] LOCK_FAILED_SALT")?;
+    let mut dek_guard = state.dek.lock().map_err(|_| "[STATE] LOCK_FAILED_KEY")?;
+    let mut kid_guard = state.kid.lock().map_err(|_| "[STATE] LOCK_FAILED_KID")?;
+    let mut gen_guard = state.generation.lock().map_err(|_| "[STATE] LOCK_FAILED_GENERATION")?;
+    let mut sender_guard = state.sender_id.lock().map_err(|_| "[STATE] LOCK_FAILED_SENDER")?;
     let mut path_guard = state.db_path.lock().map_err(|_| "[STATE] LOCK_FAILED_PATH")?;
     let mut hlc_guard = state.hlc.lock().map_err(|_| "[STATE] LOCK_FAILED_HLC")?;
     *conn_guard = Some(conn);
-    *key_guard = Some(key);
-    *salt_guard = Some(salt_bytes);
-    *path_guard = Some(path);
+    *dek_guard = Some(dek);
+    *kid_guard = Some(kid);
+    *gen_guard = Some(generation);
+    *sender_guard = Some(sender_id);
+    *path_guard = Some(path.clone());
     *hlc_guard = Some(hlc_arc);
     drop(hlc_guard);
     drop(path_guard);
-    drop(salt_guard);
-    drop(key_guard);
+    drop(sender_guard);
+    drop(gen_guard);
+    drop(kid_guard);
+    drop(dek_guard);
     drop(conn_guard);
 
     if needs_resave {
         save_vault_internal(&state)?;
     }
+
+    // T039 (FR-017): tell the frontend a migration just happened, once,
+    // so it can raise the one-time notice. No listener exists yet (that is
+    // 3g's job) — emitting to nobody is harmless, and once the frontend is
+    // built it starts reacting to an event this code already emits
+    // correctly, with no backend change needed then.
+    if migrated_this_unlock {
+        let _ = app_handle.emit(
+            "vault-migration-notice",
+            serde_json::json!({ "name": profile_name, "from_revision": generation }),
+        );
+    }
+
     Ok(())
 }
 
@@ -1444,12 +2468,20 @@ async fn create_profile(
     if path.exists() {
         return Err(format!("Profile '{}' already exists", name));
     }
+    // This path bypasses `select_profile` (it sets `active_profile`
+    // itself), so it must acquire the writer claim itself too — the
+    // resave `setup_master_db_inner` performs below refuses without one
+    // (T048), and a concurrent `create_profile` for the same name is
+    // exactly the case the claim exists to prevent.
+    acquire_writer_claim(&state, &path, &name)?;
     *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name);
     // Reuse setup_master_db's fresh-schema branch by deferring to it. Empty
     // profile starts with the same migrations the legacy path would do.
+    // `setup_master_db_inner` already performs the initial save itself
+    // (`needs_resave` is always true for a brand-new vault) — an extra save
+    // here would be redundant work that also burns a second generation
+    // number, leaving a fresh profile at generation 2 instead of 1.
     setup_master_db(app_handle.clone(), password, state).await?;
-    let db_state = app_handle.state::<DbState>();
-    save_vault_internal(&db_state)?;
     Ok(())
 }
 
@@ -8422,7 +9454,8 @@ pub fn run() {
     // installer AND the Android APK. Capability is granted in default.json.
     let builder = builder.plugin(tauri_plugin_opener::init());
     builder
-        .manage(DbState { conn: std::sync::Arc::new(StdMutex::new(None)), master_key: StdMutex::new(None), salt: StdMutex::new(None), db_path: StdMutex::new(None), active_profile: StdMutex::new(None), hlc: StdMutex::new(None) })
+        .manage(DbState { conn: std::sync::Arc::new(StdMutex::new(None)), dek: StdMutex::new(None), kid: StdMutex::new(None), generation: StdMutex::new(None), sender_id: StdMutex::new(None), db_path: StdMutex::new(None), active_profile: StdMutex::new(None), hlc: StdMutex::new(None), writer_claim: StdMutex::new(None), lock_state: StdMutex::new(lock::LockState::Unlocked), platform_auth_failures: StdMutex::new(0) })
+        .manage(ImportStagingState::default())
         .manage(SshState::new())
         // Docker live-log stream registry — keyed by frontend-issued stream id,
         // values are tokio AbortHandles so the user can stop tailing on demand.
@@ -8440,10 +9473,114 @@ pub fn run() {
         // read it at the start of every cycle so interval/threshold changes
         // are hot-applied without restarting any monitor.
         .manage::<SharedSettings>(std::sync::Arc::new(tokio::sync::Mutex::new(monitor::MonitorSettings::default())))
+        // T052: window focus loss is the one lock trigger Tauri itself
+        // reports (`WindowEvent` has exactly eight variants — research.md
+        // Decision 12 — none of which cover idle, screen-lock, or sleep;
+        // those are wired up per-platform in `setup` below instead).
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Focused(false) = event {
+                let app_handle = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Manager as _;
+                    if let Some(state) = app_handle.try_state::<DbState>() {
+                        let _ = lock::perform_lock(&app_handle, &state, lock::LockEvent::FocusLost).await;
+                    }
+                });
+            }
+        })
+        .setup(|app| {
+            use tauri::Manager as _;
+            let app_handle = app.handle().clone();
+
+            // T053: macOS screen-lock/sleep observers must be registered on
+            // the main thread — both notification centers deliver on the
+            // runloop of whichever thread registered.
+            #[cfg(target_os = "macos")]
+            {
+                let ah = app_handle.clone();
+                let _ = app.run_on_main_thread(move || {
+                    lock::macos::register_screen_and_sleep_observers(move || {
+                        let ah = ah.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Some(state) = ah.try_state::<DbState>() {
+                                let _ = lock::perform_lock(&ah, &state, lock::LockEvent::OsScreenLockOrSleep).await;
+                            }
+                        });
+                    });
+                });
+            }
+
+            // T054: the message-only window + WndProc run on their own
+            // dedicated thread (a blocking GetMessageW loop), started once
+            // here.
+            #[cfg(target_os = "windows")]
+            {
+                let ah = app_handle.clone();
+                lock::windows_impl::register_session_and_power_observer(move || {
+                    let ah = ah.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(state) = ah.try_state::<DbState>() {
+                            let _ = lock::perform_lock(&ah, &state, lock::LockEvent::OsScreenLockOrSleep).await;
+                        }
+                    });
+                });
+            }
+
+            // T055: logind over D-Bus — identical on X11 and Wayland.
+            #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+            {
+                let ah = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let ah_inner = ah.clone();
+                    let callback: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+                        let ah = ah_inner.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Some(state) = ah.try_state::<DbState>() {
+                                let _ = lock::perform_lock(&ah, &state, lock::LockEvent::OsScreenLockOrSleep).await;
+                            }
+                        });
+                    });
+                    lock::linux::watch_sleep_and_lock(callback).await;
+                });
+            }
+
+            // T056: idle-timeout poll. Runs on every platform; one with no
+            // idle-time source (`seconds_since_last_input` returns `None` —
+            // currently only a pure-Wayland session, see the Cargo.toml
+            // comment on the `x11rb` dependency) simply never fires this
+            // particular trigger. A profile only "counts" as idle-lockable
+            // while unlocked — checking `dek.is_some()` first also means
+            // this loop does nothing before any profile is open.
+            {
+                let ah = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        let Some(state) = ah.try_state::<DbState>() else { continue };
+                        let unlocked = state.dek.lock().map(|g| g.is_some()).unwrap_or(false);
+                        if !unlocked {
+                            continue;
+                        }
+                        let Some(idle_secs) = lock::seconds_since_last_input() else { continue };
+                        let threshold_secs = f64::from(lock::idle_timeout_get(&ah)) * 60.0;
+                        if idle_secs >= threshold_secs {
+                            let _ = lock::perform_lock(&ah, &state, lock::LockEvent::IdleTimeout).await;
+                        }
+                    }
+                });
+            }
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             check_db_exists, setup_master_db, persist_vault,
-            list_profiles, select_profile, create_profile, delete_profile, close_profile,
-            export_profile, import_profile_pick, import_profile_save,
+            list_profiles, profiles_dir_path, select_profile, create_profile, delete_profile, close_profile,
+            migration_notice_ack, rollback_resolve,
+            vault_lock, vault_lock_state, vault_unlock_quick, vault_unlock_full,
+            idle_timeout_get, idle_timeout_set,
+            recovery_kit_create, recovery_kit_save_file, recovery_kit_consume, pick_and_read_file, read_local_file_bytes,
+            unclaimed_keys_list, unclaimed_key_discard,
+            export_profile, import_vault_pick, import_vault_commit, import_vault_discard,
             add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_jump_host, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
             get_credentials, generate_ssh_key,
             add_folder, rename_folder, delete_folder, get_folders,
@@ -8496,6 +9633,27 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `chrono_like_timestamp`'s hand-rolled civil-calendar conversion,
+    /// checked against reference points computed independently (Python's
+    /// `datetime.utcfromtimestamp`) rather than trusted by inspection —
+    /// this is exactly the kind of arithmetic that looks right and isn't.
+    /// Covers epoch, a century-leap-year boundary (2000, divisible by 400,
+    /// IS a leap year), a regular leap year (2024), and a year-end rollover.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn chrono_like_timestamp_matches_known_reference_dates() {
+        // Cross-checked independently against Python's
+        // `datetime.utcfromtimestamp` for each of these, not re-derived by
+        // inspection — the Gregorian calendar's leap-year exceptions are
+        // exactly where "obviously correct" arithmetic goes wrong silently.
+        assert_eq!(civil_timestamp_from_unix_secs(0), "19700101-0000");
+        assert_eq!(civil_timestamp_from_unix_secs(946684800), "20000101-0000");
+        assert_eq!(civil_timestamp_from_unix_secs(951782400), "20000229-0000"); // century leap year
+        assert_eq!(civil_timestamp_from_unix_secs(1709208600), "20240229-1210"); // ordinary leap year
+        assert_eq!(civil_timestamp_from_unix_secs(1893456000), "20300101-0000");
+        assert_eq!(civil_timestamp_from_unix_secs(1735689599), "20241231-2359"); // year-end rollover
+    }
 
     #[test]
     fn dir_entry_name_rejects_traversal_and_separators() {
