@@ -197,8 +197,9 @@ jobs:
       # Arch: Tauri's bundler has no native pacman backend, so we run
       # makepkg ourselves inside an `archlinux:latest` container. The
       # PKGBUILD in packaging/arch/ installs the already-built Tauri
-      # release binary plus a .desktop and icon from $startdir — no
-      # source download / no rebuild — so the result is the same binary
+      # release binary plus a .desktop, icon, and MIME-type registration
+      # (FR-037) from $startdir — no source download / no rebuild — so the
+      # result is the same binary
       # users get from the .deb, just packaged for pacman. Compression
       # stays at pacman's default (zstd at level 19, what every Arch
       # mirror uses) — no custom XZ / no MAKEPKG_CONF tweaks.
@@ -210,6 +211,7 @@ jobs:
           mkdir -p arch-build
           cp packaging/arch/PKGBUILD             arch-build/
           cp packaging/arch/sshclientx.desktop    arch-build/
+          cp packaging/arch/sshclientx-mime.xml   arch-build/
           cp src-tauri/target/${{ matrix.rust_target }}/release/sshclientx arch-build/
           cp src-tauri/icons/icon.png            arch-build/
 

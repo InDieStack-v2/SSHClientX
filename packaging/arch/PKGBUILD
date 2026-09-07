@@ -10,6 +10,10 @@
 # If you want to build it yourself: copy the release binary into this
 # directory as `sshclientx`, copy sshclientx.desktop and icon.png in, then
 # run `makepkg -f`.
+#
+# sshclientx-mime.xml (FR-037: file-type registration, no content
+# previews) ships alongside this PKGBUILD in the repo — no CI step needed
+# to produce it, unlike the binary/.desktop/icon.
 
 pkgname=sshclientx
 pkgver=0.0.0
@@ -30,4 +34,10 @@ package() {
   install -Dm755 "$startdir/sshclientx"         "$pkgdir/usr/bin/sshclientx"
   install -Dm644 "$startdir/sshclientx.desktop" "$pkgdir/usr/share/applications/sshclientx.desktop"
   install -Dm644 "$startdir/icon.png"          "$pkgdir/usr/share/icons/hicolor/512x512/apps/sshclientx.png"
+  # FR-037: registers .sshclientx as its own MIME type so file managers
+  # recognise it and route double-click opens to this app. shared-mime-info
+  # and desktop-file-utils' own ALPM hooks refresh the system databases on
+  # install — no separate update-mime-database/update-desktop-database call
+  # needed here.
+  install -Dm644 "$startdir/sshclientx-mime.xml" "$pkgdir/usr/share/mime/packages/sshclientx.xml"
 }

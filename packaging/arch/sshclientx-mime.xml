@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Registers the .sshclientx vault as its own opaque MIME type (FR-037).
+
+  Deliberately no <sub-class-of> a text/*, application/json, or other
+  generically-previewable base type — the file is AEAD-sealed ciphertext,
+  and giving it a previewable ancestor is exactly what would make a file
+  manager's generic text/hex previewer render raw ciphertext bytes. Glob
+  registration alone is enough for double-click file-open association;
+  content-preview suppression comes from NOT declaring one.
+-->
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-sshclientx">
+    <comment>SSHClientX encrypted vault</comment>
+    <glob pattern="*.sshclientx"/>
+  </mime-type>
+</mime-info>
