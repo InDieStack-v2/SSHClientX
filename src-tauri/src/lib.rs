@@ -905,10 +905,11 @@ async fn close_profile(
     Ok(())
 }
 
-/// Permanently delete a profile's encrypted file. The caller must NOT be
-/// "in" that profile (would orphan in-memory state pointing at a deleted
-/// file). UI enforces this by only showing the delete button on the picker
-/// screen.
+/// Permanently delete a profile's encrypted file and its keystore
+/// artifacts (device factor, high-water mark, quick-unlock copy). The
+/// caller must NOT be "in" that profile (would orphan in-memory state
+/// pointing at a deleted file). UI enforces this by only showing the
+/// delete button on the picker screen.
 #[tauri::command]
 async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<(), String> {
     validate_profile_name(&name)?;
@@ -921,6 +922,17 @@ async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<()
                 last_err = Some(format!("[FILE] DELETE_PROFILE_FAILED at {:?}: {}", path, e));
             }
         }
+    }
+    if last_err.is_none() {
+        // Keyring can pop a GUI prompt; keep it off the tokio worker pool.
+        // Missing entries are already Ok inside the delete helpers. A
+        // denied keystore must not fail a completed file delete.
+        let name_ks = name.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = keystore::delete_device_factor(&name_ks);
+            let _ = keystore::delete_high_water(&name_ks);
+            let _ = keystore::delete_quick_unlock(&name_ks);
+        }).await;
     }
     match last_err {
         Some(e) => Err(e),

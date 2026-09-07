@@ -141,27 +141,6 @@ impl std::fmt::Display for Outcome {
 
 impl std::error::Error for Outcome {}
 
-/// Serializable form returned across the Tauri IPC boundary. The renderer
-/// receives `{ code, message }` and switches on `code` only, per
-/// `contracts/tauri-command-contract.md`'s stated invariant.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct VaultError {
-    pub code: &'static str,
-    pub message: String,
-}
-
-impl From<Outcome> for VaultError {
-    fn from(o: Outcome) -> Self {
-        VaultError { code: o.code(), message: o.message().to_string() }
-    }
-}
-
-impl std::fmt::Display for VaultError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "[{}] {}", self.code, self.message)
-    }
-}
-
 #[cfg(test)]
 mod outcome_tests {
     use super::*;
@@ -251,6 +230,7 @@ pub(crate) fn legacy_derive_key(password: &str, salt_bytes: &[u8]) -> Result<[u8
     Ok(key)
 }
 
+#[cfg(test)]
 pub(crate) fn legacy_encrypt(plaintext: &[u8], key: &[u8; 32]) -> Result<(Vec<u8>, [u8; LEGACY_NONCE_LEN]), String> {
     use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit, Nonce};
     let cipher = Aes256Gcm::new(key.into());
@@ -299,6 +279,7 @@ pub(crate) fn legacy_parse_blob(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8
     Ok((salt, nonce, ct))
 }
 
+#[cfg(test)]
 pub(crate) fn legacy_write_blob(salt: &[u8; LEGACY_SALT_LEN], nonce: &[u8; LEGACY_NONCE_LEN], ciphertext: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(LEGACY_HEADER_LEN + LEGACY_NONCE_LEN + ciphertext.len());
     out.extend_from_slice(LEGACY_MAGIC);
@@ -1218,7 +1199,6 @@ pub enum ConfirmationNeeded {
 /// the commit step) must still get explicit sign-off on before writing
 /// anything, per `confirmation_needed`.
 pub struct ImportDecision {
-    pub plaintext: Vec<u8>,
     pub disposition: Disposition,
     pub confirmation_needed: ConfirmationNeeded,
     pub sealed: SealedVaultFile,
@@ -1299,7 +1279,6 @@ pub fn verify_and_import(
     };
 
     Ok(ImportDecision {
-        plaintext,
         disposition,
         confirmation_needed,
         sealed,
@@ -1364,7 +1343,6 @@ mod verify_and_import_tests {
             .expect("should succeed");
         assert_eq!(result.disposition, Disposition::CreateProfile);
         assert_eq!(result.confirmation_needed, ConfirmationNeeded::None);
-        assert_eq!(result.plaintext, b"payload for a brand new profile");
     }
 
     #[test]
