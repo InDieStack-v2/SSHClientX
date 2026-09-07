@@ -1,6 +1,34 @@
-import { Settings, Palette, RefreshCw, Pipette, List } from "lucide-react";
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { Settings, Palette, RefreshCw, Pipette, List, Lock } from "lucide-react";
 
 const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
+  // Idle-lock timeout (FR-045) — backend-persisted (a device-wide sidecar
+  // file, not this component's own localStorage-backed `settings`/
+  // `setSettings`), so it gets its own state and IPC round-trip rather
+  // than folding into the prop-drilled UI-preference object above.
+  const [idleMinutes, setIdleMinutes] = useState<number | null>(null);
+  const [idleError, setIdleError] = useState<string | null>(null);
+  const [idleSaving, setIdleSaving] = useState(false);
+
+  useEffect(() => {
+    invoke<number>("idle_timeout_get").then(setIdleMinutes).catch(() => {});
+  }, []);
+
+  const commitIdleMinutes = async (minutes: number) => {
+    setIdleSaving(true); setIdleError(null);
+    try {
+      await invoke("idle_timeout_set", { minutes });
+      setIdleMinutes(minutes);
+    } catch (e) {
+      // Backend rejects out-of-range rather than clamping (FR-045) — show
+      // its message and leave the displayed value at the last-known-good one.
+      setIdleError(String(e).replace(/^\[[A-Z_]+\]\s*/, ""));
+      invoke<number>("idle_timeout_get").then(setIdleMinutes).catch(() => {});
+    } finally {
+      setIdleSaving(false);
+    }
+  };
   const accentColors = [
     { name: 'Light Blue', value: '#60a5fa' },
     { name: 'Sky', value: '#38bdf8' },
@@ -134,6 +162,49 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
                 onChange={(e) => setSettings({ ...settings, terminalFontSize: parseInt(e.target.value) || 14 })}
                 className="w-full accent-primary"
               />
+            </div>
+          </div>
+        </section>
+
+        {/* Vault Security Section */}
+        <section className="break-inside-avoid space-y-3 mb-4 sm:mb-8">
+          <div className="flex items-center gap-2 text-zinc-400 font-bold uppercase tracking-widest text-xs">
+            <Lock size={14} /> Vault Security
+          </div>
+
+          <div className="bg-[#121215] border border-white/5 rounded-2xl p-6 space-y-4 shadow-xl">
+            <div className="space-y-2">
+              <div className="flex justify-between items-center">
+                <label className="text-[11px] font-black text-zinc-500 uppercase tracking-wider">Idle lock timeout (minutes)</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={60}
+                  value={idleMinutes ?? ""}
+                  onChange={(e) => setIdleMinutes(parseInt(e.target.value) || 1)}
+                  onBlur={(e) => {
+                    const v = Math.max(1, Math.min(60, parseInt(e.target.value) || 15));
+                    commitIdleMinutes(v);
+                  }}
+                  disabled={idleSaving || idleMinutes === null}
+                  className="w-16 h-8 bg-black border border-white/10 rounded-lg px-2 text-[12px] font-bold text-white focus:border-primary/50 outline-none text-center disabled:opacity-50"
+                />
+              </div>
+              <input
+                type="range"
+                min="1"
+                max="60"
+                value={idleMinutes ?? 15}
+                disabled={idleSaving || idleMinutes === null}
+                onChange={(e) => setIdleMinutes(parseInt(e.target.value))}
+                onMouseUp={(e) => commitIdleMinutes(parseInt((e.target as HTMLInputElement).value))}
+                onTouchEnd={(e) => commitIdleMinutes(parseInt((e.target as HTMLInputElement).value))}
+                className="w-full accent-primary"
+              />
+              <p className="text-[11px] text-zinc-500 leading-relaxed">
+                Locking after inactivity is always on — this only sets how long. 1–60 minutes, default 15.
+              </p>
+              {idleError && <p className="text-[11px] text-rose-300">{idleError}</p>}
             </div>
           </div>
         </section>

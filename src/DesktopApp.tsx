@@ -5,11 +5,14 @@ import {
   Plus, X, RefreshCw, Terminal, Key, Trash2,
   ArrowLeftRight, Shield, User, Cpu, TerminalSquare, List, Edit2,
   StickyNote, Search, Square, Copy, ChevronLeft, MoreVertical, Radio,
-  ChevronDown, Columns, LayoutGrid, Pin, PinOff
+  ChevronDown, Columns, LayoutGrid, Pin, PinOff, AlertTriangle
 } from "lucide-react";
 import { useBroadcast } from "./ui/broadcast";
 
 import ProfileSelectPage from "./components/ProfileSelectPage";
+import LockScreen from "./components/LockScreen";
+import RecoveryKitPanel from "./components/RecoveryKitPanel";
+import { useTauriListen } from "./hooks/useTauriListen";
 import logoUrl from "./assets/logo.png";
 import PasswordField from "./components/PasswordField";
 import QuickConnectModal, { QuickAuth } from "./components/QuickConnectModal";
@@ -51,6 +54,24 @@ function DesktopApp() {
   // until ProfileSelectPage's onUnlocked fires, at which point the app
   // flips straight into the main view — no intermediate state.
   const [activeProfile, setActiveProfile] = useState<string | null>(null);
+  // Vault lock lifecycle (spec 002, data-model.md §2.10) — deliberately NOT
+  // reset by anything except the event/fetch below. In particular it must
+  // never be touched by session/view state changes: locking conceals with
+  // an overlay (rendered further down) but never tears down `activeView`,
+  // `sessions`, or any panel's mounted state, so there is nothing to
+  // "restore" on unlock (FR-048) — the app was never actually navigated
+  // away from underneath the overlay. `handleLogout` below is a SEPARATE,
+  // deliberately destructive flow (closes the profile, disconnects every
+  // session) and must not be conflated with locking.
+  const [lockState, setLockState] = useState<"unlocked" | "locked_soft" | "locked_hard">("unlocked");
+  // T072/FR-017: kept at this always-mounted level, not inside
+  // ProfileSelectPage — the event fires from inside `setup_master_db`
+  // BEFORE that command's own promise resolves, so it can arrive right as
+  // ProfileSelectPage unmounts (unlock just succeeded). DesktopApp never
+  // unmounts across that transition, so the listener here can't miss it.
+  const [migrationNotice, setMigrationNotice] = useState<{ name: string; fromRevision: number } | null>(null);
+  // T090: offered once the notice above is acknowledged.
+  const [recoveryCreateOpen, setRecoveryCreateOpen] = useState(false);
   const [activeView, setActiveView] = useState<string>("nodes");
   const [sessions, setSessions] = useState<Session[]>([]);
   // Tracks the live status of each open session ('connecting' | 'connected'
@@ -390,9 +411,34 @@ function DesktopApp() {
   // flow on a single screen. By the time it fires `onUnlocked`, the
   // backend has both selected the profile AND decrypted the DB — we just
   // flip the UI and refresh data.
+  // Steady-state lock updates come from the event; this is only for
+  // render-on-mount (contract §4) so a just-unlocked screen doesn't briefly
+  // show as "unlocked" before the first event, or vice versa after a
+  // reload mid-lock (there is none today, but the fetch costs nothing).
+  useTauriListen<{ state: "unlocked" | "locked_soft" | "locked_hard" }>(
+    "vault-lock-state",
+    (e) => setLockState(e.payload.state),
+    [],
+  );
+
+  useTauriListen<{ name: string; from_revision: number }>(
+    "vault-migration-notice",
+    (e) => setMigrationNotice({ name: e.payload.name, fromRevision: e.payload.from_revision }),
+    [],
+  );
+
+  const ackMigrationNotice = async () => {
+    if (!migrationNotice) return;
+    try { await invoke("migration_notice_ack", { name: migrationNotice.name }); }
+    catch (e) { addLog(`MIGRATION_ACK_FAILED: ${e}`, "error"); }
+    setMigrationNotice(null);
+    setRecoveryCreateOpen(true); // T090
+  };
+
   const handleProfileUnlocked = async (name: string) => {
     setActiveProfile(name);
     setIsUnlocked(true);
+    invoke<string>("vault_lock_state").then((s) => setLockState(s as any)).catch(() => {});
     addLog(`Profile "${name}" unlocked.`, "success");
     refreshAll();
     // Autostart sweep: load servers directly (refreshAll is also doing this
@@ -489,6 +535,7 @@ function DesktopApp() {
     // servers/credentials/sessions leaking across profile contexts.
     setIsUnlocked(false);
     setActiveProfile(null);
+    setLockState("unlocked"); // mirrors the backend's own reset in close_profile
     setSessions([]);
     setActiveView("nodes");
     setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setCommands([]);
@@ -1313,6 +1360,38 @@ function DesktopApp() {
   return (
     <div className="h-full w-full bg-background flex flex-col overflow-hidden text-zinc-200 select-none">
       {TitleBar()}
+      {/* T071: a pure overlay, not a replacement — everything underneath
+          (sessions, tunnels, panels) stays exactly as mounted (FR-049), so
+          there is nothing to tear down or restore around it (T122). */}
+      {isUnlocked && lockState !== "unlocked" && (
+        <LockScreen lockState={lockState} onUnlocked={() => setLockState("unlocked")} />
+      )}
+      {/* T072/FR-017: one-time notice, single acknowledgement — dismissing
+          it any other way would leave the pre-migration legacy file
+          undeleted, which is safe (see migration_notice_ack's own docs),
+          so there is no separate "cancel" path here on purpose. */}
+      {migrationNotice && (
+        <div className="fixed inset-0 z-[10001] bg-black/70 flex items-center justify-center p-4">
+          <div className="w-full max-w-[380px] bg-[#121214] border border-amber-500/30 rounded-xl shadow-2xl p-5">
+            <div className="flex items-center gap-2 mb-3">
+              <AlertTriangle size={16} className="text-amber-400" />
+              <span className="text-[12px] font-bold uppercase tracking-widest text-zinc-100">Vault upgraded</span>
+            </div>
+            <p className="text-[13px] text-zinc-300 leading-relaxed mb-4">
+              "{migrationNotice.name}" has been upgraded to the new, device-bound vault format. This file will{" "}
+              <strong>no longer open on other machines</strong> with just the password — each device needs its own
+              key, set up via a recovery kit or by exporting/importing it there.
+            </p>
+            <button
+              onClick={ackMigrationNotice}
+              className="w-full h-10 rounded-lg text-[13px] font-semibold bg-primary text-black"
+            >
+              I understand
+            </button>
+          </div>
+        </div>
+      )}
+      <RecoveryKitPanel isOpen={recoveryCreateOpen} mode="create" onClose={() => setRecoveryCreateOpen(false)} />
       {!isUnlocked ? (
         <ProfileSelectPage onUnlocked={handleProfileUnlocked} />
       ) : (
