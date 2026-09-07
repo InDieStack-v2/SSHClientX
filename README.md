@@ -181,7 +181,7 @@ Pick a binary from the [latest release](https://github.com/InDieStack-v2/SSHClie
 
 SSHClientX on Android is a true native build of the same Rust core — same SSH stack, same encrypted vault format. Reach a server from your phone with the same credentials you saved on your desktop.
 
-- **Same encrypted vault format.** Export a profile from desktop and import that same file on your phone (or vice versa) — same master password, nothing re-typed, no account needed.
+- **Same encrypted vault format, device-bound key.** A vault's key never leaves the device it was created on — moving it to your phone means exporting the file, then bringing it in with a **Recovery Kit** (a one-time phrase or key file you generate from the desktop app) so the phone gets its own copy of the key. No account, no server involved either way.
 - **Tabbed terminal optimised for touch.** Mobile soft keyboards don't have Ctrl / Alt / Shift / Esc / Tab — SSHClientX ships an inline **soft-key bar** between xterm and the OS keyboard with Termux-style sticky modifiers (tap to arm, double-tap to lock). Ctrl+letter, Alt+letter, and Shift+Tab all work as expected.
 - **Auto-scroll on focus.** Tap the terminal and the prompt scrolls into view; the same fires when the OS keyboard opens so the cursor row never sits hidden behind the keyboard.
 - **SFTP file browser** with multi-select, upload from the phone's storage, download into Downloads.
@@ -197,9 +197,10 @@ Your data is encrypted on your machine and never leaves it. There is no account,
 
 **How it works:**
 
-1. **Your master password becomes a vault key — on your device.** When you unlock, your password is run through Argon2id to derive a key. The password is wiped from memory the moment derivation finishes. It never goes anywhere.
-2. **Profiles are sealed with AES-256-GCM — on your device.** Every saved server (credentials, keys, tunnels, notes, mirrors) is compressed and encrypted with that key. What hits disk is opaque ciphertext.
-3. **Nothing is ever uploaded.** The encrypted vault file stays on your device. Moving it to another machine (desktop-to-desktop or desktop-to-Android) is a manual export/import of that same file — SSHClientX never sends it anywhere on your behalf.
+1. **The vault key is device-bound, not just password-derived.** Unlocking combines two things: a random secret generated on first use and held in your OS's own secure store (Keychain / Credential Manager / Secret Service), and your password run through Argon2id. Neither one alone — not a copied password, not a stolen keystore entry — is enough to open the vault. The password is wiped from memory the moment it's used, and never crosses a network boundary, ever.
+2. **Profiles are sealed with XChaCha20-Poly1305 — on your device.** Every saved server (credentials, keys, tunnels, notes, mirrors) is compressed and encrypted with that key. What hits disk is opaque ciphertext.
+3. **Moving to another device needs a Recovery Kit, not just the file.** Because the key is device-bound, copying the raw vault file to a new machine isn't enough to open it there. Generate a Recovery Kit (a 24-word phrase or a key file, sealed under its own separate passphrase — never your vault password) from a device that already has the key, and use it on the new one alongside the vault file. Nothing about this ever touches a server.
+4. **Locking conceals, it doesn't disconnect.** The app locks itself after inactivity, when the OS screen locks or sleeps, or on demand — hiding everything on screen while your live SSH sessions, tunnels, and transfers keep running underneath. Coming back is a fingerprint/Windows Hello tap (falls back to your password automatically) rather than always re-typing it.
 
 **Why there's nothing to breach:**
 
@@ -232,7 +233,7 @@ Yes. File-based keys and pasted PEM/OpenSSH keys, with or without passphrase.
 
 ### Can I move a profile between Windows and macOS?
 
-Yes. The encrypted vault file is platform-portable — export it from one machine and import that same file on another, then unlock with the same master password.
+Yes, but the vault key is device-bound, so a plain file copy won't open on its own. Export the profile, generate a Recovery Kit from the original machine (a one-time phrase or key file), then import the file on the new machine and use the kit alongside it to establish the key there. After that, the new device unlocks with its own password going forward — it doesn't have to match the original.
 
 ### Why Rust and Tauri instead of Electron?
 
@@ -248,7 +249,7 @@ No. There's no analytics SDK, no crash reporter that sends data home, no account
 
 ### Can I use SSHClientX on my Android phone with the same servers as my desktop?
 
-Yes. Export your profile from desktop and import that same file on your phone, then unlock it with the same master password — every server, key, and saved tunnel comes across. Folder mirror is desktop-only for now; everything else (terminal, SFTP, port forwarding) works on Android.
+Yes. Export your profile from desktop, generate a Recovery Kit there, then bring both the file and the kit over to your phone — Android can open, use, and save the vault once the kit has established its key, though creating a brand-new vault or upgrading an old one still has to happen on desktop first. Every server, key, and saved tunnel comes across. Folder mirror is desktop-only for now; everything else (terminal, SFTP, port forwarding) works on Android.
 
 ### Is SSHClientX on the Play Store?
 

@@ -35,8 +35,10 @@ fits together" picture.
                                      │
                      ┌───────────────▼───────────────────────────┐
                      │  <app_data>/profiles/<name>.sshclientx      │
-                     │  SQLite serialize → zstd → AES-256-GCM      │
-                     │  (Argon2id-derived key, never touches disk) │
+                     │  SQLite serialize → zstd → XChaCha20-Poly1305│
+                     │  (device-bound key: OS keystore secret ⊕    │
+                     │   Argon2id(password) — neither alone opens  │
+                     │   it, and the password never touches disk)  │
                      └─────────────────────────────────────────────┘
 ```
 
@@ -208,17 +210,44 @@ to any network path — there is nothing left to sync with.
 
 ### Vault format
 
+Spec 002 (`specs/002-e2e-vault-migration/`) replaced the single-password vault
+with a device-bound one. Current format:
+
 ```
-plaintext (SQLite serialize) → zstd compress → AES-256-GCM encrypt → write
+plaintext (SQLite serialize) → zstd compress → XChaCha20-Poly1305 seal → write
 ```
 
-- Key derivation: Argon2id, `m_cost=64MiB, t=3, p=4` (frozen — a param
-  change needs a versioned re-key migration per the constitution).
-- File magic `OMNV`; on-disk extension `.sshclientx` (write), still reads
-  legacy `.submarine` files.
-- Master key lives in `DbState` behind a `Zeroizing` wrapper; Argon2 and
-  vault serialize/encrypt run on `spawn_blocking`, never on the async
-  runtime, and the SQLite `Mutex` is never held across an `.await`.
+- **Two-of-two unlock**: `K_combined = SHA-256(K_device ‖ Argon2id(password, salt))`.
+  `K_device` is a random 32-byte secret generated once per profile and held
+  in the OS secure store (Keychain / Credential Manager / Secret Service via
+  `keystore.rs`); the DEK is wrapped under `K_combined` in a `.keywrap`
+  sidecar next to the vault file. Neither the keystore value nor the
+  password alone reconstructs the DEK — moving just the vault *file* to
+  another device is not enough to open it there (see "Recovery kit" below).
+- Sealed container magic `SSHCLTX1` (`vault.rs::SealedVaultFile`); on-disk
+  extension `.sshclientx`. The legacy single-password format (magic `OMNV`,
+  `.submarine`/`.sshclientx`, `Argon2id(password)` directly as the AES-256-GCM
+  key) is still read and migrated to the sealed format on first unlock —
+  see `keystore.rs`, `vault.rs`, `lock.rs`, `recovery.rs`,
+  `platform_auth.rs` for the full model (key wrapping, rollback detection
+  via a high-water mark, single-writer claims, recovery kits).
+- **Recovery kit**: the way a *second* device gets the same key. Sealed
+  under its own passphrase (never the vault password) via a tagless
+  XOR-pad construction — either a 24-word BIP39 phrase or a key file.
+  Consuming one registers an *unclaimed* key in the new device's keystore;
+  the matching vault file still has to be imported separately to actually
+  create a profile from it.
+- **Lock lifecycle** (`lock.rs`): three states — `unlocked`, `locked_soft`
+  (focus loss; the DEK is dropped from memory but a platform-authentication-
+  gated copy stays in the keystore for a fast Touch ID / Windows Hello
+  re-unlock), `locked_hard` (idle timeout, OS screen lock/sleep, explicit
+  lock, or app exit; that keystore copy is released too, so only the full
+  password recovers it). Live SSH sessions, tunnels, transfers, mirrors, and
+  monitors keep running through every lock — locking conceals, it does not
+  disconnect.
+- The DEK lives in `DbState` behind a `Zeroizing` wrapper; Argon2 and vault
+  serialize/encrypt run on `spawn_blocking`, never on the async runtime, and
+  the SQLite `Mutex` is never held across an `.await`.
 
 ### State management
 
@@ -244,11 +273,15 @@ ever persisted there.
   `fingerprint-prompt-{sid}`. Terminal output is base64-encoded, not a raw
   byte-array (a JSON number array bloats ~4x over the wire).
 - Errors: `Result<T, String>`, string-prefixed by subsystem — `[SYSTEM]
-  [CRYPTO] [VAULT] [DATABASE] [STATE] [FILE] [SSH] [UPDATE] [OPEN]`. A few
-  commands use the error channel as a structured signal the frontend
-  parses (`EXISTS:<path>` on an SFTP overwrite probe, retried with
-  `overwrite: true`; wrong vault password surfaces as `[CRYPTO]
-  DECRYPT_FAILURE`).
+  [CRYPTO] [VAULT] [DATABASE] [STATE] [FILE] [SSH] [UPDATE] [OPEN]`, plus
+  the vault's own closed outcome vocabulary from `vault.rs::Outcome`
+  (`[VAULT_AUTH]`, `[VAULT_BUSY]`, `[BOX_UNKNOWN_KEY]`, `[KIT_MALFORMED]`,
+  etc. — `contracts/tauri-command-contract.md` in spec 002 is the full
+  list). A few commands use the error channel as a structured signal the
+  frontend parses (`EXISTS:<path>` on an SFTP overwrite probe, retried with
+  `overwrite: true`; the frontend's `describeVaultError` in
+  `src/util/vaultErrors.ts` is what pulls a `[CODE]` back out of any of
+  these for behavioral branching, without re-parsing the message text).
 
 ## Security boundary
 
@@ -298,6 +331,8 @@ Android — those get manual smoke-tested via `npm run tauri dev` /
   this architecture is constrained by.
 - `specs/001-local-only-mode/` — why accounts/cloud-sync/sharing were
   removed.
-- `docs/features/spec-00-e2e-vault.md` — the (not-yet-built) vault vNext
-  direction: DEK/KEK split, QR device pairing, bring-your-own-cloud backup.
-  Still a real future target, not a stale doc.
+- `docs/features/spec-00-e2e-vault.md` — the original vault vNext design
+  (DEK/KEK split, QR device pairing, bring-your-own-cloud backup).
+  `specs/002-e2e-vault-migration/` is where that design actually got built
+  (device-bound two-factor unlock, recovery kits, lock lifecycle); QR
+  pairing and BYO-cloud backup remain future work beyond it.
