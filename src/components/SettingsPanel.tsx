@@ -1,8 +1,34 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Settings, Palette, RefreshCw, Pipette, List, Lock, KeyRound } from "lucide-react";
+import { Settings, Palette, RefreshCw, Pipette, List, Lock, KeyRound, Trash2 } from "lucide-react";
 
 const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenRecoveryKit }: any) => {
+  // Recovery-kit edge case: a kit consumed but never matched to a vault
+  // file leaves an unclaimed key sitting in the secure store, owning
+  // nothing — otherwise invisible and permanent. Device-wide, not tied to
+  // the profile that happens to be open right now, so it's loaded
+  // independently of everything else here.
+  const [unclaimedKeys, setUnclaimedKeys] = useState<string[]>([]);
+  const [discardingKid, setDiscardingKid] = useState<string | null>(null);
+
+  const reloadUnclaimedKeys = () => {
+    invoke<string[]>("unclaimed_keys_list").then(setUnclaimedKeys).catch(() => {});
+  };
+  useEffect(() => { reloadUnclaimedKeys(); }, []);
+
+  const discardUnclaimedKey = async (kidHex: string) => {
+    if (!window.confirm("Discard this recovered key? If you haven't imported its vault file yet, this can't be undone.")) return;
+    setDiscardingKid(kidHex);
+    try {
+      await invoke("unclaimed_key_discard", { kidHex });
+      setUnclaimedKeys((prev) => prev.filter((k) => k !== kidHex));
+    } catch {
+      // best-effort — the list stays as-is, user can retry
+    } finally {
+      setDiscardingKid(null);
+    }
+  };
+
   // Idle-lock timeout (FR-045) — backend-persisted (a device-wide sidecar
   // file, not this component's own localStorage-backed `settings`/
   // `setSettings`), so it gets its own state and IPC round-trip rather
@@ -218,6 +244,36 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenRecoveryKit }:
                 >
                   <KeyRound size={14} /> Create Recovery Kit
                 </button>
+              </div>
+            )}
+
+            {unclaimedKeys.length > 0 && (
+              <div className="space-y-2 pt-4 border-t border-white/5">
+                <p className="text-[11px] text-zinc-500 leading-relaxed">
+                  {unclaimedKeys.length === 1 ? "A key" : `${unclaimedKeys.length} keys`} recovered from a kit on
+                  this device but never matched to a vault file yet — owns nothing until you import that file, or
+                  discard it if you don't plan to.
+                </p>
+                <div className="space-y-1.5">
+                  {unclaimedKeys.map((kidHex) => (
+                    <div
+                      key={kidHex}
+                      className="flex items-center justify-between gap-2 h-9 px-3 bg-black/30 border border-white/5 rounded-lg"
+                    >
+                      <span className="text-[11px] font-mono text-zinc-400 truncate" title={kidHex}>
+                        {kidHex.slice(0, 16)}…
+                      </span>
+                      <button
+                        onClick={() => discardUnclaimedKey(kidHex)}
+                        disabled={discardingKid === kidHex}
+                        title="Discard this unclaimed key"
+                        className="h-6 px-2 rounded-md text-[11px] font-medium text-rose-300/90 bg-rose-500/5 border border-rose-500/15 hover:bg-rose-500/15 hover:text-rose-200 disabled:opacity-40 flex items-center gap-1 shrink-0"
+                      >
+                        <Trash2 size={11} /> Discard
+                      </button>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </div>

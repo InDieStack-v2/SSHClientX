@@ -129,7 +129,7 @@ password may enter the output (FR-019a1).
 - `form = "file"` → shows a save dialog whose default location is neither cloud-synced nor
   backed up (FR-019f); returns the chosen path.
 
-### `recovery_kit_consume(source, recovery_passphrase, vault_file?, new_vault_password) -> ConsumeOutcome`
+### `recovery_kit_consume(source, recovery_passphrase, vault_file?, new_vault_password, name?) -> { kid, profile? }`
 
 `source` is typed phrase words or a picked kit file — both accepted, interchangeably
 (FR-019d). Establishes an **unclaimed** key in this device's secure store, protected by
@@ -142,18 +142,35 @@ without a passphrase attempt (FR-019e).
 `vault_file` is **required for the phrase form on every platform**, because the phrase carries
 only 32 bytes and the Argon2id salt is derived from the `kid` inside the vault file
 (research.md Decision 10). It is required on Android for the file form too, since general
-import is refused there (FR-041). It is optional only for the file form on desktop, where the
-kit is self-contained and the user may import separately afterwards.
+import is refused there (FR-040) and the single-action restore below is Android's only path
+to an open profile. It is optional only for the file form on desktop, where the kit is
+self-contained and the user may import separately afterwards.
 
 Now written into the spec as FR-019g and FR-019h.
 
+**Single-action restore (FR-041).** When both `vault_file` and `name` are supplied, this
+also lands that file as a brand-new profile named `name` in the same call — verified
+through the identical `verify_and_import` pipeline the general import flow uses (FR-029),
+against the key just recovered. `profile` in the response names the landed profile (equal
+to `name` — never auto-suffixed, so a collision fails the whole call outright rather than
+picking a different name silently); omitted when landing wasn't attempted (`name` not
+supplied — desktop's own call site never passes one, so its established-only behavior is
+unchanged). The key is still established either way even if landing then fails or was
+never attempted — a caller can always retry against it later via the general import flow,
+or discard it via `unclaimed_keys_list`/`unclaimed_key_discard` below.
+
 Errors: `KIT_MALFORMED`, `KIT_WRONG_PASSPHRASE`, `KIT_KID_MISMATCH`, `VAULT_NO_KEYSTORE`,
-`VAULT_KEYSTORE_DENIED`.
+`VAULT_KEYSTORE_DENIED`, plus the full `BOX_*` set when landing was attempted and failed.
 
-### `unclaimed_keys_list() -> Vec<UnclaimedKey>` · `unclaimed_key_discard(kid)`
+### `unclaimed_keys_list() -> Vec<String>` · `unclaimed_key_discard(kid_hex) -> ()`
 
-A consumed kit whose vault file never arrives leaves a key owning nothing. These make it
-visible and disposable rather than invisible clutter (spec Edge Cases).
+A kit consumed but never landed (or landed and then abandoned before a name was picked)
+leaves a key owning nothing — visible and disposable rather than invisible clutter (spec
+Edge Cases), instead of accumulating unnoticed. `unclaimed_keys_list` returns each such
+key's `kid`, hex-encoded (plain strings, not a richer `UnclaimedKey` type — there's nothing
+else about an unclaimed key worth surfacing yet); `unclaimed_key_discard` removes one's
+key-wrap sidecar and keystore device-factor entry for good. Surfaced in Settings → Vault
+Security.
 
 ---
 

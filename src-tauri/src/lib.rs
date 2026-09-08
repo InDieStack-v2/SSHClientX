@@ -1627,14 +1627,22 @@ async fn read_local_file_bytes(path: String) -> Result<Vec<u8>, String> {
 /// T080/T084: consume a recovery kit (either form) and establish its DEK
 /// as an **unclaimed** key on this device — a fresh device factor in the
 /// keystore, and a key-wrap sidecar sealed under `new_vault_password`, a
-/// password chosen for THIS device (FR-021, FR-021a). Does not import any
-/// vault content; that is a separate, later step (US4) once the user
-/// picks a vault file to import against the now-unclaimed key.
+/// password chosen for THIS device (FR-021, FR-021a).
 ///
 /// Exactly one of `phrase` or `kit_file_bytes` must be supplied. The
 /// phrase form additionally requires `vault_file_bytes` (FR-019g) — its
 /// salt is derived from the vault's `kid`, which only the vault file can
 /// supply; the file form is self-contained and needs neither.
+///
+/// When `vault_file_bytes` AND `name` are both supplied, this also lands
+/// that vault file as a brand-new profile named `name` in the same call
+/// (FR-041) — the single restore action Android needs, since its only
+/// path to an open profile is a key established via a recovery kit, and
+/// the general Import flow that would otherwise finish the job is
+/// Android-refused (FR-040). Desktop's own call site never passes `name`,
+/// so it keeps today's two-step behavior (establish here, land via a
+/// separate Import) unchanged. Without a landed profile this returns only
+/// `{ kid }`; `profile` is omitted rather than null-shaped either way.
 #[tauri::command]
 async fn recovery_kit_consume(
     app_handle: tauri::AppHandle,
@@ -1643,12 +1651,13 @@ async fn recovery_kit_consume(
     vault_file_bytes: Option<Vec<u8>>,
     recovery_passphrase: String,
     new_vault_password: String,
+    name: Option<String>,
 ) -> Result<serde_json::Value, String> {
     // T107/FR-067: recovery-kit consumption is one of the four categories
     // diagnostics must cover.
     let result = recovery_kit_consume_inner(
         app_handle.clone(), phrase, kit_file_bytes, vault_file_bytes,
-        recovery_passphrase, new_vault_password,
+        recovery_passphrase, new_vault_password, name,
     ).await;
     vault::record_outcome(&app_handle, result)
 }
@@ -1660,10 +1669,14 @@ async fn recovery_kit_consume_inner(
     vault_file_bytes: Option<Vec<u8>>,
     mut recovery_passphrase: String,
     mut new_vault_password: String,
+    name: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let profiles_dir = profiles_dir(&app_handle)?;
     let passphrase_owned = std::mem::take(&mut recovery_passphrase);
     let password_owned = std::mem::take(&mut new_vault_password);
+    // Kept for the single-action land step below — the key-derivation
+    // closure captures its own copy of `vault_file_bytes` by move.
+    let vault_bytes_for_land = vault_file_bytes.clone();
 
     let (dek, kid) = tokio::task::spawn_blocking(move || -> Result<_, vault::Outcome> {
         let result = match (phrase, kit_file_bytes) {
@@ -1689,7 +1702,54 @@ async fn recovery_kit_consume_inner(
     recovery::establish_unclaimed_key(&profiles_dir, &dek, kid, &password_owned)
         .map_err(|o| o.to_string())?;
 
-    Ok(serde_json::json!({ "kid": hex::encode(kid) }))
+    // FR-041: land immediately when asked to. The key is left unclaimed
+    // either way if this fails or is skipped — a caller that didn't ask to
+    // land yet (desktop) or whose name collided still has the established
+    // key to retry against later.
+    let landed_profile = match (vault_bytes_for_land, name) {
+        (Some(vault_bytes), Some(name)) => {
+            Some(land_recovered_key(&profiles_dir, &vault_bytes, &dek, kid, &name).await?)
+        }
+        _ => None,
+    };
+
+    match landed_profile {
+        Some(profile) => Ok(serde_json::json!({ "kid": hex::encode(kid), "profile": profile })),
+        None => Ok(serde_json::json!({ "kid": hex::encode(kid) })),
+    }
+}
+
+/// FR-041: verifies `vault_bytes` through the same `verify_and_import`
+/// pipeline the general import flow uses (FR-029) against the DEK/`kid`
+/// just recovered from a kit, then claims it as a brand-new profile named
+/// `name` (never auto-suffixed — a hand-picked name that collides fails
+/// outright, same as the desktop `CreateProfile` commit path). The
+/// registry only ever reports this one key as `Unclaimed` or reports
+/// `Unknown` — this call site has no other profile's password in hand to
+/// try, so it cannot itself detect (or land as a `RestoreOver` copy of) a
+/// key some profile on this device already owns; that case still needs
+/// the general Import flow, which correctly resolves it (this session's
+/// `resolve_key_lookup` fix).
+async fn land_recovered_key(
+    dir: &Path,
+    vault_bytes: &[u8],
+    dek: &Zeroizing<[u8; 32]>,
+    kid: [u8; vault::KID_LEN],
+    name: &str,
+) -> Result<String, String> {
+    let key = **dek;
+    let registry = move |file_kid: &[u8; vault::KID_LEN]| -> vault::KeyLookup {
+        if *file_kid == kid { vault::KeyLookup::Unclaimed { key } } else { vault::KeyLookup::Unknown }
+    };
+    let decision = vault::verify_and_import(vault_bytes, &registry, true).map_err(|o| o.to_string())?;
+    match decision.disposition {
+        vault::Disposition::CreateProfile => {
+            claim_unclaimed_key_as_new_profile(dir, kid, name, false, vault_bytes).await
+        }
+        // Unreachable: the registry above only ever answers Unclaimed
+        // (→ always CreateProfile) or Unknown (→ already returned above).
+        _ => Err("[VALIDATION] UNEXPECTED_DISPOSITION".into()),
+    }
 }
 
 /// T085: unclaimed keys waiting for a matching vault file to be imported.
@@ -1888,15 +1948,24 @@ fn find_profile_owning_kid(dir: &Path, kid: &[u8; vault::KID_LEN]) -> Option<Str
 /// holds for `kid` — checked in order:
 /// 1. The currently open profile, if its `kid` matches. Its DEK is
 ///    already unlocked in `state`; no extra password is asked for.
-/// 2. An unclaimed key established by a previously-consumed recovery kit,
-///    if `key_password` (the password chosen when that key was
-///    established) is supplied.
-/// 3. Any OTHER profile on disk whose own key matches `kid` (FR-031,
+/// 2. Any OTHER profile on disk whose own key matches `kid` (FR-031,
 ///    scenario 13) — identified for free via `find_profile_owning_kid`,
 ///    then unwrapped with `key_password` (that profile's own vault
 ///    password) exactly like an ordinary unlock. This is what lets import
 ///    recognize a profile's own exported backup even when that profile
 ///    isn't the one currently open.
+/// 3. An unclaimed key established by a previously-consumed recovery kit,
+///    if `key_password` (the password chosen when that key was
+///    established) is supplied.
+///
+/// An owned match is checked before an unclaimed one deliberately: a kit
+/// can be re-consumed for a key some profile on this device already owns
+/// (re-running the recovery flow, or consuming a kit made from a profile
+/// that's already here), which leaves both a stale `.unclaimed` entry AND
+/// a real owner for the same `kid`. Preferring the owner routes that case
+/// through the friendlier `RestoreOver` landing (auto-suffixed "[IMPORT]"
+/// name) instead of `CreateProfile` (a hand-picked name that fails
+/// outright on any collision).
 fn resolve_key_lookup(
     state: &DbState,
     profiles_dir_path: &Path,
@@ -1930,26 +1999,6 @@ fn resolve_key_lookup(
         }
     }
 
-    let keywrap_path = recovery::unclaimed_dir(profiles_dir_path).join(format!("{}.keywrap", hex::encode(kid)));
-    if keywrap_path.exists() {
-        if let Some(password) = key_password {
-            let device_factor = keystore::load_device_factor(&recovery::unclaimed_keystore_id(&kid))
-                .map_err(|o| o.to_string())?;
-            let keywrap_bytes = fs::read(&keywrap_path).map_err(|e| format!("[FILE] UNCLAIMED_KEYWRAP_READ_FAILED: {}", e))?;
-            let keywrap = vault::KeyWrapFile::parse(&keywrap_bytes).map_err(|o| o.to_string())?;
-            let dek = keywrap.unwrap_dek(&device_factor, password).map_err(|o| o.to_string())?;
-            return Ok(vault::KeyLookup::Unclaimed { key: *dek });
-        }
-        // A matching unclaimed key exists but no password was supplied for
-        // it this call — collapses to Unknown rather than a distinct
-        // outcome. The pick command peeks ahead of this function
-        // specifically to avoid this ever being user-visible (it asks for
-        // the password before calling this at all once it knows one is
-        // needed), so this fallback only matters for a caller that skips
-        // that peek.
-        return Ok(vault::KeyLookup::Unknown);
-    }
-
     if let Some(password) = key_password {
         if let Some(owner) = find_profile_owning_kid(profiles_dir_path, &kid) {
             let owner_path = resolve_profile_path(profiles_dir_path, &owner);
@@ -1975,6 +2024,26 @@ fn resolve_key_lookup(
                 current_content_hash,
             });
         }
+    }
+
+    let keywrap_path = recovery::unclaimed_dir(profiles_dir_path).join(format!("{}.keywrap", hex::encode(kid)));
+    if keywrap_path.exists() {
+        if let Some(password) = key_password {
+            let device_factor = keystore::load_device_factor(&recovery::unclaimed_keystore_id(&kid))
+                .map_err(|o| o.to_string())?;
+            let keywrap_bytes = fs::read(&keywrap_path).map_err(|e| format!("[FILE] UNCLAIMED_KEYWRAP_READ_FAILED: {}", e))?;
+            let keywrap = vault::KeyWrapFile::parse(&keywrap_bytes).map_err(|o| o.to_string())?;
+            let dek = keywrap.unwrap_dek(&device_factor, password).map_err(|o| o.to_string())?;
+            return Ok(vault::KeyLookup::Unclaimed { key: *dek });
+        }
+        // A matching unclaimed key exists but no password was supplied for
+        // it this call — collapses to Unknown rather than a distinct
+        // outcome. The pick command peeks ahead of this function
+        // specifically to avoid this ever being user-visible (it asks for
+        // the password before calling this at all once it knows one is
+        // needed), so this fallback only matters for a caller that skips
+        // that peek.
+        return Ok(vault::KeyLookup::Unknown);
     }
 
     Ok(vault::KeyLookup::Unknown)
@@ -2050,6 +2119,22 @@ async fn import_vault_pick(
 
         let staged_bytes = fs::read(&staged_path).map_err(|e| format!("[FILE] STAGED_READ_FAILED: {}", e))?;
 
+        // A pre-migration (`OMNV`) file picked here would otherwise just
+        // fail `SealedVaultFile::parse` below as generic "not a vault
+        // file" (`BOX_BAD_MAGIC`) — technically true but unhelpful, since
+        // it IS a real vault, just not one this pipeline (sealed-container
+        // only, T033+) understands. Name it and point at the actual fix:
+        // migrate it by unlocking on its own device, or place the file
+        // directly in this device's profiles folder if it belongs here.
+        if vault::is_legacy_blob(&staged_bytes) {
+            staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?.remove(&staging_id);
+            let _ = fs::remove_file(&staged_path);
+            return Err("[FILE] LEGACY_VAULT_NOT_IMPORTABLE: This is a pre-migration vault file, not a sealed one \
+                — Import doesn't accept it directly. Unlock it on its original device to migrate it first, or, if \
+                it belongs on this device, place the file in this device's profiles folder instead of importing it."
+                .into());
+        }
+
         // FR-031: before spending a password attempt, check whether this
         // file's kid names a SPECIFIC key this device already holds (an
         // unclaimed recovery-kit key, or another profile's own key) so the
@@ -2067,11 +2152,14 @@ async fn import_vault_pick(
                     matches!((kid_guard.as_ref(), dek_guard.as_ref()), (Some(k), Some(_)) if *k == sealed.kid)
                 };
                 if !is_active_match {
-                    let target = if recovery::unclaimed_dir(&dir).join(format!("{}.keywrap", hex::encode(sealed.kid))).exists() {
-                        Some("a recovered key not yet claimed by any profile".to_string())
-                    } else {
-                        find_profile_owning_kid(&dir, &sealed.kid)
-                    };
+                    // Owned checked before unclaimed — mirrors
+                    // `resolve_key_lookup`'s own order below, so the
+                    // "whose password" this asks for is the one that call
+                    // will actually try.
+                    let target = find_profile_owning_kid(&dir, &sealed.kid).or_else(|| {
+                        recovery::unclaimed_dir(&dir).join(format!("{}.keywrap", hex::encode(sealed.kid))).exists()
+                            .then(|| "a recovered key not yet claimed by any profile".to_string())
+                    });
                     if let Some(target) = target {
                         return Ok(Some(serde_json::json!({
                             "staging_id": staging_id,
@@ -2204,59 +2292,10 @@ async fn import_vault_commit(
         let landed_name = match &decision.disposition {
             vault::Disposition::CreateProfile => {
                 let base = name.ok_or("[VALIDATION] CREATE_PROFILE_REQUIRES_A_NAME")?;
-                let landed = create_new_profile_file(&dir, &base, false, &staged_bytes)?;
-                // T085: this key is no longer unclaimed — move its keywrap
-                // sidecar and device-factor keystore entry off the kid-keyed
-                // "unclaimed" identifiers and onto the new profile's own
-                // name, since that's what an ordinary unlock
-                // (`setup_master_db`) reads by. Leaving them under the
-                // unclaimed id — or, worse, deleting the keywrap outright —
-                // would make this profile permanently unopenable by
-                // password the moment this command returns.
-                let landed_path = resolve_profile_path(&dir, &landed);
-                let unclaimed_sidecar = recovery::unclaimed_dir(&dir)
-                    .join(format!("{}.keywrap", hex::encode(decision.sealed.kid)));
-                fs::rename(&unclaimed_sidecar, vault::keywrap_path(&landed_path))
-                    .map_err(|e| format!("[FILE] CLAIM_KEYWRAP_MOVE_FAILED: {}", e))?;
-                let unclaimed_id = recovery::unclaimed_keystore_id(&decision.sealed.kid);
-                let landed_for_ks = landed.clone();
-                tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    let factor = keystore::load_device_factor(&unclaimed_id).map_err(|o| o.to_string())?;
-                    keystore::store_device_factor(&landed_for_ks, &factor).map_err(|o| o.to_string())?;
-                    let _ = keystore::delete_device_factor(&unclaimed_id);
-                    Ok(())
-                })
-                    .await
-                    .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))??;
-                landed
+                claim_unclaimed_key_as_new_profile(&dir, decision.sealed.kid, &base, false, &staged_bytes).await?
             }
             vault::Disposition::RestoreOver { profile } => {
-                let owner_path = resolve_profile_path(&dir, profile);
-                let landed = create_new_profile_file(&dir, &format!("{} [IMPORT]", profile), true, &staged_bytes)?;
-                // The copy shares the owning profile's key — give it its
-                // own keywrap sidecar and device-factor keystore entry
-                // (COPIED from the owner, not moved: the owner keeps using
-                // its own) so it can be unlocked independently through the
-                // ordinary password path. Skipping this is what made an
-                // earlier version of this landing permanently unopenable
-                // (VAULT_UNKNOWN_KID on first sign-in) — same failure mode
-                // `CreateProfile`'s arm above guards against by claiming an
-                // unclaimed key's material for the profile that adopts it.
-                let landed_path = resolve_profile_path(&dir, &landed);
-                let owner_keywrap = fs::read(vault::keywrap_path(&owner_path))
-                    .map_err(|e| format!("[FILE] OWNER_KEYWRAP_READ_FAILED: {}", e))?;
-                fs::write(vault::keywrap_path(&landed_path), &owner_keywrap)
-                    .map_err(|e| format!("[FILE] IMPORT_KEYWRAP_WRITE_FAILED: {}", e))?;
-                let owner_id = profile.clone();
-                let landed_for_ks = landed.clone();
-                tokio::task::spawn_blocking(move || -> Result<(), String> {
-                    let factor = keystore::load_device_factor(&owner_id).map_err(|o| o.to_string())?;
-                    keystore::store_device_factor(&landed_for_ks, &factor).map_err(|o| o.to_string())?;
-                    Ok(())
-                })
-                    .await
-                    .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))??;
-                landed
+                land_as_restore_over_copy(&dir, profile, &staged_bytes).await?
             }
             vault::Disposition::NoOp { profile } => profile.clone(),
         };
@@ -2267,12 +2306,100 @@ async fn import_vault_commit(
     }
 }
 
+/// Claims a just-verified unclaimed key (per `verify_and_import`'s
+/// `KeyLookup::Unclaimed`/`Disposition::CreateProfile`) for a brand-new
+/// profile: writes `staged_bytes` as `base_name` (or the first free
+/// auto-suffixed variant, if `auto_suffix`), then moves — not copies —
+/// `kid`'s `.unclaimed` keywrap sidecar and device-factor keystore entry
+/// onto the new profile's own name, since that's what an ordinary unlock
+/// (`setup_master_db`) reads by. Leaving them under the unclaimed id — or,
+/// worse, deleting the keywrap outright — would make the profile
+/// permanently unopenable by password the moment this returns. Shared by
+/// the desktop staged-import commit and the recovery kit's single-action
+/// restore (FR-032, FR-041).
+async fn claim_unclaimed_key_as_new_profile(
+    dir: &Path,
+    kid: [u8; vault::KID_LEN],
+    base_name: &str,
+    auto_suffix: bool,
+    staged_bytes: &[u8],
+) -> Result<String, String> {
+    let landed = create_new_profile_file(dir, base_name, auto_suffix, staged_bytes)?;
+    let landed_path = resolve_profile_path(dir, &landed);
+    let unclaimed_sidecar = recovery::unclaimed_dir(dir).join(format!("{}.keywrap", hex::encode(kid)));
+    fs::rename(&unclaimed_sidecar, vault::keywrap_path(&landed_path))
+        .map_err(|e| format!("[FILE] CLAIM_KEYWRAP_MOVE_FAILED: {}", e))?;
+    let unclaimed_id = recovery::unclaimed_keystore_id(&kid);
+    let landed_for_ks = landed.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let factor = keystore::load_device_factor(&unclaimed_id).map_err(|o| o.to_string())?;
+        keystore::store_device_factor(&landed_for_ks, &factor).map_err(|o| o.to_string())?;
+        let _ = keystore::delete_device_factor(&unclaimed_id);
+        Ok(())
+    })
+        .await
+        .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))??;
+    Ok(landed)
+}
+
+/// Lands an import whose key is already owned by `owner` as a new,
+/// separately-named copy ("`owner` [IMPORT]", auto-suffixed on a further
+/// collision) — `owner`'s own file is never touched (FR-032a). The copy
+/// gets its own keywrap sidecar and device-factor keystore entry, COPIED
+/// from `owner`'s own (not moved: `owner` keeps using its own), so it
+/// unlocks independently through the ordinary password path — skipping
+/// this is what made an earlier version of this landing permanently
+/// unopenable (`VAULT_UNKNOWN_KID` on first sign-in), the same failure
+/// mode `claim_unclaimed_key_as_new_profile` guards against for a
+/// genuinely new key.
+///
+/// `owner`'s name is truncated before the suffix is appended so a
+/// near-the-cap owner name doesn't push the generated candidate past the
+/// 32-char profile-name limit — this disposition has no name field of its
+/// own for the user to work around a "too long" refusal.
+async fn land_as_restore_over_copy(dir: &Path, owner: &str, staged_bytes: &[u8]) -> Result<String, String> {
+    let owner_path = resolve_profile_path(dir, owner);
+    // Worst case, `create_new_profile_file`'s own retry loop appends
+    // " 200" on top of " [IMPORT]" (13 chars total) before giving up.
+    let truncated_owner = truncate_profile_name(owner, 32 - " [IMPORT] 200".len());
+    let landed = create_new_profile_file(dir, &format!("{} [IMPORT]", truncated_owner), true, staged_bytes)?;
+    let landed_path = resolve_profile_path(dir, &landed);
+    let owner_keywrap = fs::read(vault::keywrap_path(&owner_path))
+        .map_err(|e| format!("[FILE] OWNER_KEYWRAP_READ_FAILED: {}", e))?;
+    fs::write(vault::keywrap_path(&landed_path), &owner_keywrap)
+        .map_err(|e| format!("[FILE] IMPORT_KEYWRAP_WRITE_FAILED: {}", e))?;
+    let owner_id = owner.to_string();
+    let landed_for_ks = landed.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let factor = keystore::load_device_factor(&owner_id).map_err(|o| o.to_string())?;
+        keystore::store_device_factor(&landed_for_ks, &factor).map_err(|o| o.to_string())?;
+        Ok(())
+    })
+        .await
+        .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))??;
+    Ok(landed)
+}
+
 /// Write `staged_bytes` as a brand-new profile file named `base_name` — or,
 /// when `auto_suffix` is set, the first name starting from `base_name` that
 /// doesn't already exist ("X 2", "X 3", …). Used both for a genuinely new
 /// key (fails outright on a collision — that name was hand-picked by the
 /// user) and for a key that already belongs to a profile on this device,
 /// which always lands as a new copy rather than overwriting that profile.
+/// Trims `name` to at most `max_chars` Unicode scalars (matching
+/// `validate_profile_name`'s own `.chars().count()` limit), dropping any
+/// trailing whitespace the cut leaves behind. A no-op when `name` already
+/// fits. Used to leave headroom for a suffix (" [IMPORT]", " 2", …) that
+/// would otherwise push an already-long name past the 32-char cap with no
+/// way for the user to intervene — `create_new_profile_file` has no name
+/// field of its own for that case.
+fn truncate_profile_name(name: &str, max_chars: usize) -> String {
+    if name.chars().count() <= max_chars {
+        return name.to_string();
+    }
+    name.chars().take(max_chars).collect::<String>().trim_end().to_string()
+}
+
 fn create_new_profile_file(
     dir: &Path,
     base_name: &str,
@@ -8249,6 +8376,41 @@ fn app_temp_root() -> &'static std::path::PathBuf {
     })
 }
 
+/// Best-effort cleanup of a PRIOR run's `app_temp_root()` — import staging
+/// (FR-035), SFTP live-edit, and drag staging are only ever removed on a
+/// clean commit/discard/session-end; nothing runs on an ungraceful exit
+/// (crash, force-quit), so those leftovers otherwise sit under the OS temp
+/// dir forever (each launch gets a freshly random root, so a dead run's
+/// root is never reused and never swept by that run itself). Only removes
+/// roots old enough (24h) that no legitimately still-running instance
+/// would plausibly still own one — an actively-open second instance keeps
+/// touching files under its own root, so a live one should never look this
+/// stale; this is a heuristic, not a lock, so it stays conservative.
+fn sweep_stale_temp_roots() {
+    let base = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&base) else { return };
+    let current = app_temp_root();
+    const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == *current {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if !name.starts_with("sshclientx-") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else { continue };
+        if std::time::SystemTime::now().duration_since(modified).unwrap_or_default() >= STALE_AFTER {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
 /// Per-session live-edit staging dir, under the unpredictable root.
 fn session_sftp_dir(session_id: &str) -> std::path::PathBuf {
     app_temp_root().join(format!("sftp_{}", session_id))
@@ -9990,6 +10152,11 @@ pub fn run() {
             use tauri::Manager as _;
             let app_handle = app.handle().clone();
 
+            // Off the startup path — a directory listing plus a handful of
+            // `remove_dir_all`s is cheap, but no reason to make launch wait
+            // on it.
+            tauri::async_runtime::spawn_blocking(sweep_stale_temp_roots);
+
             // T053: macOS screen-lock/sleep observers must be registered on
             // the main thread — both notification centers deliver on the
             // runloop of whichever thread registered.
@@ -10306,6 +10473,32 @@ mod tests {
         dir
     }
 
+    /// Never destructive on the parts that matter: this process's own
+    /// current root, anything not matching the naming scheme, and
+    /// anything recently touched (a live second instance) must all
+    /// survive a sweep. The old-enough-to-remove branch is exercised by
+    /// code inspection rather than a real backdated mtime — faking one
+    /// portably (without `File::open` on a directory, which fails outright
+    /// on Windows) needs a dependency this is too small to add.
+    #[test]
+    fn sweep_stale_temp_roots_only_ever_touches_its_own_naming_scheme_and_never_current_or_fresh() {
+        let current = app_temp_root().clone();
+        let base = std::env::temp_dir();
+        let fresh = base.join(format!("sshclientx-testfresh-{}", std::process::id()));
+        let unrelated = base.join(format!("not-sshclientx-{}", std::process::id()));
+        fs::create_dir_all(&fresh).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+
+        sweep_stale_temp_roots();
+
+        assert!(current.exists(), "this process's own current root must never be swept");
+        assert!(fresh.exists(), "a directory touched moments ago must never be swept");
+        assert!(unrelated.exists(), "a directory outside the sshclientx- naming scheme must never be touched");
+
+        let _ = fs::remove_dir_all(&fresh);
+        let _ = fs::remove_dir_all(&unrelated);
+    }
+
     /// FR-031/Scenario 13: an incoming file must be matched against every
     /// profile's key, not just the one currently open — `find_profile_owning_kid`
     /// is what makes that possible without decrypting anything (`kid` lives
@@ -10330,6 +10523,123 @@ mod tests {
         assert_eq!(find_profile_owning_kid(&dir, &bob_kid), Some("bob".to_string()));
         assert_eq!(find_profile_owning_kid(&dir, &[0xffu8; vault::KID_LEN]), None);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A kit re-consumed for a key some profile on this device already
+    /// owns leaves both a real owner AND a stale `.unclaimed` entry for
+    /// the same `kid`. `resolve_key_lookup` must resolve to the owner
+    /// (routing the eventual import through the friendlier auto-suffixed
+    /// `RestoreOver` landing), never to the unclaimed entry (which would
+    /// force a hand-picked name that fails outright on any collision).
+    #[test]
+    fn resolve_key_lookup_prefers_an_owning_profile_over_a_stale_unclaimed_entry() {
+        let dir = test_scratch_dir("resolve-prefer-owner");
+        let dek = [4u8; 32];
+        let kid = vault::derive_kid(&dek);
+        let password = "owner-password-1234";
+        let owner_name = format!("resolve-owner-test-{}", std::process::id());
+
+        let device_factor = vault::generate_device_factor();
+        if keystore::store_device_factor(&owner_name, &device_factor).is_err() {
+            let _ = fs::remove_dir_all(&dir);
+            return; // no real secret store on this box (CI) — same skip other keystore tests use
+        }
+
+        let mut salt = [0u8; vault::KEYWRAP_SALT_LEN];
+        rand::thread_rng().fill(&mut salt[..]);
+        let keywrap = vault::KeyWrapFile::create(&device_factor, password, salt, &dek).unwrap();
+        let owner_path = resolve_profile_path(&dir, &owner_name);
+        fs::write(vault::keywrap_path(&owner_path), keywrap.to_bytes()).unwrap();
+        let seal_key = vault::SealKey { alg: vault::SealAlg::XChaCha20Poly1305, key: &dek };
+        let sealed = vault::SealedVaultFile::seal(&seal_key, kid, 1, [0u8; vault::SENDER_ID_LEN], "test", b"payload").unwrap();
+        fs::write(&owner_path, sealed.to_bytes()).unwrap();
+
+        // A stale unclaimed entry for the SAME kid, as if the kit that
+        // originally sealed this profile's key was re-consumed.
+        recovery::establish_unclaimed_key(&dir, &dek, kid, "unclaimed-password-1234").unwrap();
+
+        let state = DbState {
+            conn: std::sync::Arc::new(StdMutex::new(None)),
+            dek: StdMutex::new(None),
+            kid: StdMutex::new(None),
+            generation: StdMutex::new(None),
+            sender_id: StdMutex::new(None),
+            db_path: StdMutex::new(None),
+            active_profile: StdMutex::new(None),
+            hlc: StdMutex::new(None),
+            writer_claim: StdMutex::new(None),
+            lock_state: StdMutex::new(lock::LockState::Unlocked),
+            platform_auth_failures: StdMutex::new(0),
+        };
+
+        match resolve_key_lookup(&state, &dir, kid, Some(password)).expect("resolve") {
+            vault::KeyLookup::Owned { profile, .. } => assert_eq!(profile, owner_name),
+            vault::KeyLookup::Unclaimed { .. } => panic!("must prefer the owning profile over a stale unclaimed entry"),
+            vault::KeyLookup::Unknown => panic!("the owner should have resolved"),
+        }
+
+        let _ = keystore::delete_device_factor(&owner_name);
+        let _ = keystore::delete_device_factor(&recovery::unclaimed_keystore_id(&kid));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// FR-041: the Android single-action restore — establish, then land
+    /// under a hand-picked name in the same call, with no separate Import
+    /// step. Verifies the profile file lands, and that the unclaimed
+    /// keywrap sidecar is MOVED (not copied) onto the new profile's own
+    /// path, since that's what makes it independently unlockable by name
+    /// afterward rather than permanently stuck under the unclaimed id.
+    #[tokio::test]
+    async fn land_recovered_key_claims_a_brand_new_profile_from_the_just_established_key() {
+        let dir = test_scratch_dir("land-recovered-key");
+        let dek = Zeroizing::new([6u8; 32]);
+        let kid = vault::derive_kid(&dek);
+        let seal_key = vault::SealKey { alg: vault::SealAlg::XChaCha20Poly1305, key: &dek };
+        let sealed = vault::SealedVaultFile::seal(&seal_key, kid, 1, [0u8; vault::SENDER_ID_LEN], "test", b"payload").unwrap();
+        let vault_bytes = sealed.to_bytes();
+
+        if recovery::establish_unclaimed_key(&dir, &dek, kid, "device-password-1234").is_err() {
+            let _ = fs::remove_dir_all(&dir);
+            return; // no real secret store on this box (CI) — same skip other keystore tests use
+        }
+
+        let name = format!("land-recovered-test-{}", std::process::id());
+        let landed = land_recovered_key(&dir, &vault_bytes, &dek, kid, &name).await.expect("land");
+        assert_eq!(landed, name);
+        let landed_path = resolve_profile_path(&dir, &name);
+        assert!(landed_path.exists(), "the vault file must be written under the new name");
+        assert!(vault::keywrap_path(&landed_path).exists(), "the new profile must get its own keywrap");
+        assert!(
+            !recovery::unclaimed_dir(&dir).join(format!("{}.keywrap", hex::encode(kid))).exists(),
+            "the unclaimed sidecar must be moved away, not left behind"
+        );
+
+        let _ = keystore::delete_device_factor(&name);
+        let _ = keystore::delete_device_factor(&recovery::unclaimed_keystore_id(&kid));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A profile name near the 32-char cap used to make its own
+    /// "[IMPORT]" copy unimportable (`land_as_restore_over_copy` builds
+    /// "<owner> [IMPORT]", which `create_new_profile_file` then refuses
+    /// outright as "too long" — with no name field on that disposition for
+    /// the user to shorten it). `truncate_profile_name` must leave enough
+    /// headroom that the resulting candidate always fits.
+    #[test]
+    fn truncate_profile_name_keeps_the_import_suffix_within_the_length_cap() {
+        let short = "Backup";
+        assert_eq!(truncate_profile_name(short, 19), short, "a name that already fits must be untouched");
+
+        let long = "Production SSH Bastion Access"; // 29 chars — overflows once " [IMPORT]" is appended
+        let truncated = truncate_profile_name(long, 32 - " [IMPORT] 200".len());
+        assert!(truncated.chars().count() <= 19);
+        assert!(!truncated.ends_with(' '), "a mid-word cut must not leave trailing whitespace");
+
+        let dir = test_scratch_dir("truncate-import-suffix");
+        let landed = create_new_profile_file(&dir, &format!("{} [IMPORT]", truncated), true, b"payload")
+            .expect("a truncated base name must fit within the 32-char cap");
+        assert!(landed.chars().count() <= 32);
         let _ = fs::remove_dir_all(&dir);
     }
 

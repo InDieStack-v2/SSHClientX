@@ -369,9 +369,12 @@ vault unchanged in the two failure cases.
   in the secure store owning nothing. The app MUST show that a recovered key is waiting
   for its vault file, and MUST let the user discard it, so it does not accumulate
   invisibly.
-- **A vault file arrives for a key the device holds twice over** — impossible by
-  construction, since a key is either unclaimed or owned by exactly one profile. If it is
-  ever observed, it is a damaged-state outcome, not a conflict.
+- **Multiple profiles on this device share one key** — the normal outcome of FR-032a, not
+  an error: a key already owned by a profile lands every further import of it as another
+  new, separately-named copy, never as a conflict. A kit re-consumed for a key some
+  profile here already owns is the one path that can also leave a stale `.unclaimed`
+  entry alongside a real owner for the same `kid`; `resolve_key_lookup` prefers the
+  owner, so it still resolves normally rather than needing to be treated as "twice over."
 - **Revision counter at its maximum**, or a file claiming an implausibly high revision:
   refused as damaged rather than accepted as newest.
 - **Export while another save is in flight**: the exported file is one complete

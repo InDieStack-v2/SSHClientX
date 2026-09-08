@@ -12,8 +12,14 @@ interface Props {
   onClose: () => void;
   /** Consume succeeded (T087) — offer to run the normal import flow on the same
    *  file. Passes along the vault file's bytes when already picked here, so
-   *  the caller can skip asking for it a second time. */
+   *  the caller can skip asking for it a second time. Desktop only — the
+   *  general import flow is Android-refused (FR-040); Android's own path to
+   *  a landed profile is `onProfileLanded` below. */
   onImportNow?: (vaultBytes?: Uint8Array) => void;
+  /** FR-041: consume landed the vault file as a new profile in the same
+   *  call (Android's single-action restore, since it has no general import
+   *  flow to fall back on) — names it so the caller can reload/select it. */
+  onProfileLanded?: (name: string) => void;
 }
 
 const inputBase =
@@ -25,7 +31,7 @@ const inputBase =
 // unlocked app (see DesktopApp's post-migration offer). "consume" needs no
 // open profile — it establishes a fresh, unclaimed key — and is reachable
 // from the picker too.
-const RecoveryKitPanel = ({ isOpen, mode, onClose, onImportNow }: Props) => {
+const RecoveryKitPanel = ({ isOpen, mode, onClose, onImportNow, onProfileLanded }: Props) => {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -46,6 +52,13 @@ const RecoveryKitPanel = ({ isOpen, mode, onClose, onImportNow }: Props) => {
   const [consumePassphrase, setConsumePassphrase] = useState("");
   const [newVaultPassword, setNewVaultPassword] = useState("");
   const [consumed, setConsumed] = useState(false);
+  // FR-041 (Android only — see the field below): name to land the vault
+  // file under in the same call. Never auto-suffixed on a collision — a
+  // hand-picked name that's taken fails outright, same as the desktop
+  // "create profile" disposition — so this stays exactly what the user
+  // typed once consume succeeds.
+  const [profileName, setProfileName] = useState("");
+  const [landedProfile, setLandedProfile] = useState<string | null>(null);
 
   // T113: Android has no native file dialog (`rfd` has no Android
   // backend), so file selection there opens the in-app browser instead —
@@ -61,6 +74,7 @@ const RecoveryKitPanel = ({ isOpen, mode, onClose, onImportNow }: Props) => {
     setKitFileBytes(null); setKitFileName(null);
     setVaultFileBytes(null); setVaultFileName(null);
     setConsumePassphrase(""); setNewVaultPassword(""); setConsumed(false);
+    setProfileName(""); setLandedProfile(null);
     setBrowserTarget(null);
   }, [isOpen, mode]);
 
@@ -118,23 +132,43 @@ const RecoveryKitPanel = ({ isOpen, mode, onClose, onImportNow }: Props) => {
     }
   };
 
+  // FR-041: Android has no general Import flow to fall back on (FR-040), so
+  // its only path to an open profile is landing the vault file in this same
+  // call — needs a name up front, unlike desktop's two-step "establish,
+  // then Import" (where the name comes later, on the Import popup).
+  const needsNameNow = IS_ANDROID && !!vaultFileBytes;
+  // The vault file is required for the phrase form everywhere (FR-019g —
+  // its salt comes from the file's kid) AND, on Android specifically, for
+  // the file form too — Android has no way to land it later, so skipping
+  // it here would just strand the key exactly like the "come back with
+  // the vault file" dead end this session's fix is meant to avoid.
+  const vaultFileRequired = consumeSource === "phrase" || IS_ANDROID;
+
   const submitConsume = async () => {
     if (consumeSource === "phrase" && !typedWords.trim()) { setError("Type the recovery phrase."); return; }
     if (consumeSource === "file" && !kitFileBytes) { setError("Pick the recovery kit file."); return; }
-    // FR-019g: the phrase form needs the vault file on every platform — its
-    // Argon2id salt comes from the kid inside it.
-    if (consumeSource === "phrase" && !vaultFileBytes) { setError("Pick the vault file too — the phrase alone isn't enough."); return; }
+    if (vaultFileRequired && !vaultFileBytes) {
+      setError(
+        IS_ANDROID
+          ? "Pick the matching vault file too — Android needs it to create the profile in this same step."
+          : "Pick the vault file too — the phrase alone isn't enough.",
+      );
+      return;
+    }
     if (!consumePassphrase) { setError("Enter the recovery passphrase."); return; }
     if (!newVaultPassword || newVaultPassword.length < 8) { setError("Set a vault password for this device (at least 8 characters)."); return; }
+    if (needsNameNow && !profileName.trim()) { setError("Pick a name for the profile."); return; }
     setBusy(true); setError(null);
     try {
-      await invoke("recovery_kit_consume", {
+      const result = await invoke<{ kid: string; profile?: string }>("recovery_kit_consume", {
         phrase: consumeSource === "phrase" ? typedWords.trim() : undefined,
         kitFileBytes: consumeSource === "file" ? Array.from(kitFileBytes!) : undefined,
         vaultFileBytes: vaultFileBytes ? Array.from(vaultFileBytes) : undefined,
         recoveryPassphrase: consumePassphrase,
         newVaultPassword,
+        name: needsNameNow ? profileName.trim() : undefined,
       });
+      setLandedProfile(result.profile ?? null);
       setConsumed(true);
     } catch (e) {
       setError(describeVaultError(e).message);
@@ -220,27 +254,49 @@ const RecoveryKitPanel = ({ isOpen, mode, onClose, onImportNow }: Props) => {
               </>
             )
           ) : consumed ? (
-            <div className="space-y-3">
-              <div className="px-3 py-2 bg-emerald-500/10 border border-emerald-500/25 rounded-lg text-emerald-100 text-[12px] flex items-center gap-2">
-                <CheckCircle2 size={13} className="shrink-0" /> Key established on this device.
-              </div>
-              <p className="text-[12px] text-zinc-400 leading-relaxed">
-                {vaultFileBytes
-                  ? "The key alone doesn't create a profile — import that vault file to finish."
-                  : "Now use Import and pick that same vault file to finish — the key alone doesn't create a profile."}
-              </p>
-              <div className="flex gap-2">
+            landedProfile ? (
+              // FR-041: Android's single-action restore already landed it.
+              <div className="space-y-3">
+                <div className="px-3 py-2 bg-emerald-500/10 border border-emerald-500/25 rounded-lg text-emerald-100 text-[12px] flex items-center gap-2">
+                  <CheckCircle2 size={13} className="shrink-0" /> Profile "{landedProfile}" is ready.
+                </div>
+                <p className="text-[12px] text-zinc-400 leading-relaxed">
+                  Sign in to it with the vault password you just set to open it.
+                </p>
                 <button
-                  onClick={() => onImportNow?.(vaultFileBytes ?? undefined)}
-                  className="flex-1 h-10 rounded-lg text-[13px] font-semibold bg-primary text-black"
+                  onClick={() => { onProfileLanded?.(landedProfile); onClose(); }}
+                  className="w-full h-10 rounded-lg text-[13px] font-semibold bg-primary text-black"
                 >
-                  Import now
-                </button>
-                <button onClick={onClose} className="h-10 px-4 rounded-lg text-[13px] font-semibold text-zinc-300 bg-white/5 border border-white/10">
-                  Later
+                  Done
                 </button>
               </div>
-            </div>
+            ) : (
+              // Desktop only: `vaultFileRequired` means Android's own path
+              // through here always has a landed profile by now (a landing
+              // failure keeps `consumed` false — the error banner shows
+              // instead — so this branch never fires there).
+              <div className="space-y-3">
+                <div className="px-3 py-2 bg-emerald-500/10 border border-emerald-500/25 rounded-lg text-emerald-100 text-[12px] flex items-center gap-2">
+                  <CheckCircle2 size={13} className="shrink-0" /> Key established on this device.
+                </div>
+                <p className="text-[12px] text-zinc-400 leading-relaxed">
+                  {vaultFileBytes
+                    ? "The key alone doesn't create a profile — import that vault file to finish."
+                    : "Now use Import and pick that same vault file to finish — the key alone doesn't create a profile."}
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => onImportNow?.(vaultFileBytes ?? undefined)}
+                    className="flex-1 h-10 rounded-lg text-[13px] font-semibold bg-primary text-black"
+                  >
+                    Import now
+                  </button>
+                  <button onClick={onClose} className="h-10 px-4 rounded-lg text-[13px] font-semibold text-zinc-300 bg-white/5 border border-white/10">
+                    Later
+                  </button>
+                </div>
+              </div>
+            )
           ) : (
             <>
               <div className="flex gap-2">
@@ -269,12 +325,27 @@ const RecoveryKitPanel = ({ isOpen, mode, onClose, onImportNow }: Props) => {
 
               {/* FR-019g: required for the phrase form always; optional for
                   the file form (the kit is self-contained then). */}
-              <Field label={consumeSource === "phrase" ? "Vault file (required)" : "Vault file (optional — or import separately)"}>
+              <Field label={vaultFileRequired ? "Vault file (required)" : "Vault file (optional — or import separately)"}>
                 <PickButton
                   fileName={vaultFileName}
                   onPick={() => pickFile("vault", "Select the vault file", ["sshclientx", "submarine"])}
                 />
               </Field>
+
+              {/* FR-041: Android has no general Import flow, so it needs
+                  the profile's name now, to land the vault file as a new
+                  profile in this same call. Desktop keeps naming it later,
+                  on the Import popup, so this never shows there. */}
+              {needsNameNow && (
+                <Field label="Profile name">
+                  <input
+                    value={profileName}
+                    onChange={(e) => setProfileName(e.target.value)}
+                    placeholder="What to call it on this device"
+                    className={inputBase}
+                  />
+                </Field>
+              )}
 
               <Field label="Recovery passphrase">
                 <PasswordField value={consumePassphrase} onChange={setConsumePassphrase} placeholder="The passphrase this kit was sealed under" className={inputBase} />

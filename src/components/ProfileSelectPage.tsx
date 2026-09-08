@@ -859,6 +859,11 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
         mode="consume"
         onClose={() => setRecoveryOpen(false)}
         onImportNow={(vaultBytes) => { setRecoveryOpen(false); startImport(vaultBytes); }}
+        onProfileLanded={async (name) => {
+          setInfo(`Profile "${name}" is ready — sign in below.`);
+          await reload();
+          setSelected(name);
+        }}
       />
     </div>
   );
