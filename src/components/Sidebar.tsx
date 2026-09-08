@@ -1,4 +1,4 @@
-import { Server, KeyRound, Library, Activity, Settings, LogOut } from "lucide-react";
+import { Server, KeyRound, Library, Activity, Settings, LogOut, Download } from "lucide-react";
 
 // Vertical rail on desktop, horizontal bottom dock on mobile. Layout swap is
 // driven by `isMobile` so the terminal/session views can use the full screen
@@ -6,7 +6,7 @@ import { Server, KeyRound, Library, Activity, Settings, LogOut } from "lucide-re
 // a 360px-wide viewport. The parent in DesktopApp uses `flex-col-reverse` on
 // mobile so this component visually lands at the bottom while staying first
 // in DOM order (keyboard tab-order stays intuitive).
-export const Sidebar = ({ activeTab, setActiveTab, isMobile, onLogout }: any) => {
+export const Sidebar = ({ activeTab, setActiveTab, isMobile, onLogout, onExport }: any) => {
   // Commands + Notes used to be separate rails. Both are per-profile lists
   // of small text blobs stored under the vault; the only real distinction
   // was "runnable snippet vs freeform prose". A single Library rail with
@@ -108,6 +108,15 @@ export const Sidebar = ({ activeTab, setActiveTab, isMobile, onLogout }: any) =>
           last-most icon — matches the muscle memory from when it was the
           only bottom action. */}
       <div className="mt-auto w-full px-2 flex flex-col gap-2">
+        {onExport && (
+          <button
+            onClick={onExport}
+            className="p-2.5 rounded-xl transition-all flex items-center justify-center text-zinc-500 hover:text-zinc-200 hover:bg-white/5"
+            title="Export profile"
+          >
+            <Download size={20} />
+          </button>
+        )}
         {onLogout && (
           <button
             onClick={onLogout}

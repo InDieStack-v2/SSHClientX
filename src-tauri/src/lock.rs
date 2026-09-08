@@ -22,6 +22,38 @@
 //! `SshState`/`MonitorMap`/`MirrorMap` at all.
 
 use serde::Serialize;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Counts native dialogs (rfd file/folder pickers) currently open. The OS
+/// reports one of our own dialogs stealing focus from the main webview as
+/// an ordinary `WindowEvent::Focused(false)` — indistinguishable, at that
+/// event, from the user actually switching to another app — so every
+/// `rfd::FileDialog`/`AsyncFileDialog` call site holds a `DialogGuard` for
+/// its duration, and the focus handler treats a focus loss while one is
+/// open as still-ours rather than a real backgrounding.
+static OPEN_DIALOGS: AtomicUsize = AtomicUsize::new(0);
+
+pub struct DialogGuard(());
+
+impl DialogGuard {
+    pub fn open() -> Self {
+        OPEN_DIALOGS.fetch_add(1, Ordering::SeqCst);
+        DialogGuard(())
+    }
+}
+
+impl Drop for DialogGuard {
+    fn drop(&mut self) {
+        OPEN_DIALOGS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// True while a `DialogGuard` is held somewhere — the one case a
+/// `WindowEvent::Focused(false)` must be ignored rather than fed to
+/// `perform_lock` as a real `FocusLost`.
+pub fn native_dialog_open() -> bool {
+    OPEN_DIALOGS.load(Ordering::SeqCst) > 0
+}
 
 // ---------------------------------------------------------------------------
 // State machine (T050, T061)

@@ -1440,6 +1440,42 @@ async fn confirm_identity_by_password(state: &DbState, password: String) -> Resu
     Ok(())
 }
 
+/// Identity confirmation for a profile that may not be the currently open
+/// one (e.g. exporting a still-locked profile from the pick screen). Unlike
+/// `confirm_identity_by_password`, this doesn't compare against a cached
+/// DEK in `state` — it re-derives the DEK straight from that profile's own
+/// on-disk key-wrap, and `unwrap_dek`'s AEAD tag is itself the proof: it
+/// only succeeds for the correct password, so success alone confirms
+/// identity. The DEK is discarded immediately; nothing here touches session
+/// state.
+async fn verify_profile_password(
+    app_handle: &tauri::AppHandle,
+    name: &str,
+    password: String,
+) -> Result<(), String> {
+    let path = profile_path(app_handle, name)?;
+    let keywrap_bytes = fs::read(vault::keywrap_path(&path))
+        .map_err(|e| format!("[FILE] KEYWRAP_READ_FAILED: {}", e))?;
+    let keywrap = vault::KeyWrapFile::parse(&keywrap_bytes).map_err(|o| o.to_string())?;
+
+    let profile_for_ks = name.to_string();
+    let device_factor = tokio::task::spawn_blocking(move || keystore::load_device_factor(&profile_for_ks))
+        .await
+        .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))?
+        .map_err(|o| o.to_string())?;
+
+    let mut password_owned = password;
+    tokio::task::spawn_blocking(move || {
+        let res = keywrap.unwrap_dek(&device_factor, &password_owned);
+        password_owned.zeroize();
+        res
+    })
+        .await
+        .map_err(|e| format!("[CRYPTO] KDF_JOIN: {}", e))?
+        .map_err(|o| o.to_string())?;
+    Ok(())
+}
+
 /// T068: the shared FR-055 identity-confirmation helper, satisfiable by
 /// platform authentication OR the vault password — never an in-app dialog
 /// of our own design, since either of these is already an OS- or
@@ -1514,6 +1550,7 @@ async fn recovery_kit_save_file(bytes: Vec<u8>) -> Result<Option<String>, String
     }
     #[cfg(not(target_os = "android"))]
     {
+        let _dialog_guard = lock::DialogGuard::open();
         let chosen = rfd::FileDialog::new()
             .set_title("Save recovery kit")
             .set_file_name("recovery.sshclientx-kit")
@@ -1545,6 +1582,7 @@ async fn pick_and_read_file(title: String, extensions: Vec<String>) -> Result<Op
     #[cfg(not(target_os = "android"))]
     {
         let ext_refs: Vec<&str> = extensions.iter().map(|s| s.as_str()).collect();
+        let _dialog_guard = lock::DialogGuard::open();
         let picked = rfd::FileDialog::new()
             .set_title(&title)
             .add_filter("file", &ext_refs)
@@ -1682,17 +1720,12 @@ async fn export_profile(
     #[cfg(not(target_os = "android"))]
     {
         // T091 (FR-023): identity confirmation before export, even though
-        // the exported bytes are already encrypted. Reuses the same
-        // password re-entry check kit creation uses (FR-055) — this only
-        // works for the CURRENTLY OPEN profile, which the confirmation
-        // helper verifies against; exporting a *different*, not-currently-open
-        // profile has no live DEK to compare against, so it is refused
-        // rather than silently skipping confirmation.
-        let active = state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE")?.clone();
-        if active.as_deref() != Some(name.as_str()) {
-            return Err("[VALIDATION] EXPORT_REQUIRES_THE_OPEN_PROFILE: select and unlock this profile first.".into());
-        }
-        confirm_identity_by_password(&state, password).await?;
+        // the exported bytes are already encrypted. Export is offered from
+        // the (locked) profile pick screen, so it verifies the password
+        // against this profile's own key-wrap rather than requiring it to
+        // already be the open session's profile.
+        let _ = &state;
+        verify_profile_password(&app_handle, &name, password).await?;
 
         // T092: export the file exactly as sealed on disk — read once,
         // never unlocked, never re-encrypted. T095: reading the FINAL path
@@ -1718,6 +1751,7 @@ async fn export_profile(
         // rfd's blocking dialog must not run on the main thread on macOS — we're
         // already off the UI thread in a tauri async command so a direct call is
         // fine. spawn_blocking would be needed if this was wrapped differently.
+        let _dialog_guard = lock::DialogGuard::open();
         let chosen = rfd::FileDialog::new()
             .set_title("Export profile")
             .set_file_name(&default_name)
@@ -1882,6 +1916,7 @@ async fn import_vault_pick(
     }
     #[cfg(not(target_os = "android"))]
     {
+        let _dialog_guard = lock::DialogGuard::open();
         let picked = rfd::FileDialog::new()
             .set_title("Import vault")
             .add_filter("SSHClientX vault", &[VAULT_EXT, VAULT_EXT_LEGACY])
@@ -2870,6 +2905,7 @@ async fn pick_ssh_key_file() -> Result<Option<(String, Option<String>, String)>,
     }
     #[cfg(not(target_os = "android"))]
     {
+        let _dialog_guard = lock::DialogGuard::open();
         let picked = rfd::FileDialog::new()
             .set_title("Select SSH private key")
             .pick_file();
@@ -6008,6 +6044,7 @@ async fn pick_local_directory() -> Result<Option<String>, String> {
     }
     #[cfg(not(target_os = "android"))]
     {
+        let _dialog_guard = lock::DialogGuard::open();
         let path = rfd::AsyncFileDialog::new().pick_folder().await;
         Ok(path.map(|p| p.path().to_string_lossy().into_owned()))
     }
@@ -9143,6 +9180,7 @@ async fn select_local_folder() -> Result<Option<String>, String> {
     }
     #[cfg(not(target_os = "android"))]
     {
+        let _dialog_guard = lock::DialogGuard::open();
         let folder = rfd::FileDialog::new()
             .set_title("Choose Local Directory")
             .pick_folder();
@@ -9771,6 +9809,12 @@ pub fn run() {
         // those are wired up per-platform in `setup` below instead).
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Focused(false) = event {
+                // One of our own native file/folder dialogs stealing focus
+                // reports identically to the user switching away — ignore
+                // it rather than locking mid-export/import/pick.
+                if lock::native_dialog_open() {
+                    return;
+                }
                 let app_handle = window.app_handle().clone();
                 tauri::async_runtime::spawn(async move {
                     use tauri::Manager as _;

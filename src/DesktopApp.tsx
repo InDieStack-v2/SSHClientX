@@ -26,6 +26,8 @@ import SettingsPanel from "./components/SettingsPanel";
 import { SessionView } from "./components/SessionView";
 import MonitoringPanel from "./components/MonitoringPanel";
 import { ErrorBoundary } from "./ui/ErrorBoundary";
+import { describeVaultError } from "./util/vaultErrors";
+import { IS_ANDROID } from "./util/platform";
 
 const appWindow = getCurrentWindow();
 
@@ -540,6 +542,28 @@ function DesktopApp() {
     setActiveView("nodes");
     setServers([]); setCredentials([]); setSshKeys([]); setFolders([]); setCommands([]);
     addLog("Profile locked.", "info");
+  };
+
+  // Export the active profile's encrypted file. Reuses the same
+  // `export_profile` command ProfileSelectPage's locked-row Export uses —
+  // it verifies the password against the named profile's own key-wrap, so
+  // it works the same whether the profile is locked or (as here) already open.
+  const handleExportProfile = async () => {
+    if (!activeProfile) return;
+    const pwd = await textPrompt({
+      title: "Confirm your identity",
+      message: `Enter the password for "${activeProfile}" to export it.`,
+      password: true,
+      okLabel: "Export",
+      validate: (v) => (v ? null : "Password required."),
+    });
+    if (pwd === null) return;
+    try {
+      const saved = await invoke<string | null>("export_profile", { name: activeProfile, password: pwd });
+      if (saved) addLog(`Exported to ${saved}`, "success");
+    } catch (e) {
+      addLog(describeVaultError(e).message, "error");
+    }
   };
 
   const openServer = (server: any) => {
@@ -1401,7 +1425,7 @@ function DesktopApp() {
         // tab-order stays intuitive and <main> grabs the full screen width
         // (terminal gains the ~50px the vertical rail used to eat).
         <div className={`flex-1 flex ${isMobile ? 'flex-col-reverse' : ''} overflow-hidden pt-10`}>
-          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} />
+          <Sidebar activeTab={activeView.startsWith('session-') ? 'nodes' : activeView} setActiveTab={setActiveView} isMobile={isMobile} onLogout={handleLogout} onExport={IS_ANDROID ? undefined : handleExportProfile} />
 
           <main className="flex-1 flex flex-col min-w-0 min-h-0 bg-transparent relative">
             {activeView === "nodes" && (
