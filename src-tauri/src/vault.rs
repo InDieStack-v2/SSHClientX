@@ -142,7 +142,9 @@ impl Outcome {
             Outcome::VaultKdf => "Could not derive the vault key from the password.",
             Outcome::VaultBusy => "This profile is already open in another running copy of the app.",
             Outcome::KitMalformed => "This isn't a valid recovery phrase or recovery file.",
-            Outcome::KitWrongPassphrase => "Wrong recovery passphrase for this kit.",
+            Outcome::KitWrongPassphrase => {
+                "Wrong recovery passphrase for this kit — or, for a typed phrase, this isn't the vault file it was created for."
+            }
             Outcome::KitKidMismatch => "This recovery kit does not match the supplied vault file.",
         }
     }

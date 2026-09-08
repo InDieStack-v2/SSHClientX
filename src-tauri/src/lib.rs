@@ -1699,6 +1699,22 @@ async fn recovery_kit_consume_inner(
         .map_err(|e| format!("[CRYPTO] KIT_JOIN: {}", e))?
         .map_err(|o| o.to_string())?;
 
+    // A file-form kit is self-contained — its `kid` never gets cross-
+    // checked against a vault file supplied alongside it (unlike phrase
+    // form, where the vault file's `kid` IS the derivation's own salt
+    // input, so a mismatch there already failed inside `consume_phrase_
+    // kit` above, as `KIT_WRONG_PASSPHRASE`). Catch it now, with its own
+    // dedicated message, rather than silently establishing a key for a
+    // DIFFERENT vault than the one on screen — or letting it surface
+    // later as a confusing "sealed with another device's key, use a
+    // recovery kit" (`BOX_UNKNOWN_KEY`) from whatever tries to land it,
+    // when the user just came FROM the recovery-kit flow.
+    if let Some(vault_bytes) = &vault_bytes_for_land {
+        if !kit_matches_vault_file(kid, vault_bytes) {
+            return Err(vault::Outcome::KitKidMismatch.to_string());
+        }
+    }
+
     recovery::establish_unclaimed_key(&profiles_dir, &dek, kid, &password_owned)
         .map_err(|o| o.to_string())?;
 
@@ -1716,6 +1732,21 @@ async fn recovery_kit_consume_inner(
     match landed_profile {
         Some(profile) => Ok(serde_json::json!({ "kid": hex::encode(kid), "profile": profile })),
         None => Ok(serde_json::json!({ "kid": hex::encode(kid) })),
+    }
+}
+
+/// True when `vault_bytes`' own sealed header names `kid` — i.e. a
+/// file-form kit (whose `kid` is self-contained, embedded in the kit
+/// itself) actually belongs to the vault file supplied alongside it. A
+/// vault file that fails to parse here is deliberately NOT treated as a
+/// mismatch (returns `true`, letting the caller proceed) — a malformed or
+/// legacy file gets a more specific, correct diagnosis from the real
+/// verification pipeline (`verify_and_import`) a step later, rather than
+/// being misreported as "wrong kit" by this cheap header-only peek.
+fn kit_matches_vault_file(kid: [u8; vault::KID_LEN], vault_bytes: &[u8]) -> bool {
+    match vault::SealedVaultFile::parse(vault_bytes) {
+        Ok(sealed) => sealed.kid == kid,
+        Err(_) => true,
     }
 }
 
@@ -1741,7 +1772,21 @@ async fn land_recovered_key(
     let registry = move |file_kid: &[u8; vault::KID_LEN]| -> vault::KeyLookup {
         if *file_kid == kid { vault::KeyLookup::Unclaimed { key } } else { vault::KeyLookup::Unknown }
     };
-    let decision = vault::verify_and_import(vault_bytes, &registry, true).map_err(|o| o.to_string())?;
+    let decision = vault::verify_and_import(vault_bytes, &registry, true).map_err(|o| {
+        // `BOX_UNKNOWN_KEY`'s own message ("sealed with another device's
+        // key — use a recovery kit") is written for the general import
+        // flow; reused verbatim here it reads as circular — the caller is
+        // already IN the recovery flow, mid-claim of a specific key. Same
+        // code (so anything branching on it still works), clearer text.
+        if matches!(o, vault::Outcome::BoxUnknownKey) {
+            format!(
+                "[{}] This vault file doesn't match the key you're claiming — pick the one it was exported from.",
+                o.code()
+            )
+        } else {
+            o.to_string()
+        }
+    })?;
     match decision.disposition {
         vault::Disposition::CreateProfile => {
             claim_unclaimed_key_as_new_profile(dir, kid, name, false, vault_bytes).await
@@ -10659,6 +10704,58 @@ mod tests {
 
         let _ = keystore::delete_device_factor(&name);
         let _ = keystore::delete_device_factor(&recovery::unclaimed_keystore_id(&kid));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file-form kit's `kid` is self-contained — never derived from any
+    /// vault file — so a mismatched pairing must be caught by comparing
+    /// headers directly, not by hoping the wrong-passphrase check happens
+    /// to catch it (it can't: nothing about `consume_file_kit` ever reads
+    /// the vault file at all).
+    #[test]
+    fn kit_matches_vault_file_compares_headers_and_is_permissive_on_a_bad_header() {
+        let dek_a = [1u8; 32];
+        let kid_a = vault::derive_kid(&dek_a);
+        let seal_key_a = vault::SealKey { alg: vault::SealAlg::XChaCha20Poly1305, key: &dek_a };
+        let sealed_a = vault::SealedVaultFile::seal(&seal_key_a, kid_a, 1, [0u8; vault::SENDER_ID_LEN], "test", b"payload").unwrap();
+
+        let dek_b = [2u8; 32];
+        let kid_b = vault::derive_kid(&dek_b);
+        let seal_key_b = vault::SealKey { alg: vault::SealAlg::XChaCha20Poly1305, key: &dek_b };
+        let sealed_b = vault::SealedVaultFile::seal(&seal_key_b, kid_b, 1, [0u8; vault::SENDER_ID_LEN], "test", b"payload").unwrap();
+
+        assert!(kit_matches_vault_file(kid_a, &sealed_a.to_bytes()), "a kit's own vault file must match");
+        assert!(!kit_matches_vault_file(kid_a, &sealed_b.to_bytes()), "a DIFFERENT vault's file must not match");
+        assert!(
+            kit_matches_vault_file(kid_a, b"not a vault file at all"),
+            "an unparseable file must not be misreported as a kid mismatch — verify_and_import gives the real diagnosis later"
+        );
+    }
+
+    /// `BOX_UNKNOWN_KEY`'s stock message ("use a recovery kit") reads as
+    /// circular from inside the recovery/claim flow itself — the caller is
+    /// already there. `land_recovered_key` must remap the text (keeping
+    /// the same code, so anything still branching on it works) rather than
+    /// passing the stock message through unchanged.
+    #[tokio::test]
+    async fn land_recovered_key_rewrites_the_circular_unknown_key_message() {
+        let dir = test_scratch_dir("land-wrong-kit");
+        let dek = Zeroizing::new([3u8; 32]);
+        let kid = vault::derive_kid(&dek);
+
+        // A genuine vault file, but sealed for a DIFFERENT key than the
+        // one just "recovered" — exactly a wrong-kit-for-this-vault pick.
+        let other_dek = [9u8; 32];
+        let other_kid = vault::derive_kid(&other_dek);
+        let seal_key = vault::SealKey { alg: vault::SealAlg::XChaCha20Poly1305, key: &other_dek };
+        let sealed = vault::SealedVaultFile::seal(&seal_key, other_kid, 1, [0u8; vault::SENDER_ID_LEN], "test", b"payload").unwrap();
+
+        let err = land_recovered_key(&dir, &sealed.to_bytes(), &dek, kid, "whatever")
+            .await
+            .expect_err("a vault file for a different key must be refused");
+        assert!(err.starts_with("[BOX_UNKNOWN_KEY]"), "the code must stay recognizable: {err}");
+        assert!(!err.contains("recovery kit"), "must not tell the user to do what they're already doing: {err}");
+
         let _ = fs::remove_dir_all(&dir);
     }
 
