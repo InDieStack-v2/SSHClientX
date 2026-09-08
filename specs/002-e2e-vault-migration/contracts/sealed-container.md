@@ -93,7 +93,7 @@ data an earlier check rejected.
 | 5 | `kid` matches **some** key the device holds, owned or unclaimed (FR-031) | `BOX_UNKNOWN_KEY` |
 | 6 | Caller is authorised — identity confirmation per FR-055 | `BOX_AUTH` |
 | 7 | AEAD open with the AAD of §1.1 | `BOX_CORRUPT` |
-| 8 | Revision policy per §4 | `BOX_OLDER` / `BOX_CONFLICT` |
+| 8 | Revision policy per §4 | never fails — informational only (§4) |
 
 Step 5 before step 7 is deliberate: a file for a key this device does not hold is never
 decrypted (FR-031). Step 4 before step 7 means a truncated or tampered file is reported as
@@ -107,7 +107,7 @@ On success the caller receives the opened payload plus the decided disposition:
 | Disposition | When |
 | --- | --- |
 | `CreateProfile` | `kid` matched an **unclaimed** key (FR-032) |
-| `RestoreOver(profile)` | `kid` matched a key owned by `profile` (FR-032a) |
+| `RestoreOver(profile)` | `kid` matched a key owned by `profile` (FR-032a) — despite the name, the commit step for this disposition never restores over `profile`; it lands as a new, separately-named copy sharing `profile`'s key (FR-032a, FR-032b) |
 | `NoOp` | same revision, identical content — importing the same file twice |
 
 `CreateProfile` is never offered for a `kid` an existing profile owns; the caller is told
@@ -117,14 +117,18 @@ which profile owns it instead.
 
 ## 4. Revision policy
 
-Comparing incoming `generation` against the target profile's current revision:
+Comparing incoming `generation` against the owning profile's current revision — for
+`RestoreOver` only, since `CreateProfile`/`NoOp` have no revision to compare against:
 
-| Condition | Outcome |
-| --- | --- |
-| incoming > local | proceed |
-| incoming == local, identical content hash | `NoOp` |
-| incoming == local, different content | `BOX_CONFLICT` — never overwrite without a separate explicit choice |
-| incoming < local | `BOX_OLDER` — proceed only on explicit confirmation, preserving the newer state as a recoverable revision |
+| Condition | `ConfirmationNeeded` | Effect on commit |
+| --- | --- | --- |
+| incoming > local | `None` | lands as a new copy (FR-032a) |
+| incoming == local, identical content hash | n/a — disposition is `NoOp`, not `RestoreOver` | nothing imported |
+| incoming == local, different content | `Conflict` | lands as a new copy anyway — informational only, since nothing is overwritten (FR-033 dropped) |
+| incoming < local | `Older` | lands as a new copy anyway — informational only, same reason |
+
+`ConfirmationNeeded` is still computed and returned to the caller at staging time (it may be
+useful for a future UI to show as an FYI), but `import_vault_commit` never refuses on it.
 
 Separately, at **open** time (not import), the profile's own file is compared against the
 high-water mark held in the secure store:
@@ -134,9 +138,9 @@ high-water mark held in the secure store:
 | file revision >= high-water | normal open |
 | file revision < high-water | `VAULT_ROLLBACK` (FR-064) |
 
-`VAULT_ROLLBACK` is distinct from `BOX_OLDER`: the former means the file underneath the app
-went backwards without an import, the latter means the user is importing an older file
-deliberately.
+`VAULT_ROLLBACK` is unrelated to import's revision policy above: it means the file underneath
+the app went backwards through some means other than this app's own import (a manual file
+restore, a sync conflict), and is the only revision-comparison outcome that still blocks.
 
 ---
 
@@ -153,9 +157,12 @@ a generic error (FR-036).
 | `BOX_UNSUPPORTED` | Format version this release does not understand |
 | `BOX_CORRUPT` | Damaged or tampered with |
 | `BOX_UNKNOWN_KEY` | Sealed for a key this device does not hold — points at the recovery kit |
-| `BOX_OLDER` | Older than the vault on this device |
-| `BOX_CONFLICT` | Same revision, different content |
+| `BOX_OLDER`¹ | Older than the vault on this device |
+| `BOX_CONFLICT`¹ | Same revision, different content |
 | `BOX_AUTH` | Identity confirmation cancelled |
+
+¹ Distinct outcome codes still defined for this reason, but no longer returned as an error
+by any command per §4 (FR-033 dropped) — import lands as a new copy instead of failing.
 
 ### 5.2 Vault outcomes
 

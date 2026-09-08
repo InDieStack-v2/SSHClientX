@@ -325,8 +325,8 @@ with the password alone on any machine and would nullify the feature.
 | An incoming file is matched against **every** key the device holds, not one profile's key | FR-031 |
 | A file matching no held key is never decrypted | FR-031 |
 | A file matching an unclaimed key may create a new Profile that then owns that key | FR-032 |
-| A file matching an owned key offers only restore-over, naming the owning Profile | FR-032a |
-| Lower incoming revision ⇒ explicit confirmation required | FR-033 |
-| Equal revision, different content ⇒ conflict, no overwrite without a separate choice | FR-033 |
-| Accepted writes are atomic; the replaced revision stays recoverable | FR-034 |
+| A file matching an owned key never overwrites it — always lands as a new Profile sharing that key, naming the owning Profile | FR-032a |
+| That new Profile gets its own key-wrap sidecar and device-factor entry (copied, not shared), so it unlocks independently with the owning Profile's password | FR-032b |
+| Revision/content differences vs. the owning Profile (older, conflicting) require no confirmation — nothing is ever overwritten | FR-032a |
+| Accepted writes are atomic | FR-034 |
 | Every distinct verification failure is its own outcome, never collapsed | FR-036 |

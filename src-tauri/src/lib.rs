@@ -2146,11 +2146,11 @@ async fn import_vault_pick(
     }
 }
 
-/// T099/T100 (FR-033, FR-034): perform the write staging decided. `name`
-/// is required for `create_profile`. Returns the profile name the import
-/// actually landed on — auto-suffixed when a matched key's own profile
-/// already has that name (see `create_new_profile_file`), so the caller
-/// can select the right row without having to guess it in advance.
+/// T099/T100 (FR-032a, FR-032b, FR-034): perform the write staging decided.
+/// `name` is required for `create_profile`. Returns the profile name the
+/// import actually landed on — auto-suffixed when a matched key's own
+/// profile already has that name (see `create_new_profile_file`), so the
+/// caller can select the right row without having to guess it in advance.
 #[tauri::command]
 async fn import_vault_commit(
     app_handle: tauri::AppHandle,
@@ -2159,12 +2159,10 @@ async fn import_vault_commit(
     staging_id: String,
     name: Option<String>,
     key_password: Option<String>,
-    confirm_older: Option<bool>,
-    resolve_conflict: Option<bool>,
 ) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (app_handle, state, staging, staging_id, name, key_password, confirm_older, resolve_conflict);
+        let _ = (app_handle, state, staging, staging_id, name, key_password);
         return Err("Vault import is not available on Android.".into());
     }
     #[cfg(not(target_os = "android"))]
@@ -2195,27 +2193,14 @@ async fn import_vault_commit(
                 o.to_string()
             })?;
 
-        // contracts/tauri-command-contract.md §2 (FR-033): a commit without
-        // the matching confirmation must refuse with the same code again,
-        // never proceed. `import_vault_pick` already reported this via
-        // `confirmation_needed`; re-derived here too rather than trusted
-        // from that earlier call, same reasoning as re-deriving `decision`
-        // itself just above.
-        match decision.confirmation_needed {
-            vault::ConfirmationNeeded::None => {}
-            vault::ConfirmationNeeded::Older if confirm_older == Some(true) => {}
-            vault::ConfirmationNeeded::Older => return Err(vault::Outcome::BoxOlder.to_string()),
-            vault::ConfirmationNeeded::Conflict if resolve_conflict == Some(true) => {}
-            vault::ConfirmationNeeded::Conflict => return Err(vault::Outcome::BoxConflict.to_string()),
-        }
-
-        // FR-032a/FR-032b: a key already owned by a profile on this device
-        // is restored directly over that profile's own file — never landed
-        // as a separately-named copy. A copy would have no keywrap sidecar
-        // or device-factor keystore entry of its own (both stay keyed to
-        // the ORIGINAL profile name), making it permanently unopenable
-        // through the ordinary password unlock path. Only a genuinely
-        // new/unclaimed key gets to pick its own name via `name`.
+        // Per product direction (spec.md Clarifications): a key already
+        // owned by a profile on this device is NEVER overwritten by an
+        // import — it always lands as a new, separately-named copy
+        // (auto-suffixed "[IMPORT]" on a name collision), so re-importing
+        // a backup can never clobber newer local changes. `decision`'s
+        // older/conflict revision policy (`ConfirmationNeeded`) is purely
+        // informational here as a result — nothing at risk of being lost,
+        // so nothing to gate the commit on.
         let landed_name = match &decision.disposition {
             vault::Disposition::CreateProfile => {
                 let base = name.ok_or("[VALIDATION] CREATE_PROFILE_REQUIRES_A_NAME")?;
@@ -2247,25 +2232,31 @@ async fn import_vault_commit(
             }
             vault::Disposition::RestoreOver { profile } => {
                 let owner_path = resolve_profile_path(&dir, profile);
-                // FR-058/FR-061: same single-writer guard as any other
-                // direct vault write (rollback_resolve's "restore_newer" is
-                // the same shape) — refuse if another running instance
-                // holds this profile open rather than racing its writes.
-                // `import_vault_commit` only ever runs from the (still
-                // locked) profile picker, so `profile` is never this
-                // process's own active profile — no self-conflict case to
-                // special-case here.
-                let _claim = vault::WriterClaim::acquire(&owner_path).map_err(|o| match o {
-                    vault::Outcome::VaultBusy => format!("[VAULT] VAULT_BUSY: '{}' is already open in another running copy of SSHClientX.", profile),
-                    other => other.to_string(),
-                })?;
-                // FR-034: preserve the replaced revision as recoverable
-                // before the atomic overwrite.
-                vault::rotate_into_history(&owner_path)?;
-                let tmp_path = owner_path.with_extension("sshclientx.tmp");
-                fs::write(&tmp_path, &staged_bytes).map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED: {}", e))?;
-                fs::rename(&tmp_path, &owner_path).map_err(|e| format!("[FILE] IMPORT_RENAME_FAILED: {}", e))?;
-                profile.clone()
+                let landed = create_new_profile_file(&dir, &format!("{} [IMPORT]", profile), true, &staged_bytes)?;
+                // The copy shares the owning profile's key — give it its
+                // own keywrap sidecar and device-factor keystore entry
+                // (COPIED from the owner, not moved: the owner keeps using
+                // its own) so it can be unlocked independently through the
+                // ordinary password path. Skipping this is what made an
+                // earlier version of this landing permanently unopenable
+                // (VAULT_UNKNOWN_KID on first sign-in) — same failure mode
+                // `CreateProfile`'s arm above guards against by claiming an
+                // unclaimed key's material for the profile that adopts it.
+                let landed_path = resolve_profile_path(&dir, &landed);
+                let owner_keywrap = fs::read(vault::keywrap_path(&owner_path))
+                    .map_err(|e| format!("[FILE] OWNER_KEYWRAP_READ_FAILED: {}", e))?;
+                fs::write(vault::keywrap_path(&landed_path), &owner_keywrap)
+                    .map_err(|e| format!("[FILE] IMPORT_KEYWRAP_WRITE_FAILED: {}", e))?;
+                let owner_id = profile.clone();
+                let landed_for_ks = landed.clone();
+                tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    let factor = keystore::load_device_factor(&owner_id).map_err(|o| o.to_string())?;
+                    keystore::store_device_factor(&landed_for_ks, &factor).map_err(|o| o.to_string())?;
+                    Ok(())
+                })
+                    .await
+                    .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))??;
+                landed
             }
             vault::Disposition::NoOp { profile } => profile.clone(),
         };

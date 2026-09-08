@@ -165,42 +165,56 @@ command pair, `import_vault_pick` then `import_vault_commit`
       current profile's key.
       - No match → refused (`BOX_UNKNOWN_KEY`).
       - Matches an **unclaimed** key → `Disposition::CreateProfile`.
-      - Matches an **owned** profile's key → `Disposition::RestoreOver`,
-        plus a revision comparison against that profile's current content:
-        - incoming newer → proceed, no extra confirmation.
+      - Matches an **owned** profile's key → `Disposition::RestoreOver`
+        (despite the name, this never restores over anything at commit —
+        see 3.2), plus a revision comparison against that profile's
+        current content, kept purely as informational metadata:
+        - incoming newer → `ConfirmationNeeded::None`.
         - incoming **older** → `ConfirmationNeeded::Older`.
         - same revision, different content → `ConfirmationNeeded::Conflict`.
-        - same revision, same content → `Disposition::NoOp`.
+        - same revision, same content → `Disposition::NoOp` instead.
    3. AEAD open with the matched key.
 
-The disposition and any confirmation needed are returned to the UI so it
-can ask "create a new profile named ___?" / "this is an older backup —
-restore anyway?" / "conflicting content — overwrite?" before anything is
-written.
+The disposition (and, for now, the informational confirmation-needed flag)
+are returned to the UI so it can ask "create a new profile named ___?" or
+tell the user which existing profile a match belongs to before anything is
+written. Per product direction, an owned-key match is never destructive
+enough to need a "restore anyway?" / "overwrite?" prompt — see 3.2.
 
 ### 3.2 Commit: write
 
 Re-runs `verify_and_import` from scratch on the same staged bytes — never
 trusts the pick step's cached decision, so a stale or replayed commit
-re-derives and re-refuses identically. `Older`/`Conflict` without the
-matching confirmation flag is refused again here, logged as a diagnostic.
+re-derives identically.
 
 - **`CreateProfile`**: takes a claim on the destination path *before*
   checking it doesn't already exist (closes a race between two concurrent
   imports of the same new name), writes atomically (tmp file + rename),
-  then deletes the `.unclaimed/<kid>.keywrap` bookkeeping — the keystore
-  device-factor entry itself stays, since the new profile's future unlocks
-  read from it. This is what turns an unclaimed key into a real profile.
-- **`RestoreOver`**: proves exclusive access (existing in-memory claim if
-  it's the currently-open profile, otherwise acquire-and-drop a fresh one),
-  rotates the existing file into revision history, then writes atomically.
+  then **moves** (not deletes) the `.unclaimed/<kid>.keywrap` sidecar to
+  the new profile's own keywrap path and re-keys its keystore
+  device-factor entry from `unclaimed:<kid>` to the new profile's name —
+  this is what turns an unclaimed key into a real, independently-openable
+  profile. (An earlier version of this deleted the sidecar outright and
+  left the device-factor entry under the unclaimed id, which made the new
+  profile permanently unopenable — `VAULT_UNKNOWN_KID` on first sign-in.)
+- **`RestoreOver`**: never writes to the owning profile's own file. Lands
+  the staged bytes as a new profile instead — `create_new_profile_file`
+  with `"<owner> [IMPORT]"` as the base name, auto-suffixed on a further
+  collision — then **copies** (not moves: the owner keeps using its own)
+  the owning profile's keywrap sidecar and device-factor entry onto the
+  new copy, so it unlocks independently with the owner's own vault
+  password. `ConfirmationNeeded::Older`/`Conflict` from the pick step is
+  never checked here — nothing is at risk of being overwritten, so there
+  is nothing to gate the write on.
 - **`NoOp`**: nothing written.
 
 **Net effect:** an unclaimed key can only ever become a *new* profile
-(never silently merge into an existing one), and an existing profile's key
-can only ever be *restored over* (never spawn a duplicate profile for a key
-already owned) — `verify_and_import`'s `kid`-first lookup is what enforces
-both directions.
+(never silently merge into an existing one), and a key already owned by a
+profile can only ever land as *another* new profile sharing that key
+(never overwrite the one that already owns it) — `verify_and_import`'s
+`kid`-first lookup identifies the match either way, and the commit step's
+own choice of write (claim-and-move vs. land-and-copy) is what makes both
+outcomes independently openable afterward.
 
 ---
 

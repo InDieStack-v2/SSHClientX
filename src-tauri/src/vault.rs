@@ -1191,8 +1191,10 @@ pub enum Disposition {
     /// `kid` matched an unclaimed key — offer to create a new profile that
     /// owns it (FR-032).
     CreateProfile,
-    /// `kid` matched a key an existing profile owns — offer only to
-    /// restore over that profile, naming it (FR-032a).
+    /// `kid` matched a key an existing profile owns. Despite the name,
+    /// the commit step for this never overwrites `profile` — it lands the
+    /// import as a new, separately-named copy sharing that key (FR-032a),
+    /// naming `profile` purely so the caller can explain the relation.
     RestoreOver { profile: String },
     /// Same revision, identical content — a no-op re-import, not a
     /// conflict (spec Edge Cases: "same file imported twice"). Carries the
@@ -1200,22 +1202,22 @@ pub enum Disposition {
     NoOp { profile: String },
 }
 
-/// Which confirmation, if any, a caller must obtain before committing this
-/// import (FR-033). Kept distinct rather than one boolean because the two
-/// cases require *different* explicit choices from the user
-/// (`confirm_older` vs `resolve_conflict` in the command contract) — a
-/// single flag would lose that distinction exactly where it matters.
+/// How the incoming file's revision compares to the profile that already
+/// owns its `kid`, for a `RestoreOver` disposition. Informational only:
+/// import never overwrites that profile (FR-032a) — it always lands as a
+/// new, separately-named copy regardless of this value — so nothing in the
+/// commit path branches on it (FR-033, which used to require explicit
+/// confirmation before an overwrite, is dropped along with the overwrite
+/// itself). Kept distinct per case, rather than collapsed to one boolean,
+/// since a future caller may still want to say *which* kind of divergence
+/// this copy represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmationNeeded {
-    /// Nothing further needed — safe to commit as-is.
+    /// Incoming revision is newer, or this isn't a `RestoreOver` at all.
     None,
-    /// Incoming revision is lower than local. Committing without explicit
-    /// confirmation must be refused (`BOX_OLDER`), and the newer local
-    /// state must be preserved as a recoverable revision, not clobbered.
+    /// Incoming revision is lower than the owning profile's.
     Older,
-    /// Same revision, different content. Committing without a separate
-    /// explicit choice must be refused (`BOX_CONFLICT`) — never overwrite
-    /// silently.
+    /// Same revision as the owning profile's, but different content.
     Conflict,
 }
 

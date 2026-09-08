@@ -85,19 +85,30 @@ signature survives verification, disposition, and conflict handling.
 Opens the picker, copies the bytes into the app sandbox, and runs
 `verify_and_import` (FR-029, FR-030) up to but not including the write.
 
-`StagedImport`: `{ staging_id, disposition, incoming_revision, local_revision?, sender_name, created_at }`
+`StagedImport`: `{ staging_id, disposition, profile?, confirmation_needed, incoming_revision, sender_name, created_at }`
 
-`disposition`: `CreateProfile` | `RestoreOver { profile }` | `NoOp`.
+`disposition`: `create_profile` | `restore_over` | `no_op` | `needs_password`. `profile` names
+the matched profile for `restore_over`/`needs_password`/`no_op`; null for `create_profile`.
 
 Errors: the full `BOX_*` set. `BOX_UNKNOWN_KEY` carries a pointer to the recovery-kit flow.
 
-### `import_vault_commit(staging_id, name?, confirm_older?, resolve_conflict?) -> ()`
+### `import_vault_commit(staging_id, name?, key_password?) -> String`
 
-Performs the write decided at staging. `name` only for `CreateProfile`. `confirm_older` is
-required for `BOX_OLDER` and `resolve_conflict` for `BOX_CONFLICT` — a commit without the
-matching confirmation returns the same code again rather than proceeding (FR-033).
+Performs the write decided at staging, returning the profile name the import actually
+landed on. `name` only for `CreateProfile` (the caller's chosen name; auto-suffixed on a
+collision is never silent — a hand-picked name that collides is refused outright).
+`key_password` is the password for whichever key `import_vault_pick` matched, when one
+was needed (FR-032a's key material read comes from that profile's own keywrap).
 
-Write is atomic and preserves the replaced revision (FR-034).
+`RestoreOver { profile }` never overwrites `profile`'s own file — it always lands as a
+new, separately-named copy ("`profile` [IMPORT]", auto-suffixed on a further collision)
+that gets its own key-wrap sidecar and device-factor entry, copied from `profile`'s own,
+so it is independently unlockable with `profile`'s vault password from the moment this
+returns (FR-032a, FR-032b). Because nothing is ever overwritten, `confirmation_needed`
+from the staging step is informational only here — commit never refuses on it (FR-033
+dropped).
+
+Write is atomic (FR-034).
 
 ### `import_vault_discard(staging_id) -> ()`
 

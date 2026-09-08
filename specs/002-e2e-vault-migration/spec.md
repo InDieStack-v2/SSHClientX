@@ -74,11 +74,19 @@ v3.0.0 and extended by v3.1.0.
 - Q: When migration, recovery, import, or unlock fails, what should the app have written
   down for support? → A: The outcome code, timestamp, revision numbers, key-identifier
   prefix, and file hash prefix. Never hostnames, paths, filenames, or content.
-- Q: When a vault file is imported to create a new profile rather than restore over an
-  existing one, which key does that new profile use? → A: Incoming files are matched
-  against every key the device holds. Import-as-new-profile is offered only when the
-  matching key arrived via a recovery kit and no profile owns it yet; otherwise the only
-  choice is restoring over the profile that owns that key.
+- Q: When a vault file is imported and its key is already owned by a profile on this
+  device, does import restore over (overwrite) that profile? → A: No, never. It always
+  lands as a new, separately-named copy ("X [IMPORT]", auto-suffixed on a further
+  collision) that shares the matched key, so a bad or stale import can never clobber
+  local changes — the owning profile's own file is untouched. The copy gets its own
+  key-wrap sidecar and device-factor keystore entry (copied from the owning profile's,
+  not shared by reference) so it opens independently with that profile's own password —
+  an earlier attempt at this that only wrote the vault file, without also giving the copy
+  its own key material, left it permanently unopenable. Because nothing is ever
+  overwritten, an older or content-conflicting incoming revision needs no special
+  confirmation either (FR-033 is dropped, on the same precedent as FR-008). A file
+  matching an unclaimed key (no profile owns it yet) still creates a new profile that
+  owns that key outright, per FR-032.
 
 ---
 
@@ -278,27 +286,28 @@ material when opened as text.
 ### User Story 4 - Import tells me exactly why a file was rejected (Priority: P4)
 
 The user imports a vault file. Every file — whatever route it arrived by — passes
-through one verification path that checks the file is genuine, undamaged, meant for this
-device's key, and not older than what is already here. Each failure has its own clear
-outcome. Import can either create a new profile or restore over an existing one, and
-restoring over an existing profile never silently discards newer content.
+through one verification path that checks the file is genuine, undamaged, and meant for
+this device's key. Each failure has its own clear outcome. Import never overwrites an
+existing profile: a file matching an unclaimed key becomes a new profile that owns it, and
+a file matching a key an existing profile already owns lands as a new, separately-named
+copy sharing that key — the profile that already owns the key is never touched, however
+the incoming revision compares to what's already there.
 
 **Why this priority**: Import works today for the only case it supports (create a new
-profile). This story adds real verification, the restore-over-existing case that makes
-revision comparison meaningful, and the distinct failure outcomes. It is also the story
-that establishes the single verification path the later same-network and cloud transports
-will reuse.
+profile). This story adds real verification, the case where an incoming file's key is
+already owned by an existing profile, and the distinct failure outcomes. It is also the
+story that establishes the single verification path the later same-network and cloud
+transports will reuse.
 
-**Independent Test**: Feed the importer a genuine file, a file with one byte flipped, a
-file sealed for a different key, an older file, and a same-revision-different-content
-file, and confirm five distinct outcomes with the local vault unchanged in the four
-failure cases.
+**Independent Test**: Feed the importer a genuine file, a file with one byte flipped, and
+a file sealed for a different key, and confirm three distinct outcomes with the local
+vault unchanged in the two failure cases.
 
 **Acceptance Scenarios**:
 
-1. **Given** a genuine file sealed for a key this device holds and newer than the profile
-   owning that key, **When** the user restores over that profile, **Then** the local vault
-   is replaced atomically and the replaced revision remains recoverable.
+1. **Given** a genuine file sealed for a key already owned by a profile on this device,
+   **When** the user imports it, **Then** it lands as a new, separately-named profile
+   sharing that key, written atomically, and the owning profile's own file is untouched.
 2. **Given** a file that is not a vault file at all, **When** it is imported, **Then** the
    user is told it is not a vault file and nothing is written.
 3. **Given** a file in a format version this release does not understand, **When** it is
@@ -308,12 +317,12 @@ failure cases.
 5. **Given** a file sealed for a different device's key, **When** it is imported,
    **Then** the app does not decrypt it, says it was sealed with another device's key,
    and points the user at the recovery-kit path.
-6. **Given** a file older than the local profile, **When** the user restores over that
-   profile, **Then** the user must explicitly confirm the downgrade, and the newer
-   content is preserved as a recoverable revision.
-7. **Given** a file at the same revision as the local profile but with different
-   content, **When** the user restores over that profile, **Then** the app reports a
-   conflict and refuses to overwrite without a separate explicit choice.
+6. **Given** a file older than the profile owning its key, **When** the user imports it,
+   **Then** it still lands as a new, separately-named copy — no confirmation is needed,
+   since the owning profile's own (newer) content is never at risk.
+7. **Given** a file at the same revision as the profile owning its key but with different
+   content, **When** the user imports it, **Then** it still lands as a new,
+   separately-named copy — no conflict to resolve, since nothing is overwritten.
 8. **Given** any import, **When** it completes or fails, **Then** the app's own copies of
    the picked file are removed from temporary and cache locations.
 9. **Given** the user cancels the identity confirmation during import, **When** the
@@ -325,8 +334,8 @@ failure cases.
     user imports it, **Then** a new profile is created that owns that key, and no other
     profile's key is involved.
 12. **Given** a file matching a key an existing profile already owns, **When** the user
-    asks to import it as a new profile, **Then** the app offers only to restore over that
-    profile and names which profile owns the key.
+    imports it, **Then** the app names the owning profile, lands the import as a new,
+    separately-named copy sharing that key, and never overwrites the owning profile.
 13. **Given** a device holding several profiles, **When** a file is imported, **Then** it
     is matched against every key the device holds, and the correct profile is identified
     without the user selecting one first.
@@ -673,27 +682,26 @@ failure cases.
   exists on this device yet, is an **unclaimed key**. It MUST be held in the secure store
   like any other vault key and MUST be included in the FR-031 match.
 - **FR-032**: When an incoming file matches an unclaimed key, the system MUST offer to
-  import it as a new profile, and that new profile MUST own that key — preserving one
-  profile, one vault key.
+  import it as a new profile, and that new profile MUST become that key's sole owner —
+  no other profile shares an unclaimed key's ownership.
 - **FR-032a**: When an incoming file matches a key already owned by a profile on this
-  device, the system MUST offer only to restore over that profile. It MUST NOT create a
-  second profile sharing an existing profile's key, and MUST name the owning profile so
-  the user understands why.
-- **FR-032b**: The system MUST support restoring over an existing profile in all cases
-  where FR-031 matched a key that profile owns.
-- **FR-033**: When restoring over an existing profile, a file at a lower revision MUST
-  require explicit user confirmation, and a file at an equal revision with different
-  content MUST be reported as a conflict and MUST NOT overwrite without a separate
-  explicit choice.
+  device, the system MUST NOT overwrite that profile. It MUST land the import as a new,
+  separately-named profile instead (auto-suffixed on a further name collision) that
+  shares the owning profile's key, and MUST name the owning profile in the offer so the
+  user understands why the two are related.
+- **FR-032b**: A profile created by FR-032a MUST be independently unlockable with the
+  owning profile's own vault password from the moment import completes — its key-wrap
+  sidecar and device-factor keystore entry MUST be established for it directly (not left
+  pointing at the owning profile's own identifiers), the same guarantee FR-032 already
+  makes for a profile created from an unclaimed key.
 - **FR-034**: The system MUST write an accepted import atomically, such that an
-  interruption leaves either the previous vault or the new one intact, never a partial
-  file, and MUST preserve the replaced revision as recoverable.
+  interruption leaves either no new file or a complete one, never a partial file.
 - **FR-035**: The system MUST remove its own copies of an imported file from temporary
   and cache locations when import completes or fails.
 - **FR-036**: The system MUST surface each distinct verification failure — not a vault
-  file, unsupported version, damaged or tampered, sealed for another key, older than
-  local, same-revision conflict, unlock cancelled — as its own outcome, and MUST NOT
-  collapse them into a single generic error.
+  file, unsupported version, damaged or tampered, sealed for another key, unlock
+  cancelled — as its own outcome, and MUST NOT collapse them into a single generic
+  error. (Older and same-revision-conflict are no longer failures per FR-032a/FR-033.)
 
 **Platform and integration**
 
