@@ -863,6 +863,13 @@ async fn profiles_dir_path(app_handle: tauri::AppHandle) -> Result<String, Strin
 /// `create_profile`) is where the profile name is known; this helper just
 /// resolves the claim.
 fn acquire_writer_claim(state: &DbState, vault_path: &Path, name: &str) -> Result<(), String> {
+    // Drop any claim this process already holds BEFORE acquiring the new
+    // one. A stale claim left by a previous failed sign-in attempt (e.g.
+    // wrong password) is still an open `File` handle on the same sidecar
+    // path, and `try_lock` conflicts with that regardless of it being our
+    // own process — so acquiring first would make a retry on the very same
+    // profile self-report VAULT_BUSY.
+    *state.writer_claim.lock().map_err(|_| "[STATE] LOCK_FAILED_CLAIM")? = None;
     let claim = vault::WriterClaim::acquire(vault_path).map_err(|o| match o {
         vault::Outcome::VaultBusy => format!("[VAULT] VAULT_BUSY: '{}' is already open in another running copy of SSHClientX.", name),
         other => other.to_string(),
@@ -2177,12 +2184,13 @@ async fn import_vault_commit(
                 o.to_string()
             })?;
 
-        // FR-031/scope decision: a key already owned by a profile on this
-        // device is NEVER overwritten by an import — it always lands as a
-        // new, separately-named copy (auto-suffixed "[IMPORT]" on a name
-        // collision), so re-importing a backup can never clobber newer
-        // local changes. Only a genuinely new/unclaimed key gets to pick
-        // its own name via `name`.
+        // FR-032a/FR-032b: a key already owned by a profile on this device
+        // is restored directly over that profile's own file — never landed
+        // as a separately-named copy. A copy would have no keywrap sidecar
+        // or device-factor keystore entry of its own (both stay keyed to
+        // the ORIGINAL profile name), making it permanently unopenable
+        // through the ordinary password unlock path. Only a genuinely
+        // new/unclaimed key gets to pick its own name via `name`.
         let landed_name = match &decision.disposition {
             vault::Disposition::CreateProfile => {
                 let base = name.ok_or("[VALIDATION] CREATE_PROFILE_REQUIRES_A_NAME")?;
@@ -2198,7 +2206,26 @@ async fn import_vault_commit(
                 landed
             }
             vault::Disposition::RestoreOver { profile } => {
-                create_new_profile_file(&dir, &format!("{} [IMPORT]", profile), true, &staged_bytes)?
+                let owner_path = resolve_profile_path(&dir, profile);
+                // FR-058/FR-061: same single-writer guard as any other
+                // direct vault write (rollback_resolve's "restore_newer" is
+                // the same shape) — refuse if another running instance
+                // holds this profile open rather than racing its writes.
+                // `import_vault_commit` only ever runs from the (still
+                // locked) profile picker, so `profile` is never this
+                // process's own active profile — no self-conflict case to
+                // special-case here.
+                let _claim = vault::WriterClaim::acquire(&owner_path).map_err(|o| match o {
+                    vault::Outcome::VaultBusy => format!("[VAULT] VAULT_BUSY: '{}' is already open in another running copy of SSHClientX.", profile),
+                    other => other.to_string(),
+                })?;
+                // FR-034: preserve the replaced revision as recoverable
+                // before the atomic overwrite.
+                vault::rotate_into_history(&owner_path)?;
+                let tmp_path = owner_path.with_extension("sshclientx.tmp");
+                fs::write(&tmp_path, &staged_bytes).map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED: {}", e))?;
+                fs::rename(&tmp_path, &owner_path).map_err(|e| format!("[FILE] IMPORT_RENAME_FAILED: {}", e))?;
+                profile.clone()
             }
             vault::Disposition::NoOp { profile } => profile.clone(),
         };
