@@ -17,17 +17,12 @@ import { describeVaultError } from "../util/vaultErrors";
 // running build. Mirrors the shape AboutPanel already consumes.
 interface UpdateInfo { current: string; latest: string | null; has_update: boolean; release_url: string | null; }
 
-// contracts/tauri-command-contract.md §1, plus `high_water` (not in the
-// documented contract — added alongside `list_profiles` specifically so
-// the rollback dialog below can name both revisions without a separate
-// command or a structured-error mechanism the rest of the backend doesn't
-// have; see src-tauri/src/lib.rs's `list_profiles`).
+// contracts/tauri-command-contract.md §1.
 interface ProfileSummary {
   name: string;
   format: "sealed" | "legacy";
   revision: number;
   busy: boolean;
-  high_water: number;
 }
 
 // contracts/tauri-command-contract.md §2, extended with "needs_password":
@@ -241,7 +236,12 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
       const info = describeVaultError(e);
       if (info.code === "VAULT_ROLLBACK") {
         const prof = profiles.find((p) => p.name === selected);
-        setRollbackInfo({ name: selected, fileRevision: prof?.revision ?? 0, highWater: prof?.high_water ?? 0 });
+        // Fetched only now, for this one profile — not for every profile
+        // on every list load, which used to mean a keychain-access prompt
+        // per profile just to render the picker (each profile's high-water
+        // mark is its own keychain item).
+        const highWater = await invoke<number>("profile_high_water", { name: selected }).catch(() => 0);
+        setRollbackInfo({ name: selected, fileRevision: prof?.revision ?? 0, highWater });
       } else {
         setError(info.message);
       }

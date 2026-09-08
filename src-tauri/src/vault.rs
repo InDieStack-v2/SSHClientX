@@ -760,7 +760,16 @@ impl DiagnosticEntry {
         }
     }
 
+    // No current production caller populates these two fields (the import
+    // pipeline's own older/conflict path that used to was retired — a
+    // matched key now always lands as a new copy rather than needing a
+    // revision comparison to report on). Kept `#[allow(dead_code)]` rather
+    // than deleted: `serialized_entries_never_leak_forbidden_content`
+    // below exercises them directly to prove the no-leak guarantee holds
+    // for a revision/kid-bearing entry too, which is exactly the shape a
+    // future rollback or conflict diagnostic would need.
     #[must_use]
+    #[allow(dead_code)]
     pub fn with_revisions(mut self, local: Option<u64>, incoming: Option<u64>) -> Self {
         self.local_revision = local;
         self.incoming_revision = incoming;
@@ -768,6 +777,7 @@ impl DiagnosticEntry {
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub fn with_kid(mut self, kid: &[u8]) -> Self {
         self.kid_prefix = Some(hex::encode(&kid[..kid.len().min(4)]));
         self

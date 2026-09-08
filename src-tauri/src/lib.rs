@@ -822,15 +822,24 @@ async fn list_profiles(app_handle: tauri::AppHandle) -> Result<Vec<serde_json::V
             Err(vault::Outcome::VaultBusy) => true,
             Err(_) => false,
         };
-        // Frontend-only addition beyond contract §1's ProfileSummary: the
-        // rollback-resolution dialog needs to name BOTH revisions (the
-        // file's own, above, and this device's last-seen high-water mark)
-        // without inventing a structured-error mechanism the rest of the
-        // codebase doesn't have. Needs no key, same as everything else here.
-        let high_water = keystore::load_high_water(&name).unwrap_or(0);
-        out.push(serde_json::json!({ "name": name, "format": format, "revision": revision, "busy": busy, "high_water": high_water }));
+        out.push(serde_json::json!({ "name": name, "format": format, "revision": revision, "busy": busy }));
     }
     Ok(out)
+}
+
+/// The rollback-resolution dialog needs the device's last-seen high-water
+/// mark for the ONE profile that just failed to unlock with `VAULT_ROLLBACK`
+/// — fetched only then, rather than for every profile on every list load.
+/// Each profile's high-water mark is its own keychain item, so reading all
+/// of them up front (as `list_profiles` briefly did) meant a machine with
+/// several profiles saw a separate OS keychain-access prompt per profile
+/// just to render the picker, before the user had even picked one.
+#[tauri::command]
+async fn profile_high_water(name: String) -> Result<u64, String> {
+    let name = normalize_profile_name(&name)?;
+    tokio::task::spawn_blocking(move || keystore::load_high_water(&name).unwrap_or(0))
+        .await
+        .map_err(|e| format!("[STATE] KEYSTORE_JOIN: {}", e))
 }
 
 /// T114: exposes the profiles directory path so the picker can warn when it
@@ -10005,7 +10014,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             check_db_exists, setup_master_db, persist_vault,
-            list_profiles, profiles_dir_path, select_profile, create_profile, delete_profile, close_profile,
+            list_profiles, profile_high_water, profiles_dir_path, select_profile, create_profile, delete_profile, close_profile,
             migration_notice_ack, rollback_resolve,
             vault_lock, vault_lock_state, vault_unlock_quick, vault_unlock_full,
             vault_unlock_quick_cold, profile_quick_unlock_available,
