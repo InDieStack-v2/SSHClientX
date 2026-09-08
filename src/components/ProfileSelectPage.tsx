@@ -30,12 +30,16 @@ interface ProfileSummary {
   high_water: number;
 }
 
-// contracts/tauri-command-contract.md §2. `profile` is only set for
-// `restore_over`; `confirmation_needed` is "none" unless the disposition
-// needs an explicit choice first.
+// contracts/tauri-command-contract.md §2, extended with "needs_password":
+// the file's key matches a specific key on this device (another profile's
+// own, or an unclaimed recovery-kit key) that isn't already unlocked, so
+// `profile` names/describes it and the picker asks for its password before
+// re-trying, rather than sending the user into the recovery-kit flow for a
+// key this device already holds. A key already owned by a profile never
+// restores over it — it always lands as a new, separately-named copy.
 interface StagedImport {
   staging_id: string;
-  disposition: "create_profile" | "restore_over" | "no_op";
+  disposition: "create_profile" | "restore_over" | "no_op" | "needs_password";
   profile: string | null;
   confirmation_needed: "none" | "older" | "conflict";
   incoming_revision: number;
@@ -86,6 +90,10 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   // `_discard` (contract §2) — replaces the old sniff-and-copy pair.
   const [staged, setStaged] = useState<StagedImport | null>(null);
   const [importName, setImportName] = useState("");
+  // Only ever set for a "needs_password" staged import — the password for
+  // whichever specific key this file matched, re-sent to both the pick
+  // retry and the eventual commit (T102).
+  const [keyPassword, setKeyPassword] = useState("");
 
   // T073: set only on a VAULT_ROLLBACK-coded unlock failure. No race with
   // unmounting (unlike migration-notice, this is a synchronous catch on
@@ -309,20 +317,46 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   // T106: stage-then-commit against the verified import pipeline.
   const startImport = async () => {
     setError(null); setInfo(null);
+    setKeyPassword("");
     setBusy(true);
     try {
-      const picked = await invoke<StagedImport | null>("import_vault_pick");
+      const picked = await invoke<StagedImport | null>("import_vault_pick", {});
       if (!picked) { setBusy(false); return; }
       setStaged(picked);
-      setImportName(picked.profile || "");
+      setImportName(picked.disposition === "create_profile" ? (picked.profile || "") : "");
     } catch (e) {
       const info = describeVaultError(e);
       setError(info.message);
       if (info.code === "BOX_UNKNOWN_KEY") {
-        // Not for any key this device holds — the only way in is a
-        // recovery kit (spec Edge Cases / contract §2).
+        // Genuinely unrecognized by every key this device holds — the only
+        // way in is a recovery kit. A file matching a KNOWN key (this
+        // device's own profile or an unclaimed recovery-kit key) never
+        // reaches here — it comes back as a "needs_password" staged import
+        // instead (FR-031).
         setRecoveryOpen(true);
       }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // Retries the same already-staged file with a password for whichever
+  // specific key `startImport` identified — no re-picking the file.
+  const submitKeyPassword = async () => {
+    if (!staged || !keyPassword) return;
+    setBusy(true); setError(null);
+    try {
+      const resumed = await invoke<StagedImport | null>("import_vault_pick", {
+        keyPassword,
+        retryStagingId: staged.staging_id,
+      });
+      if (resumed) {
+        setStaged(resumed);
+        setImportName(resumed.disposition === "create_profile" ? (resumed.profile || "") : "");
+      }
+    } catch (e) {
+      // Staged file stays put on a wrong password — same field, try again.
+      setError(describeVaultError(e).message);
     } finally {
       setBusy(false);
     }
@@ -332,6 +366,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     if (!staged) return;
     try { await invoke("import_vault_discard", { stagingId: staged.staging_id }); } catch { /* best-effort */ }
     setStaged(null);
+    setKeyPassword("");
     setError(null);
   };
 
@@ -351,7 +386,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     };
   }, []);
 
-  const commitImport = async (opts?: { confirmOlder?: boolean; resolveConflict?: boolean }) => {
+  const commitImport = async () => {
     if (!staged) return;
     if (staged.disposition === "create_profile" && !importName.trim()) {
       setError("Pick a name for the imported profile.");
@@ -359,21 +394,21 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     }
     setBusy(true); setError(null);
     try {
-      await invoke("import_vault_commit", {
+      // FR-031/scope: a key already owned by a profile on this device is
+      // never restored over — the backend always lands it as a new,
+      // separately-named copy (auto-suffixed on a name collision) and
+      // reports back whichever name it actually used.
+      const landed = await invoke<string>("import_vault_commit", {
         stagingId: staged.staging_id,
         name: staged.disposition === "create_profile" ? importName.trim() : undefined,
-        // Rust declares these as plain `bool`, not `Option<bool>` — an
-        // omitted key (which `undefined` becomes once JSON-serialized) is
-        // a hard IPC deserialization error ("missing required key"), not a
-        // default. Must always send a concrete boolean.
-        confirmOlder: opts?.confirmOlder ?? false,
-        resolveConflict: opts?.resolveConflict ?? false,
+        keyPassword: keyPassword || undefined,
       });
       const wasNoOp = staged.disposition === "no_op";
       setStaged(null);
-      setInfo(wasNoOp ? "Already up to date — nothing imported." : `Imported${importName ? ` as "${importName.trim()}"` : ""}.`);
+      setKeyPassword("");
+      setInfo(wasNoOp ? "Already up to date — nothing imported." : `Imported as "${landed}".`);
       await reload();
-      if (importName.trim()) setSelected(importName.trim());
+      setSelected(landed);
     } catch (e) {
       setError(describeVaultError(e).message);
     } finally {
@@ -479,64 +514,101 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
           </div>
         )}
 
-        {/* T106: staged import — branches on disposition/confirmation_needed. */}
+        {/* T106: staged import — branches on disposition. A popup rather
+            than an inline card: it needs full attention (it's about to
+            write a profile file), and the picker's own card underneath is
+            mid-scroll/mid-form while this is up. */}
         {staged && (
-          <div className="mb-3 px-3 py-3 bg-zinc-900/60 border border-primary/30 rounded-lg space-y-2 animate-in fade-in">
-            {staged.disposition === "create_profile" && (
-              <>
-                <div className="text-[11.5px] text-zinc-300 leading-snug">
-                  New vault from {staged.sender_name || "another device"} (revision {staged.incoming_revision}). Pick a name.
+          <div
+            className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3 animate-in fade-in"
+            onClick={cancelImport}
+          >
+            <div
+              className="w-full max-w-sm bg-[#121214] border border-primary/30 rounded-xl shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="shrink-0 px-4 py-3 border-b border-white/5 flex items-center justify-between">
+                <span className="text-[12px] font-bold uppercase tracking-widest text-white flex items-center gap-2">
+                  <Upload size={13} className="text-primary" /> Import vault
+                </span>
+                <button onClick={cancelImport} className="text-zinc-400 hover:text-white"><X size={16} /></button>
+              </div>
+
+              <div className="p-4 space-y-3">
+                {staged.disposition === "create_profile" && (
+                  <>
+                    <div className="text-[11.5px] text-zinc-300 leading-snug">
+                      New vault from {staged.sender_name || "another device"} (revision {staged.incoming_revision}). Pick a name.
+                    </div>
+                    <input
+                      value={importName}
+                      onChange={(e) => setImportName(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && commitImport()}
+                      className={inputBase + " h-9 text-[13px]"}
+                      placeholder="Profile name"
+                      autoFocus
+                    />
+                  </>
+                )}
+                {staged.disposition === "needs_password" && (
+                  <>
+                    <div className="text-[11.5px] text-zinc-300 leading-snug">
+                      This file matches <span className="text-primary font-semibold">{staged.profile}</span> already on
+                      this device. Enter its password to continue.
+                    </div>
+                    <input
+                      type="password"
+                      value={keyPassword}
+                      onChange={(e) => setKeyPassword(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && submitKeyPassword()}
+                      className={inputBase + " h-9 text-[13px]"}
+                      placeholder="Password"
+                      autoFocus
+                    />
+                  </>
+                )}
+                {/* FR-031/scope: a matched key never overwrites the profile
+                    that already owns it — importing always adds a
+                    separate, auto-suffixed copy instead, so there's
+                    nothing to confirm about revision or content here. */}
+                {staged.disposition === "restore_over" && (
+                  <div className="text-[11.5px] text-zinc-300 leading-snug">
+                    This device already has <span className="font-semibold">"{staged.profile}"</span>. Importing will add
+                    a separate copy (named "{staged.profile} [IMPORT]", or an auto-numbered variant) —{" "}
+                    <span className="font-semibold">"{staged.profile}"</span> itself is left untouched.
+                  </div>
+                )}
+                {staged.disposition === "no_op" && (
+                  <div className="text-[11.5px] text-zinc-300 leading-snug">
+                    This file matches <span className="font-semibold">"{staged.profile}"</span> exactly — nothing to import.
+                  </div>
+                )}
+                <div className="flex gap-2">
+                  <button
+                    onClick={staged.disposition === "needs_password" ? submitKeyPassword : () => commitImport()}
+                    disabled={
+                      busy ||
+                      (staged.disposition === "create_profile" && !importName.trim()) ||
+                      (staged.disposition === "needs_password" && !keyPassword)
+                    }
+                    className="flex-1 h-9 rounded-lg text-[12.5px] font-semibold bg-primary text-black disabled:opacity-50"
+                  >
+                    {busy
+                      ? (staged.disposition === "needs_password" ? "Checking…" : "Importing…")
+                      : staged.disposition === "no_op"
+                        ? "Dismiss"
+                        : staged.disposition === "needs_password"
+                          ? "Continue"
+                          : "Import"}
+                  </button>
+                  <button
+                    onClick={cancelImport}
+                    className="h-9 px-3 rounded-lg text-[12.5px] font-semibold text-zinc-300 hover:text-white bg-white/5 hover:bg-white/10 border border-white/10"
+                  >
+                    Cancel
+                  </button>
                 </div>
-                <input
-                  value={importName}
-                  onChange={(e) => setImportName(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && commitImport()}
-                  className={inputBase + " h-9 text-[13px]"}
-                  placeholder="Profile name"
-                  autoFocus
-                />
-              </>
-            )}
-            {staged.disposition === "restore_over" && staged.confirmation_needed === "none" && (
-              <div className="text-[11.5px] text-zinc-300 leading-snug">
-                Restore over <span className="text-primary font-semibold">"{staged.profile}"</span> with revision{" "}
-                {staged.incoming_revision} from {staged.sender_name || "another device"}?
               </div>
-            )}
-            {staged.confirmation_needed === "older" && (
-              <div className="text-[11.5px] text-amber-200 leading-snug">
-                This file (revision {staged.incoming_revision}) is OLDER than the local revision of{" "}
-                <span className="font-semibold">"{staged.profile}"</span>. Restoring will replace the newer local content.
-              </div>
-            )}
-            {staged.confirmation_needed === "conflict" && (
-              <div className="text-[11.5px] text-amber-200 leading-snug">
-                This file is the SAME revision as <span className="font-semibold">"{staged.profile}"</span> but the
-                content differs. Restoring will overwrite the local copy.
-              </div>
-            )}
-            {staged.disposition === "no_op" && (
-              <div className="text-[11.5px] text-zinc-300 leading-snug">
-                This file matches <span className="font-semibold">"{staged.profile}"</span> exactly — nothing to import.
-              </div>
-            )}
-            <div className="flex gap-2">
-              <button
-                onClick={() => commitImport({
-                  confirmOlder: staged.confirmation_needed === "older",
-                  resolveConflict: staged.confirmation_needed === "conflict",
-                })}
-                disabled={busy || (staged.disposition === "create_profile" && !importName.trim())}
-                className="flex-1 h-9 rounded-lg text-[12.5px] font-semibold bg-primary text-black disabled:opacity-50"
-              >
-                {busy ? "Importing…" : staged.disposition === "no_op" ? "Dismiss" : "Import"}
-              </button>
-              <button
-                onClick={cancelImport}
-                className="h-9 px-3 rounded-lg text-[12.5px] font-semibold text-zinc-300 hover:text-white bg-white/5 hover:bg-white/10 border border-white/10"
-              >
-                Cancel
-              </button>
             </div>
           </div>
         )}

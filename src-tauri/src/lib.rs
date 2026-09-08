@@ -1830,24 +1830,62 @@ pub struct ImportStagingState {
     pub staged: StdMutex<std::collections::HashMap<String, PathBuf>>,
 }
 
+/// Scan every profile file in `dir` for one whose own sealed header
+/// carries `kid` (FR-031: match an incoming file against every key this
+/// device holds, not just the one currently open). `kid` is a plaintext
+/// field of the sealed container — this never touches a password or a
+/// key, only the header, so it's cheap enough to run on every profile on
+/// disk before anyone types anything.
+///
+/// A repeated re-import of the same key eventually leaves MULTIPLE
+/// profiles sharing one `kid` (the original, plus its own "[IMPORT]"
+/// copies) — `fs::read_dir`'s order is unspecified, so picking whichever
+/// one it happens to list first would make a later import's auto-suffix
+/// chain onto whatever copy was matched ("X [IMPORT] [IMPORT]") instead of
+/// consistently onto the original ("X [IMPORT] 2"). Sorting candidates and
+/// taking the lexicographically-first one is deterministic and, since a
+/// copy's name always starts with the original's plus a suffix, correctly
+/// prefers the original in the common case.
+fn find_profile_owning_kid(dir: &Path, kid: &[u8; vault::KID_LEN]) -> Option<String> {
+    let entries = fs::read_dir(dir).ok()?;
+    let mut candidates: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() || !is_vault_extension(path.extension()) {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+        if validate_profile_name(stem).is_err() {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let Ok(sealed) = vault::SealedVaultFile::parse(&bytes) else { continue };
+        if sealed.kid == *kid {
+            candidates.push(read_profile_label(&path).unwrap_or_else(|| stem.to_string()));
+        }
+    }
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
 /// T102 (FR-031, FR-032, FR-032a): resolve what key, if any, this device
 /// holds for `kid` — checked in order:
 /// 1. The currently open profile, if its `kid` matches. Its DEK is
 ///    already unlocked in `state`; no extra password is asked for.
 /// 2. An unclaimed key established by a previously-consumed recovery kit,
-///    if `unclaimed_password` (the password chosen when that key was
+///    if `key_password` (the password chosen when that key was
 ///    established) is supplied.
-/// 3. Otherwise, unknown to this device.
-///
-/// Deliberately out of scope here: restoring over a profile *other than*
-/// the one currently open. That case needs the target profile's own
-/// password too, which doesn't fit this single-password call shape —
-/// select and unlock that profile first, then import.
+/// 3. Any OTHER profile on disk whose own key matches `kid` (FR-031,
+///    scenario 13) — identified for free via `find_profile_owning_kid`,
+///    then unwrapped with `key_password` (that profile's own vault
+///    password) exactly like an ordinary unlock. This is what lets import
+///    recognize a profile's own exported backup even when that profile
+///    isn't the one currently open.
 fn resolve_key_lookup(
     state: &DbState,
     profiles_dir_path: &Path,
     kid: [u8; vault::KID_LEN],
-    unclaimed_password: Option<&str>,
+    key_password: Option<&str>,
 ) -> Result<vault::KeyLookup, String> {
     {
         let open_kid = state.kid.lock().map_err(|_| "[STATE] LOCK_FAILED_KID")?;
@@ -1878,7 +1916,7 @@ fn resolve_key_lookup(
 
     let keywrap_path = recovery::unclaimed_dir(profiles_dir_path).join(format!("{}.keywrap", hex::encode(kid)));
     if keywrap_path.exists() {
-        if let Some(password) = unclaimed_password {
+        if let Some(password) = key_password {
             let device_factor = keystore::load_device_factor(&recovery::unclaimed_keystore_id(&kid))
                 .map_err(|o| o.to_string())?;
             let keywrap_bytes = fs::read(&keywrap_path).map_err(|e| format!("[FILE] UNCLAIMED_KEYWRAP_READ_FAILED: {}", e))?;
@@ -1888,10 +1926,39 @@ fn resolve_key_lookup(
         }
         // A matching unclaimed key exists but no password was supplied for
         // it this call — collapses to Unknown rather than a distinct
-        // outcome. A real (if minor) UX rough edge: retrying with the
-        // password succeeds, but a bare attempt reads identically to a
-        // genuinely unrecognised file. Not a correctness gap — BOX_UNKNOWN_KEY
-        // still correctly points at the recovery-kit flow either way.
+        // outcome. The pick command peeks ahead of this function
+        // specifically to avoid this ever being user-visible (it asks for
+        // the password before calling this at all once it knows one is
+        // needed), so this fallback only matters for a caller that skips
+        // that peek.
+        return Ok(vault::KeyLookup::Unknown);
+    }
+
+    if let Some(password) = key_password {
+        if let Some(owner) = find_profile_owning_kid(profiles_dir_path, &kid) {
+            let owner_path = resolve_profile_path(profiles_dir_path, &owner);
+            let device_factor = keystore::load_device_factor(&owner).map_err(|o| o.to_string())?;
+            let keywrap_bytes = fs::read(vault::keywrap_path(&owner_path))
+                .map_err(|e| format!("[FILE] OWNER_KEYWRAP_READ_FAILED: {}", e))?;
+            let keywrap = vault::KeyWrapFile::parse(&keywrap_bytes).map_err(|o| o.to_string())?;
+            let dek = keywrap.unwrap_dek(&device_factor, password).map_err(|o| o.to_string())?;
+            if vault::derive_kid(&dek) != kid {
+                return Err(vault::Outcome::VaultAuth.to_string());
+            }
+            let owner_bytes = fs::read(&owner_path).map_err(|e| format!("[FILE] OWNER_VAULT_READ_FAILED: {}", e))?;
+            let owner_sealed = vault::SealedVaultFile::parse(&owner_bytes).map_err(|o| o.to_string())?;
+            let owner_plain = owner_sealed
+                .open(&vault::SealKey { alg: owner_sealed.alg, key: &dek })
+                .map_err(|o| o.to_string())?;
+            use sha2::{Digest, Sha256};
+            let current_content_hash: [u8; 32] = Sha256::digest(&owner_plain).into();
+            return Ok(vault::KeyLookup::Owned {
+                profile: owner,
+                key: *dek,
+                current_revision: owner_sealed.generation,
+                current_content_hash,
+            });
+        }
     }
 
     Ok(vault::KeyLookup::Unknown)
@@ -1900,54 +1967,113 @@ fn resolve_key_lookup(
 /// T097 (FR-030): open a file picker, copy the picked file into the app
 /// sandbox, and verify THAT copy — never the original source again, which
 /// is what makes this immune to a TOCTOU swap between pick and read.
-/// `unclaimed_password` is the password for an unclaimed key this file
-/// might match (see `resolve_key_lookup`); pass `None` for the common case
-/// of restoring over the currently open profile.
+/// `key_password` is the password for whichever specific key this file
+/// turns out to need (an unclaimed recovery-kit key, or another profile's
+/// own vault password — see `resolve_key_lookup`); pass `None` on the
+/// first attempt. `retry_staging_id`, when set, skips the file dialog and
+/// re-verifies the SAME already-staged file with `key_password` — this is
+/// how the UI supplies a password after `needs_password` comes back,
+/// without asking the user to pick the file a second time.
 #[tauri::command]
 async fn import_vault_pick(
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, DbState>,
     staging: tauri::State<'_, ImportStagingState>,
-    unclaimed_password: Option<String>,
+    key_password: Option<String>,
+    retry_staging_id: Option<String>,
 ) -> Result<Option<serde_json::Value>, String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (app_handle, state, staging, unclaimed_password);
+        let _ = (app_handle, state, staging, key_password, retry_staging_id);
         return Err("Vault import is not available on Android.".into());
     }
     #[cfg(not(target_os = "android"))]
     {
-        let _dialog_guard = lock::DialogGuard::open();
-        let picked = rfd::FileDialog::new()
-            .set_title("Import vault")
-            .add_filter("SSHClientX vault", &[VAULT_EXT, VAULT_EXT_LEGACY])
-            .pick_file();
-        let source_path = match picked {
-            Some(p) => p,
-            None => return Ok(None),
-        };
+        let dir = profiles_dir(&app_handle)?;
 
-        let source_bytes = fs::read(&source_path).map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?;
-        let staging_id = {
-            let mut b = [0u8; 16];
-            rand::thread_rng().fill(&mut b);
-            hex::encode(b)
+        let (staging_id, staged_path) = if let Some(id) = retry_staging_id {
+            let path = staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?
+                .get(&id).cloned()
+                .ok_or("[VALIDATION] UNKNOWN_STAGING_ID")?;
+            (id, path)
+        } else {
+            let _dialog_guard = lock::DialogGuard::open();
+            let picked = rfd::FileDialog::new()
+                .set_title("Import vault")
+                .add_filter("SSHClientX vault", &[VAULT_EXT, VAULT_EXT_LEGACY])
+                .pick_file();
+            let source_path = match picked {
+                Some(p) => p,
+                None => return Ok(None),
+            };
+
+            let source_bytes = fs::read(&source_path).map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?;
+            let staging_id = {
+                let mut b = [0u8; 16];
+                rand::thread_rng().fill(&mut b);
+                hex::encode(b)
+            };
+            let staged_dir = app_temp_root().join("import_staging");
+            fs::create_dir_all(&staged_dir).map_err(|e| format!("[FILE] STAGING_MKDIR_FAILED: {}", e))?;
+            let staged_path = staged_dir.join(format!("{}.sshclientx", staging_id));
+            fs::write(&staged_path, &source_bytes).map_err(|e| format!("[FILE] STAGING_WRITE_FAILED: {}", e))?;
+            drop(source_bytes); // the copy on disk is what gets verified from here on
+            staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?
+                .insert(staging_id.clone(), staged_path.clone());
+            (staging_id, staged_path)
         };
-        let staged_dir = app_temp_root().join("import_staging");
-        fs::create_dir_all(&staged_dir).map_err(|e| format!("[FILE] STAGING_MKDIR_FAILED: {}", e))?;
-        let staged_path = staged_dir.join(format!("{}.sshclientx", staging_id));
-        fs::write(&staged_path, &source_bytes).map_err(|e| format!("[FILE] STAGING_WRITE_FAILED: {}", e))?;
-        drop(source_bytes); // the copy on disk is what gets verified from here on
 
         let staged_bytes = fs::read(&staged_path).map_err(|e| format!("[FILE] STAGED_READ_FAILED: {}", e))?;
 
-        let dir = profiles_dir(&app_handle)?;
-        let registry = |k: &[u8; vault::KID_LEN]| -> vault::KeyLookup {
-            resolve_key_lookup(&state, &dir, *k, unclaimed_password.as_deref())
-                .unwrap_or(vault::KeyLookup::Unknown)
+        // FR-031: before spending a password attempt, check whether this
+        // file's kid names a SPECIFIC key this device already holds (an
+        // unclaimed recovery-kit key, or another profile's own key) so the
+        // caller can be told exactly whose password to ask for, instead of
+        // a generic "unknown key" that would send the user into the
+        // recovery-kit flow for a key this device already has. A malformed
+        // file (bad magic, corrupt, unsupported) fails this parse and is
+        // left for `verify_and_import` below to report properly.
+        let sealed_peek = vault::SealedVaultFile::parse(&staged_bytes).ok();
+        if key_password.is_none() {
+            if let Some(sealed) = &sealed_peek {
+                let is_active_match = {
+                    let kid_guard = state.kid.lock().map_err(|_| "[STATE] LOCK_FAILED_KID")?;
+                    let dek_guard = state.dek.lock().map_err(|_| "[STATE] LOCK_FAILED_KEY")?;
+                    matches!((kid_guard.as_ref(), dek_guard.as_ref()), (Some(k), Some(_)) if *k == sealed.kid)
+                };
+                if !is_active_match {
+                    let target = if recovery::unclaimed_dir(&dir).join(format!("{}.keywrap", hex::encode(sealed.kid))).exists() {
+                        Some("a recovered key not yet claimed by any profile".to_string())
+                    } else {
+                        find_profile_owning_kid(&dir, &sealed.kid)
+                    };
+                    if let Some(target) = target {
+                        return Ok(Some(serde_json::json!({
+                            "staging_id": staging_id,
+                            "disposition": "needs_password",
+                            "profile": target,
+                            "confirmation_needed": "none",
+                            "incoming_revision": sealed.generation,
+                            "sender_name": sealed.sender_name,
+                            "created_at": sealed.created_at,
+                        })));
+                    }
+                }
+            }
+        }
+
+        // Resolved eagerly (rather than inside the registry closure below)
+        // so a wrong password surfaces as its own outcome — a closure
+        // returning bare `KeyLookup` has nowhere to carry that Err, and
+        // collapsing it to `Unknown` would misreport a bad password as
+        // "sealed with another device's key".
+        let lookup = match &sealed_peek {
+            Some(sealed) => resolve_key_lookup(&state, &dir, sealed.kid, key_password.as_deref())?,
+            None => vault::KeyLookup::Unknown,
         };
+        let registry = move |_: &[u8; vault::KID_LEN]| -> vault::KeyLookup { lookup.clone() };
         // Identity confirmation for import is the existing-profile match's
-        // own unlock (the profile is already open) or an unclaimed key's
+        // own unlock (the profile is already open) or the matched key's
         // own password (just supplied above) — both are already a form of
         // "prove you have a right to this key," so this call is always
         // `identity_confirmed = true` at the staging step; nothing is
@@ -1956,6 +2082,7 @@ async fn import_vault_pick(
         let decision = match vault::verify_and_import(&staged_bytes, &registry, true) {
             Ok(d) => d,
             Err(o) => {
+                staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?.remove(&staging_id);
                 let _ = fs::remove_file(&staged_path);
                 // T107/FR-067: import is one of the four diagnostic
                 // categories. The hash prefix is the one thing always
@@ -1971,13 +2098,10 @@ async fn import_vault_pick(
             }
         };
 
-        staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?
-            .insert(staging_id.clone(), staged_path);
-
         let (disposition_str, profile_name) = match &decision.disposition {
             vault::Disposition::CreateProfile => ("create_profile", None),
             vault::Disposition::RestoreOver { profile } => ("restore_over", Some(profile.clone())),
-            vault::Disposition::NoOp => ("no_op", None),
+            vault::Disposition::NoOp { profile } => ("no_op", Some(profile.clone())),
         };
         let confirmation_str = match decision.confirmation_needed {
             vault::ConfirmationNeeded::None => "none",
@@ -1998,11 +2122,10 @@ async fn import_vault_pick(
 }
 
 /// T099/T100 (FR-033, FR-034): perform the write staging decided. `name`
-/// is required for `create_profile`. `confirm_older`/`resolve_conflict`
-/// must be `true` when the staged disposition needs that specific
-/// confirmation — a commit missing the matching one re-derives the
-/// decision fresh and refuses with the same code again, rather than a
-/// stale cached one letting a second call quietly slip through.
+/// is required for `create_profile`. Returns the profile name the import
+/// actually landed on — auto-suffixed when a matched key's own profile
+/// already has that name (see `create_new_profile_file`), so the caller
+/// can select the right row without having to guess it in advance.
 #[tauri::command]
 async fn import_vault_commit(
     app_handle: tauri::AppHandle,
@@ -2010,12 +2133,11 @@ async fn import_vault_commit(
     staging: tauri::State<'_, ImportStagingState>,
     staging_id: String,
     name: Option<String>,
-    confirm_older: bool,
-    resolve_conflict: bool,
-) -> Result<(), String> {
+    key_password: Option<String>,
+) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (app_handle, state, staging, staging_id, name, confirm_older, resolve_conflict);
+        let _ = (app_handle, state, staging, staging_id, name, key_password);
         return Err("Vault import is not available on Android.".into());
     }
     #[cfg(not(target_os = "android"))]
@@ -2026,16 +2148,17 @@ async fn import_vault_commit(
         let staged_bytes = fs::read(&staged_path).map_err(|e| format!("[FILE] STAGED_READ_FAILED: {}", e))?;
 
         let dir = profiles_dir(&app_handle)?;
-        // Re-resolve without an unclaimed password: the pick step already
-        // proved access if this was an unclaimed-key match, and re-asking
-        // for it here would be redundant. If this genuinely is an
-        // unclaimed-key disposition being committed, the disposition
-        // itself was already decided at pick time; commit only needs to
-        // re-run the SAME pipeline for the (older/conflict) confirmation
-        // check, not re-authenticate.
-        let registry = |k: &[u8; vault::KID_LEN]| -> vault::KeyLookup {
-            resolve_key_lookup(&state, &dir, *k, None).unwrap_or(vault::KeyLookup::Unknown)
+        // Re-resolve fresh rather than trusting the pick step's cached
+        // decision (T100) — `key_password` is whatever the pick step
+        // already used to prove access, passed through again so this
+        // re-derivation can actually succeed instead of falling back to
+        // `Unknown` for a key that isn't the currently-open profile's own.
+        let sealed_peek = vault::SealedVaultFile::parse(&staged_bytes).ok();
+        let lookup = match &sealed_peek {
+            Some(sealed) => resolve_key_lookup(&state, &dir, sealed.kid, key_password.as_deref())?,
+            None => vault::KeyLookup::Unknown,
         };
+        let registry = move |_: &[u8; vault::KID_LEN]| -> vault::KeyLookup { lookup.clone() };
         let decision = vault::verify_and_import(&staged_bytes, &registry, true)
             .map_err(|o| {
                 // T107/FR-067: a genuine verification failure re-surfacing
@@ -2045,110 +2168,81 @@ async fn import_vault_commit(
                 o.to_string()
             })?;
 
-        match decision.confirmation_needed {
-            vault::ConfirmationNeeded::Older if !confirm_older => {
-                vault::record_diagnostic(
-                    &app_handle,
-                    &vault::DiagnosticEntry::new(vault::Outcome::BoxOlder.code())
-                        .with_revisions(None, Some(decision.sealed.generation))
-                        .with_kid(&decision.sealed.kid),
-                );
-                return Err(vault::Outcome::BoxOlder.to_string());
-            }
-            vault::ConfirmationNeeded::Conflict if !resolve_conflict => {
-                vault::record_diagnostic(
-                    &app_handle,
-                    &vault::DiagnosticEntry::new(vault::Outcome::BoxConflict.code())
-                        .with_revisions(None, Some(decision.sealed.generation))
-                        .with_kid(&decision.sealed.kid),
-                );
-                return Err(vault::Outcome::BoxConflict.to_string());
-            }
-            _ => {}
-        }
-
-        match &decision.disposition {
+        // FR-031/scope decision: a key already owned by a profile on this
+        // device is NEVER overwritten by an import — it always lands as a
+        // new, separately-named copy (auto-suffixed "[IMPORT]" on a name
+        // collision), so re-importing a backup can never clobber newer
+        // local changes. Only a genuinely new/unclaimed key gets to pick
+        // its own name via `name`.
+        let landed_name = match &decision.disposition {
             vault::Disposition::CreateProfile => {
-                let profile_name = normalize_profile_name(
-                    &name.ok_or("[VALIDATION] CREATE_PROFILE_REQUIRES_A_NAME")?,
-                )?;
-                fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
-                let dest = resolve_profile_path(&dir, &profile_name);
-                // FR-058/FR-061: claim the sidecar BEFORE checking existence
-                // — closes the TOCTOU window where two instances importing
-                // the same new name at once could otherwise both pass the
-                // `exists()` check and race to create/overwrite it. The
-                // claim's own sidecar file can be created regardless of
-                // whether `dest` itself exists yet.
-                let _claim = vault::WriterClaim::acquire(&dest).map_err(|o| match o {
-                    vault::Outcome::VaultBusy => format!("[VAULT] VAULT_BUSY: '{}' is already being imported by another running copy of SSHClientX.", profile_name),
-                    other => other.to_string(),
-                })?;
-                if dest.exists() {
-                    return Err(format!("Profile '{}' already exists", profile_name));
-                }
-                // Atomic: tmp -> rename, same discipline as an ordinary save.
-                let tmp = dest.with_extension("sshclientx.tmp");
-                fs::write(&tmp, &staged_bytes).map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED: {}", e))?;
-                fs::rename(&tmp, &dest).map_err(|e| format!("[FILE] IMPORT_RENAME_FAILED: {}", e))?;
-                let _ = write_profile_label(&dest, &profile_name);
-
+                let base = name.ok_or("[VALIDATION] CREATE_PROFILE_REQUIRES_A_NAME")?;
+                let landed = create_new_profile_file(&dir, &base, false, &staged_bytes)?;
                 // T085: this key is no longer unclaimed — remove its
                 // unclaimed-state sidecar now that a profile owns it. The
                 // keystore device-factor entry stays (it's what the new
                 // profile's future unlocks will read); only the unclaimed
                 // *bookkeeping* is retired.
-                let kid = decision.sealed.kid;
-                let unclaimed_sidecar = recovery::unclaimed_dir(&dir).join(format!("{}.keywrap", hex::encode(kid)));
+                let unclaimed_sidecar = recovery::unclaimed_dir(&dir)
+                    .join(format!("{}.keywrap", hex::encode(decision.sealed.kid)));
                 let _ = fs::remove_file(&unclaimed_sidecar);
+                landed
             }
             vault::Disposition::RestoreOver { profile } => {
-                let dest = profile_path(&app_handle, profile)?;
-
-                // FR-058/FR-061: same single-writer guarantee every other
-                // vault write requires. If this IS the currently-open
-                // profile, `state.writer_claim` already proves exclusive
-                // access — acquiring a second claim on the same path from
-                // this same process would itself report VAULT_BUSY (see
-                // `WriterClaim`'s own doc comment on same-process
-                // handle-vs-handle conflict). Otherwise, acquire-and-drop a
-                // claim to prove no OTHER instance holds it before writing.
-                let active = state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE")?.clone();
-                let is_currently_open = active.as_deref() == Some(profile.as_str());
-                let _claim = if is_currently_open {
-                    None
-                } else {
-                    Some(vault::WriterClaim::acquire(&dest).map_err(|o| match o {
-                        vault::Outcome::VaultBusy => format!("[VAULT] VAULT_BUSY: '{}' is already open in another running copy of SSHClientX.", profile),
-                        other => other.to_string(),
-                    })?)
-                };
-
-                if dest.exists() {
-                    vault::rotate_into_history(&dest)?;
-                }
-                let tmp = dest.with_extension("sshclientx.tmp");
-                fs::write(&tmp, &staged_bytes).map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED: {}", e))?;
-                fs::rename(&tmp, &dest).map_err(|e| format!("[FILE] IMPORT_RENAME_FAILED: {}", e))?;
-
-                // If the profile being restored over is the currently open
-                // one, the cached generation in `state` is now stale —
-                // refresh it so the next save advances from the imported
-                // file's revision, not the pre-import one.
-                if is_currently_open {
-                    *state.generation.lock().map_err(|_| "[STATE] LOCK_FAILED_GENERATION")? = Some(decision.sealed.generation);
-                }
+                create_new_profile_file(&dir, &format!("{} [IMPORT]", profile), true, &staged_bytes)?
             }
-            vault::Disposition::NoOp => {
-                // Nothing to write — importing the same file twice is a
-                // deliberate no-op, not an error.
-            }
-        }
+            vault::Disposition::NoOp { profile } => profile.clone(),
+        };
 
         staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?.remove(&staging_id);
         let _ = fs::remove_file(&staged_path);
-        Ok(())
+        Ok(landed_name)
     }
+}
+
+/// Write `staged_bytes` as a brand-new profile file named `base_name` — or,
+/// when `auto_suffix` is set, the first name starting from `base_name` that
+/// doesn't already exist ("X 2", "X 3", …). Used both for a genuinely new
+/// key (fails outright on a collision — that name was hand-picked by the
+/// user) and for a key that already belongs to a profile on this device,
+/// which always lands as a new copy rather than overwriting that profile.
+fn create_new_profile_file(
+    dir: &Path,
+    base_name: &str,
+    auto_suffix: bool,
+    staged_bytes: &[u8],
+) -> Result<String, String> {
+    fs::create_dir_all(dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
+    let mut candidate = normalize_profile_name(base_name)?;
+    // ponytail: bounded rather than open-ended — an unbroken run of 200
+    // copies of the same profile isn't a real scenario this needs to
+    // survive; raise the cap (or switch to a random suffix) if it ever is.
+    for suffix_n in 2..=200 {
+        let dest = resolve_profile_path(dir, &candidate);
+        // FR-058/FR-061: claim the sidecar BEFORE checking existence —
+        // closes the TOCTOU window where two instances importing the same
+        // new name at once could otherwise both pass the `exists()` check
+        // and race to create/overwrite it.
+        let claim = vault::WriterClaim::acquire(&dest).map_err(|o| match o {
+            vault::Outcome::VaultBusy => format!("[VAULT] VAULT_BUSY: '{}' is already being imported by another running copy of SSHClientX.", candidate),
+            other => other.to_string(),
+        })?;
+        if dest.exists() {
+            drop(claim);
+            if !auto_suffix {
+                return Err(format!("Profile '{}' already exists", candidate));
+            }
+            candidate = normalize_profile_name(&format!("{} {}", base_name, suffix_n))?;
+            continue;
+        }
+        // Atomic: tmp -> rename, same discipline as an ordinary save.
+        let tmp = dest.with_extension("sshclientx.tmp");
+        fs::write(&tmp, staged_bytes).map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED: {}", e))?;
+        fs::rename(&tmp, &dest).map_err(|e| format!("[FILE] IMPORT_RENAME_FAILED: {}", e))?;
+        let _ = write_profile_label(&dest, &candidate);
+        return Ok(candidate);
+    }
+    Err(format!("Too many existing copies of '{}' — remove some first.", base_name))
 }
 
 /// T101 (FR-035): discard a staged import without committing it.
@@ -10127,6 +10221,113 @@ mod tests {
         assert_eq!(read_profile_label(&vault).as_deref(), Some("Work Laptop"));
         write_profile_label(&vault, "Other Name").unwrap();
         assert_eq!(read_profile_label(&vault), None, "label must match the file stem's slug");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn test_scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sshclientx-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// FR-031/Scenario 13: an incoming file must be matched against every
+    /// profile's key, not just the one currently open — `find_profile_owning_kid`
+    /// is what makes that possible without decrypting anything (`kid` lives
+    /// in the sealed header in the clear).
+    #[test]
+    fn find_profile_owning_kid_matches_by_header_not_name() {
+        let dir = test_scratch_dir("findkid");
+
+        let alice_dek = [7u8; 32];
+        let alice_key = vault::SealKey { alg: vault::SealAlg::XChaCha20Poly1305, key: &alice_dek };
+        let alice_kid = vault::derive_kid(&alice_dek);
+        let alice_sealed = vault::SealedVaultFile::seal(&alice_key, alice_kid, 1, [0u8; vault::SENDER_ID_LEN], "test", b"payload").unwrap();
+        fs::write(dir.join("alice.sshclientx"), alice_sealed.to_bytes()).unwrap();
+
+        let bob_dek = [9u8; 32];
+        let bob_key = vault::SealKey { alg: vault::SealAlg::XChaCha20Poly1305, key: &bob_dek };
+        let bob_kid = vault::derive_kid(&bob_dek);
+        let bob_sealed = vault::SealedVaultFile::seal(&bob_key, bob_kid, 1, [0u8; vault::SENDER_ID_LEN], "test", b"payload").unwrap();
+        fs::write(dir.join("bob.sshclientx"), bob_sealed.to_bytes()).unwrap();
+
+        assert_eq!(find_profile_owning_kid(&dir, &alice_kid), Some("alice".to_string()));
+        assert_eq!(find_profile_owning_kid(&dir, &bob_kid), Some("bob".to_string()));
+        assert_eq!(find_profile_owning_kid(&dir, &[0xffu8; vault::KID_LEN]), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The core of the "export & import on the same device" fix: a key
+    /// that already belongs to a profile never overwrites it — it lands as
+    /// an auto-suffixed copy, while a hand-picked name still fails outright
+    /// on a genuine collision instead of silently landing elsewhere.
+    #[test]
+    fn create_new_profile_file_auto_suffixes_on_collision_but_not_when_disabled() {
+        let dir = test_scratch_dir("createnew");
+
+        let first = create_new_profile_file(&dir, "Backup", true, b"one").unwrap();
+        assert_eq!(first, "Backup");
+        let second = create_new_profile_file(&dir, "Backup", true, b"two").unwrap();
+        assert_eq!(second, "Backup 2", "a name collision must land on an auto-numbered copy, never overwrite");
+        let third = create_new_profile_file(&dir, "Backup", true, b"three").unwrap();
+        assert_eq!(third, "Backup 3");
+
+        assert_eq!(fs::read(resolve_profile_path(&dir, "Backup")).unwrap(), b"one");
+        assert_eq!(fs::read(resolve_profile_path(&dir, "Backup 2")).unwrap(), b"two");
+        assert_eq!(fs::read(resolve_profile_path(&dir, "Backup 3")).unwrap(), b"three");
+
+        let err = create_new_profile_file(&dir, "Backup", false, b"four").unwrap_err();
+        assert!(err.contains("already exists"), "unexpected error: {err}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Verifies a profile re-imported repeatedly: after the first copy
+    /// exists, TWO profiles share the incoming file's `kid` (the original
+    /// plus its own copy) — the match must keep resolving to the original
+    /// name so later imports suffix cleanly ("Backup [IMPORT] 2", "3", …)
+    /// instead of chaining onto whichever copy was matched
+    /// ("Backup [IMPORT] [IMPORT]").
+    #[test]
+    fn reimporting_the_same_profile_repeatedly_suffixes_off_the_original_every_time() {
+        let dir = test_scratch_dir("reimport-chain");
+
+        let dek = [3u8; 32];
+        let seal_key = vault::SealKey { alg: vault::SealAlg::XChaCha20Poly1305, key: &dek };
+        let kid = vault::derive_kid(&dek);
+        let sealed = vault::SealedVaultFile::seal(&seal_key, kid, 1, [0u8; vault::SENDER_ID_LEN], "test", b"payload").unwrap();
+        let bytes = sealed.to_bytes();
+
+        // The original profile already exists on this device.
+        fs::write(dir.join("Backup.sshclientx"), &bytes).unwrap();
+
+        // Re-import #1.
+        let owner = find_profile_owning_kid(&dir, &kid).expect("must find the original owner");
+        assert_eq!(owner, "Backup");
+        let second = create_new_profile_file(&dir, &format!("{} [IMPORT]", owner), true, &bytes).unwrap();
+        assert_eq!(second, "Backup [IMPORT]");
+
+        // Re-import #2: "Backup" and "Backup [IMPORT]" now both own this
+        // kid — the match must still land on "Backup", not "Backup [IMPORT]".
+        let owner_again = find_profile_owning_kid(&dir, &kid).expect("must still find an owner");
+        assert_eq!(owner_again, "Backup", "must prefer the original name over its own copies");
+        let third = create_new_profile_file(&dir, &format!("{} [IMPORT]", owner_again), true, &bytes).unwrap();
+        assert_eq!(third, "Backup [IMPORT] 2", "must NOT chain into \"Backup [IMPORT] [IMPORT]\"");
+
+        // Re-import #3, for good measure — three sharers of the same kid.
+        let owner_third_time = find_profile_owning_kid(&dir, &kid).expect("must still find an owner");
+        assert_eq!(owner_third_time, "Backup");
+        let fourth = create_new_profile_file(&dir, &format!("{} [IMPORT]", owner_third_time), true, &bytes).unwrap();
+        assert_eq!(fourth, "Backup [IMPORT] 3");
 
         let _ = fs::remove_dir_all(&dir);
     }

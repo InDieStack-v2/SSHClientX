@@ -1153,6 +1153,7 @@ mod container_tests {
 /// unclaimed-key store, T024+) rather than this module reaching into a
 /// database directly — `vault.rs` owns the format and the pipeline, not
 /// profile storage.
+#[derive(Clone)]
 pub enum KeyLookup {
     /// No profile or unclaimed key on this device matches this `kid`.
     Unknown,
@@ -1184,8 +1185,9 @@ pub enum Disposition {
     /// restore over that profile, naming it (FR-032a).
     RestoreOver { profile: String },
     /// Same revision, identical content — a no-op re-import, not a
-    /// conflict (spec Edge Cases: "same file imported twice").
-    NoOp,
+    /// conflict (spec Edge Cases: "same file imported twice"). Carries the
+    /// matched profile's name purely for the caller's own message.
+    NoOp { profile: String },
 }
 
 /// Which confirmation, if any, a caller must obtain before committing this
@@ -1281,7 +1283,7 @@ pub fn verify_and_import(
                     use sha2::{Digest, Sha256};
                     let incoming_hash: [u8; 32] = Sha256::digest(&plaintext).into();
                     if incoming_hash == current_content_hash {
-                        (Disposition::NoOp, ConfirmationNeeded::None)
+                        (Disposition::NoOp { profile }, ConfirmationNeeded::None)
                     } else {
                         (Disposition::RestoreOver { profile }, ConfirmationNeeded::Conflict)
                     }
@@ -1417,7 +1419,7 @@ mod verify_and_import_tests {
             true,
         )
         .expect("should succeed");
-        assert_eq!(result.disposition, Disposition::NoOp);
+        assert_eq!(result.disposition, Disposition::NoOp { profile: "carol".into() });
         assert_eq!(result.confirmation_needed, ConfirmationNeeded::None);
     }
 
