@@ -1550,10 +1550,11 @@ async fn recovery_kit_save_file(bytes: Vec<u8>) -> Result<Option<String>, String
     }
     #[cfg(not(target_os = "android"))]
     {
+        let default_name = format!("SSHClientX-recovery-kit-{}.sshclientx-kit", chrono_like_timestamp());
         let _dialog_guard = lock::DialogGuard::open();
         let chosen = rfd::FileDialog::new()
             .set_title("Save recovery kit")
-            .set_file_name("recovery.sshclientx-kit")
+            .set_file_name(&default_name)
             .add_filter("SSHClientX recovery kit", &["sshclientx-kit"])
             .save_file();
         let Some(dest) = chosen else { return Ok(None) };

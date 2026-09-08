@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Settings, Palette, RefreshCw, Pipette, List, Lock } from "lucide-react";
+import { Settings, Palette, RefreshCw, Pipette, List, Lock, KeyRound } from "lucide-react";
 
-const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
+const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenRecoveryKit }: any) => {
   // Idle-lock timeout (FR-045) — backend-persisted (a device-wide sidecar
   // file, not this component's own localStorage-backed `settings`/
   // `setSettings`), so it gets its own state and IPC round-trip rather
@@ -206,6 +206,20 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs }: any) => {
               </p>
               {idleError && <p className="text-[11px] text-rose-300">{idleError}</p>}
             </div>
+
+            {onOpenRecoveryKit && (
+              <div className="space-y-2 pt-4 border-t border-white/5">
+                <p className="text-[11px] text-zinc-500 leading-relaxed">
+                  A recovery kit lets you re-establish this vault's key on another device you control, without your vault password ever leaving this one.
+                </p>
+                <button
+                  onClick={onOpenRecoveryKit}
+                  className="px-4 h-9 bg-primary/10 border border-primary/30 text-primary rounded-xl text-xs font-bold uppercase hover:bg-primary hover:text-zinc-950 transition-all w-full flex items-center justify-center gap-2"
+                >
+                  <KeyRound size={14} /> Create Recovery Kit
+                </button>
+              </div>
+            )}
           </div>
         </section>
 

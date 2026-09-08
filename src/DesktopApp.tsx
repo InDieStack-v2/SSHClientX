@@ -1471,6 +1471,7 @@ function DesktopApp() {
                 setSettings={setAppSettings}
                 isMobile={isMobile}
                 onOpenLogs={() => setActiveView("logs")}
+                onOpenRecoveryKit={() => setRecoveryCreateOpen(true)}
               />
             )}
 
