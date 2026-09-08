@@ -10,8 +10,10 @@ interface Props {
   isOpen: boolean;
   mode: "create" | "consume";
   onClose: () => void;
-  /** Consume succeeded (T087) — offer to run the normal import flow on the same file. */
-  onImportNow?: () => void;
+  /** Consume succeeded (T087) — offer to run the normal import flow on the same
+   *  file. Passes along the vault file's bytes when already picked here, so
+   *  the caller can skip asking for it a second time. */
+  onImportNow?: (vaultBytes?: Uint8Array) => void;
 }
 
 const inputBase =
@@ -223,11 +225,13 @@ const RecoveryKitPanel = ({ isOpen, mode, onClose, onImportNow }: Props) => {
                 <CheckCircle2 size={13} className="shrink-0" /> Key established on this device.
               </div>
               <p className="text-[12px] text-zinc-400 leading-relaxed">
-                Now use Import and pick that same vault file to finish — the key alone doesn't create a profile.
+                {vaultFileBytes
+                  ? "The key alone doesn't create a profile — import that vault file to finish."
+                  : "Now use Import and pick that same vault file to finish — the key alone doesn't create a profile."}
               </p>
               <div className="flex gap-2">
                 <button
-                  onClick={() => onImportNow?.()}
+                  onClick={() => onImportNow?.(vaultFileBytes ?? undefined)}
                   className="flex-1 h-10 rounded-lg text-[13px] font-semibold bg-primary text-black"
                 >
                   Import now

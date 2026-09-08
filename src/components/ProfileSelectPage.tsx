@@ -315,12 +315,17 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   };
 
   // T106: stage-then-commit against the verified import pipeline.
-  const startImport = async () => {
+  // `vaultBytes`, when given, is a vault file already read into memory (the
+  // recovery-kit consume flow's own "vault file" pick) — skips a second
+  // native dialog for the same file.
+  const startImport = async (vaultBytes?: Uint8Array) => {
     setError(null); setInfo(null);
     setKeyPassword("");
     setBusy(true);
     try {
-      const picked = await invoke<StagedImport | null>("import_vault_pick", {});
+      const picked = await invoke<StagedImport | null>("import_vault_pick", {
+        bytes: vaultBytes ? Array.from(vaultBytes) : undefined,
+      });
       if (!picked) { setBusy(false); return; }
       setStaged(picked);
       setImportName(picked.disposition === "create_profile" ? (picked.profile || "") : "");
@@ -535,6 +540,15 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               </div>
 
               <div className="p-4 space-y-3">
+                {/* The page's own error banner renders behind this popup
+                    (fixed + z-50 covers the whole screen), so a failure
+                    while this is open — e.g. a wrong password — needs its
+                    own copy here or it's invisible. */}
+                {error && (
+                  <div className="px-3 py-2 bg-rose-500/10 border border-rose-500/20 rounded-lg text-rose-200 text-[11.5px] flex items-center gap-2">
+                    <AlertTriangle size={13} className="shrink-0" /> {error}
+                  </div>
+                )}
                 {staged.disposition === "create_profile" && (
                   <>
                     <div className="text-[11.5px] text-zinc-300 leading-snug">
@@ -659,7 +673,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               )}
               {!IS_ANDROID && (
                 <button
-                  onClick={startImport}
+                  onClick={() => startImport()}
                   disabled={busy}
                   title="Import an exported .sshclientx or .submarine file"
                   className="flex-1 h-9 rounded-lg bg-white/[0.02] border border-white/5 hover:bg-white/5 hover:border-white/10 text-zinc-400 hover:text-zinc-100 text-[12px] font-medium transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
@@ -782,7 +796,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               </button>
               {!IS_ANDROID && (
                 <button
-                  onClick={startImport}
+                  onClick={() => startImport()}
                   disabled={busy}
                   title="Import an exported .sshclientx or .submarine file"
                   className="flex-1 h-9 rounded-lg bg-white/[0.02] border border-white/5 hover:bg-white/5 hover:border-white/10 text-zinc-400 hover:text-zinc-100 text-[12px] font-medium transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
@@ -842,7 +856,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
         isOpen={recoveryOpen}
         mode="consume"
         onClose={() => setRecoveryOpen(false)}
-        onImportNow={() => { setRecoveryOpen(false); startImport(); }}
+        onImportNow={(vaultBytes) => { setRecoveryOpen(false); startImport(vaultBytes); }}
       />
     </div>
   );

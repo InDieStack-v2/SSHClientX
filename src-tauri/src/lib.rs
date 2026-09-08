@@ -1997,10 +1997,11 @@ async fn import_vault_pick(
     staging: tauri::State<'_, ImportStagingState>,
     key_password: Option<String>,
     retry_staging_id: Option<String>,
+    bytes: Option<Vec<u8>>,
 ) -> Result<Option<serde_json::Value>, String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (app_handle, state, staging, key_password, retry_staging_id);
+        let _ = (app_handle, state, staging, key_password, retry_staging_id, bytes);
         return Err("Vault import is not available on Android.".into());
     }
     #[cfg(not(target_os = "android"))]
@@ -2013,17 +2014,25 @@ async fn import_vault_pick(
                 .ok_or("[VALIDATION] UNKNOWN_STAGING_ID")?;
             (id, path)
         } else {
-            let _dialog_guard = lock::DialogGuard::open();
-            let picked = rfd::FileDialog::new()
-                .set_title("Import vault")
-                .add_filter("SSHClientX vault", &[VAULT_EXT, VAULT_EXT_LEGACY])
-                .pick_file();
-            let source_path = match picked {
-                Some(p) => p,
-                None => return Ok(None),
+            // `bytes` lets a caller that already has the vault file's
+            // content in memory (e.g. the recovery-kit consume flow, which
+            // just had the user pick this same file for its own "vault
+            // file" field) skip a second native dialog for the identical
+            // file. Falls back to the normal picker when absent.
+            let source_bytes = if let Some(b) = bytes {
+                b
+            } else {
+                let _dialog_guard = lock::DialogGuard::open();
+                let picked = rfd::FileDialog::new()
+                    .set_title("Import vault")
+                    .add_filter("SSHClientX vault", &[VAULT_EXT, VAULT_EXT_LEGACY])
+                    .pick_file();
+                let source_path = match picked {
+                    Some(p) => p,
+                    None => return Ok(None),
+                };
+                fs::read(&source_path).map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?
             };
-
-            let source_bytes = fs::read(&source_path).map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?;
             let staging_id = {
                 let mut b = [0u8; 16];
                 rand::thread_rng().fill(&mut b);
