@@ -2195,14 +2195,29 @@ async fn import_vault_commit(
             vault::Disposition::CreateProfile => {
                 let base = name.ok_or("[VALIDATION] CREATE_PROFILE_REQUIRES_A_NAME")?;
                 let landed = create_new_profile_file(&dir, &base, false, &staged_bytes)?;
-                // T085: this key is no longer unclaimed — remove its
-                // unclaimed-state sidecar now that a profile owns it. The
-                // keystore device-factor entry stays (it's what the new
-                // profile's future unlocks will read); only the unclaimed
-                // *bookkeeping* is retired.
+                // T085: this key is no longer unclaimed — move its keywrap
+                // sidecar and device-factor keystore entry off the kid-keyed
+                // "unclaimed" identifiers and onto the new profile's own
+                // name, since that's what an ordinary unlock
+                // (`setup_master_db`) reads by. Leaving them under the
+                // unclaimed id — or, worse, deleting the keywrap outright —
+                // would make this profile permanently unopenable by
+                // password the moment this command returns.
+                let landed_path = resolve_profile_path(&dir, &landed);
                 let unclaimed_sidecar = recovery::unclaimed_dir(&dir)
                     .join(format!("{}.keywrap", hex::encode(decision.sealed.kid)));
-                let _ = fs::remove_file(&unclaimed_sidecar);
+                fs::rename(&unclaimed_sidecar, vault::keywrap_path(&landed_path))
+                    .map_err(|e| format!("[FILE] CLAIM_KEYWRAP_MOVE_FAILED: {}", e))?;
+                let unclaimed_id = recovery::unclaimed_keystore_id(&decision.sealed.kid);
+                let landed_for_ks = landed.clone();
+                tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    let factor = keystore::load_device_factor(&unclaimed_id).map_err(|o| o.to_string())?;
+                    keystore::store_device_factor(&landed_for_ks, &factor).map_err(|o| o.to_string())?;
+                    let _ = keystore::delete_device_factor(&unclaimed_id);
+                    Ok(())
+                })
+                    .await
+                    .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))??;
                 landed
             }
             vault::Disposition::RestoreOver { profile } => {
