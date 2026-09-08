@@ -1767,6 +1767,48 @@ async fn unclaimed_key_discard(app_handle: tauri::AppHandle, kid_hex: String) ->
     recovery::discard_unclaimed_key(&dir, &kid_hex).map_err(|o| o.to_string())
 }
 
+/// Finishes what `recovery_kit_consume`'s single-action land step (FR-041)
+/// either wasn't asked to do or failed at (most commonly: the name
+/// collided). The key was already established either way — this just
+/// unwraps it by `kid_hex` + its own device password (exactly what
+/// `resolve_key_lookup`'s unclaimed-store branch already does for the
+/// general import flow's "needs_password" retry) and lands it, reusing
+/// `land_recovered_key`. Reachable from the locked picker (unclaimed keys
+/// are device-wide, tied to no profile — Android's only route back to a
+/// first profile after a failed single-action land) and from Settings ->
+/// Vault Security once a profile is open.
+#[tauri::command]
+async fn unclaimed_key_claim(
+    app_handle: tauri::AppHandle,
+    kid_hex: String,
+    key_password: String,
+    vault_file_bytes: Vec<u8>,
+    name: String,
+) -> Result<String, String> {
+    let result = unclaimed_key_claim_inner(app_handle.clone(), kid_hex, key_password, vault_file_bytes, name).await;
+    vault::record_outcome(&app_handle, result)
+}
+
+async fn unclaimed_key_claim_inner(
+    app_handle: tauri::AppHandle,
+    kid_hex: String,
+    key_password: String,
+    vault_file_bytes: Vec<u8>,
+    name: String,
+) -> Result<String, String> {
+    let dir = profiles_dir(&app_handle)?;
+    let kid_bytes = hex::decode(&kid_hex).map_err(|_| "[VALIDATION] BAD_KID_HEX".to_string())?;
+    let kid: [u8; vault::KID_LEN] = kid_bytes.try_into().map_err(|_| "[VALIDATION] BAD_KID_HEX".to_string())?;
+
+    let device_factor = keystore::load_device_factor(&recovery::unclaimed_keystore_id(&kid)).map_err(|o| o.to_string())?;
+    let keywrap_path = recovery::unclaimed_dir(&dir).join(format!("{}.keywrap", kid_hex));
+    let keywrap_bytes = fs::read(&keywrap_path).map_err(|e| format!("[FILE] UNCLAIMED_KEYWRAP_READ_FAILED: {}", e))?;
+    let keywrap = vault::KeyWrapFile::parse(&keywrap_bytes).map_err(|o| o.to_string())?;
+    let dek = keywrap.unwrap_dek(&device_factor, &key_password).map_err(|o| o.to_string())?;
+
+    land_recovered_key(&dir, &vault_file_bytes, &dek, kid, &name).await
+}
+
 /// Copy a profile's encrypted file to a user-chosen location so it can be
 /// backed up or moved between machines. The file is already encrypted at
 /// rest — we just copy bytes; we never decrypt or re-encrypt.
@@ -10245,7 +10287,7 @@ pub fn run() {
             vault_unlock_quick_cold, profile_quick_unlock_available,
             idle_timeout_get, idle_timeout_set,
             recovery_kit_create, recovery_kit_save_file, recovery_kit_consume, pick_and_read_file, read_local_file_bytes,
-            unclaimed_keys_list, unclaimed_key_discard,
+            unclaimed_keys_list, unclaimed_key_discard, unclaimed_key_claim,
             export_profile, import_vault_pick, import_vault_commit, import_vault_discard,
             add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_jump_host, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
             get_credentials, generate_ssh_key,

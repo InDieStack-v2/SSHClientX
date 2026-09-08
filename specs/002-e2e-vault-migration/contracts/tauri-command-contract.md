@@ -157,10 +157,32 @@ picking a different name silently); omitted when landing wasn't attempted (`name
 supplied — desktop's own call site never passes one, so its established-only behavior is
 unchanged). The key is still established either way even if landing then fails or was
 never attempted — a caller can always retry against it later via the general import flow,
-or discard it via `unclaimed_keys_list`/`unclaimed_key_discard` below.
+or claim/discard it via `unclaimed_key_claim`/`unclaimed_keys_list`/`unclaimed_key_discard`
+below.
 
 Errors: `KIT_MALFORMED`, `KIT_WRONG_PASSPHRASE`, `KIT_KID_MISMATCH`, `VAULT_NO_KEYSTORE`,
 `VAULT_KEYSTORE_DENIED`, plus the full `BOX_*` set when landing was attempted and failed.
+
+### `unclaimed_key_claim(kid_hex, key_password, vault_file, name) -> String`
+
+Finishes claiming an already-established unclaimed key outside the original
+`recovery_kit_consume` call — the retry path when a single-action land either wasn't
+attempted (desktop's own `recovery_kit_consume` call never passes `name`, so this is
+always its route to actually landing a key) or failed (most commonly Android: the name
+collided). `key_password` is the device password chosen when the key was established
+(the same "unclaimed key's own password" `resolve_key_lookup`'s unclaimed-store branch
+already unwraps with for the general import flow's `needs_password` retry). Runs the same
+`verify_and_import` pipeline as everything else (FR-029) and the same claim step as
+`recovery_kit_consume`'s single-action land, sharing its implementation
+(`land_recovered_key`). Returns the landed profile's name (equal to `name` — never
+auto-suffixed).
+
+Reachable from the locked picker screen (unclaimed keys are device-wide, tied to no
+profile — the one screen guaranteed reachable regardless of platform or whether any
+profile exists yet) and from Settings → Vault Security once one does.
+
+Errors: the full `BOX_*` set, `VAULT_AUTH` (wrong `key_password`), `VAULT_UNKNOWN_KID`
+(no unclaimed key for `kid_hex` on this device).
 
 ### `unclaimed_keys_list() -> Vec<String>` · `unclaimed_key_discard(kid_hex) -> ()`
 
@@ -169,8 +191,8 @@ leaves a key owning nothing — visible and disposable rather than invisible clu
 Edge Cases), instead of accumulating unnoticed. `unclaimed_keys_list` returns each such
 key's `kid`, hex-encoded (plain strings, not a richer `UnclaimedKey` type — there's nothing
 else about an unclaimed key worth surfacing yet); `unclaimed_key_discard` removes one's
-key-wrap sidecar and keystore device-factor entry for good. Surfaced in Settings → Vault
-Security.
+key-wrap sidecar and keystore device-factor entry for good. Surfaced on the locked picker
+and in Settings → Vault Security.
 
 ---
 

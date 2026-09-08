@@ -171,7 +171,20 @@ const RecoveryKitPanel = ({ isOpen, mode, onClose, onImportNow, onProfileLanded 
       setLandedProfile(result.profile ?? null);
       setConsumed(true);
     } catch (e) {
-      setError(describeVaultError(e).message);
+      const info = describeVaultError(e);
+      // Consume runs kit-derivation, then establish, then (only here)
+      // landing, in that order — a `KIT_*` or `VAULT_*` code means it
+      // failed before or during establish, so the key was never actually
+      // established. Anything else (a `BOX_*` verification code, or a
+      // bare message like "Profile 'X' already exists") can only have
+      // come from the landing step, meaning establish already succeeded —
+      // the key exists even though this call still failed overall.
+      const establishFailed = info.code !== null && (info.code.startsWith("KIT_") || info.code.startsWith("VAULT_"));
+      setError(
+        needsNameNow && !establishFailed
+          ? `${info.message} The key itself was still established — find it back on the sign-in screen under "Recovered keys" to try a different name.`
+          : info.message,
+      );
     } finally {
       setBusy(false);
     }

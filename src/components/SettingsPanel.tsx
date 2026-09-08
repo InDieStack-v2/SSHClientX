@@ -1,15 +1,20 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Settings, Palette, RefreshCw, Pipette, List, Lock, KeyRound, Trash2 } from "lucide-react";
+import ClaimUnclaimedKeyPanel from "./ClaimUnclaimedKeyPanel";
 
 const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenRecoveryKit }: any) => {
   // Recovery-kit edge case: a kit consumed but never matched to a vault
   // file leaves an unclaimed key sitting in the secure store, owning
   // nothing — otherwise invisible and permanent. Device-wide, not tied to
   // the profile that happens to be open right now, so it's loaded
-  // independently of everything else here.
+  // independently of everything else here. The picker screen carries the
+  // same list (reachable before any profile is open, which this panel
+  // isn't) — this copy is for a device that already has one, doing later
+  // housekeeping without signing out.
   const [unclaimedKeys, setUnclaimedKeys] = useState<string[]>([]);
   const [discardingKid, setDiscardingKid] = useState<string | null>(null);
+  const [claimingKid, setClaimingKid] = useState<string | null>(null);
 
   const reloadUnclaimedKeys = () => {
     invoke<string[]>("unclaimed_keys_list").then(setUnclaimedKeys).catch(() => {});
@@ -263,14 +268,22 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenRecoveryKit }:
                       <span className="text-[11px] font-mono text-zinc-400 truncate" title={kidHex}>
                         {kidHex.slice(0, 16)}…
                       </span>
-                      <button
-                        onClick={() => discardUnclaimedKey(kidHex)}
-                        disabled={discardingKid === kidHex}
-                        title="Discard this unclaimed key"
-                        className="h-6 px-2 rounded-md text-[11px] font-medium text-rose-300/90 bg-rose-500/5 border border-rose-500/15 hover:bg-rose-500/15 hover:text-rose-200 disabled:opacity-40 flex items-center gap-1 shrink-0"
-                      >
-                        <Trash2 size={11} /> Discard
-                      </button>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          onClick={() => setClaimingKid(kidHex)}
+                          className="h-6 px-2 rounded-md text-[11px] font-medium text-primary bg-primary/10 border border-primary/25 hover:bg-primary/20"
+                        >
+                          Finish
+                        </button>
+                        <button
+                          onClick={() => discardUnclaimedKey(kidHex)}
+                          disabled={discardingKid === kidHex}
+                          title="Discard this unclaimed key"
+                          className="h-6 px-2 rounded-md text-[11px] font-medium text-rose-300/90 bg-rose-500/5 border border-rose-500/15 hover:bg-rose-500/15 hover:text-rose-200 disabled:opacity-40 flex items-center gap-1"
+                        >
+                          <Trash2 size={11} /> Discard
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -326,6 +339,17 @@ const SettingsPanel = ({ settings, setSettings, onOpenLogs, onOpenRecoveryKit }:
           </div>
         </section>
       </div>
+
+      <ClaimUnclaimedKeyPanel
+        isOpen={claimingKid !== null}
+        kidHex={claimingKid}
+        onClose={() => setClaimingKid(null)}
+        onClaimed={(name) => {
+          setClaimingKid(null);
+          setUnclaimedKeys((prev) => prev.filter((k) => k !== claimingKid));
+          window.alert(`Profile "${name}" is ready — sign out and sign back in to open it.`);
+        }}
+      />
     </div>
   );
 };

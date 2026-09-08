@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import AboutPanel from "./AboutPanel";
 import RecoveryKitPanel from "./RecoveryKitPanel";
+import ClaimUnclaimedKeyPanel from "./ClaimUnclaimedKeyPanel";
 import logoUrl from "../assets/logo.png";
 import { IS_ANDROID } from "../util/platform";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
@@ -102,6 +103,34 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   // here. The post-migration "create a kit now?" offer (T090) lives in
   // DesktopApp instead, where a profile really is open by the time it fires.
   const [recoveryOpen, setRecoveryOpen] = useState(false);
+
+  // A kit consumed but never landed (or landed and abandoned before a name
+  // was picked) leaves an unclaimed key here — device-wide, tied to no
+  // profile, so this is the one screen guaranteed reachable to finish or
+  // discard it: Android's single-action land (FR-041) can fail with no
+  // profile yet open to reach Settings' own copy of this same list from.
+  const [unclaimedKeys, setUnclaimedKeys] = useState<string[]>([]);
+  const [claimingKid, setClaimingKid] = useState<string | null>(null);
+  const reloadUnclaimedKeys = () => {
+    invoke<string[]>("unclaimed_keys_list").then(setUnclaimedKeys).catch(() => {});
+  };
+  useEffect(() => { reloadUnclaimedKeys(); }, []);
+
+  const discardUnclaimedKey = async (kidHex: string) => {
+    const ok = await confirm({
+      title: "Discard recovered key",
+      message: "If you haven't imported its vault file yet, this can't be undone.",
+      destructive: true,
+      okLabel: "Discard",
+    });
+    if (!ok) return;
+    try {
+      await invoke("unclaimed_key_discard", { kidHex });
+      setUnclaimedKeys((prev) => prev.filter((k) => k !== kidHex));
+    } catch (e) {
+      setError(describeVaultError(e).message);
+    }
+  };
 
   const [aboutOpen, setAboutOpen] = useState(false);
   const [cloudSyncFolder, setCloudSyncFolder] = useState<string | null>(null);
@@ -816,6 +845,43 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
           </div>
         )}
 
+        {/* A kit consumed but not yet matched to a profile — always shown
+            here regardless of screen state, since this is the one place
+            guaranteed reachable to finish or discard it (spec Edge Cases:
+            "must not accumulate invisibly"). */}
+        {unclaimedKeys.length > 0 && (
+          <div className="mt-3 space-y-1.5">
+            <span className="text-[10px] font-bold uppercase tracking-[0.18em] text-zinc-500 px-0.5">
+              {unclaimedKeys.length === 1 ? "Recovered key" : "Recovered keys"} not yet matched to a profile
+            </span>
+            {unclaimedKeys.map((kidHex) => (
+              <div
+                key={kidHex}
+                className="flex items-center justify-between gap-2 h-10 px-3 bg-white/[0.02] border border-white/5 rounded-lg"
+              >
+                <span className="text-[11px] font-mono text-zinc-400 truncate" title={kidHex}>
+                  {kidHex.slice(0, 16)}…
+                </span>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    onClick={() => setClaimingKid(kidHex)}
+                    className="h-7 px-2 rounded-md text-[11px] font-medium text-primary bg-primary/10 border border-primary/25 hover:bg-primary/20"
+                  >
+                    Finish
+                  </button>
+                  <button
+                    onClick={() => discardUnclaimedKey(kidHex)}
+                    title="Discard this unclaimed key"
+                    className="h-7 px-2 rounded-md text-[11px] font-medium text-rose-300/90 bg-rose-500/5 border border-rose-500/15 hover:bg-rose-500/15 hover:text-rose-200 flex items-center gap-1"
+                  >
+                    <Trash2 size={11} /> Discard
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
         {/* About + Donate — a matched pair of pills, with a live "new version"
             notice underneath when one is available. */}
         <div className="mt-4 flex flex-col items-center gap-2.5">
@@ -862,6 +928,19 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
         onProfileLanded={async (name) => {
           setInfo(`Profile "${name}" is ready — sign in below.`);
           await reload();
+          reloadUnclaimedKeys();
+          setSelected(name);
+        }}
+      />
+      <ClaimUnclaimedKeyPanel
+        isOpen={claimingKid !== null}
+        kidHex={claimingKid}
+        onClose={() => setClaimingKid(null)}
+        onClaimed={async (name) => {
+          setClaimingKid(null);
+          setInfo(`Profile "${name}" is ready — sign in below.`);
+          await reload();
+          reloadUnclaimedKeys();
           setSelected(name);
         }}
       />
