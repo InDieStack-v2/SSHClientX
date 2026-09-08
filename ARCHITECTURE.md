@@ -224,6 +224,8 @@ plaintext (SQLite serialize) → zstd compress → XChaCha20-Poly1305 seal → w
   sidecar next to the vault file. Neither the keystore value nor the
   password alone reconstructs the DEK — moving just the vault *file* to
   another device is not enough to open it there (see "Recovery kit" below).
+  Full mechanism, including the recovery-kit crypto and the import/claiming
+  flow, is in [`docs/vault-security.md`](docs/vault-security.md).
 - Sealed container magic `SSHCLTX1` (`vault.rs::SealedVaultFile`); on-disk
   extension `.sshclientx`. The legacy single-password format (magic `OMNV`,
   `.submarine`/`.sshclientx`, `Argon2id(password)` directly as the AES-256-GCM
@@ -327,6 +329,8 @@ Android — those get manual smoke-tested via `npm run tauri dev` /
 ## Where to look for more detail
 
 - `AGENTS.md` — conventions, dev commands, compat-freeze list.
+- `docs/vault-security.md` — full vault security mechanism: two-of-two
+  unlock, lock lifecycle, recovery kits, import/claiming flow.
 - `.specify/memory/constitution.md` — the five non-negotiable principles
   this architecture is constrained by.
 - `specs/001-local-only-mode/` — why accounts/cloud-sync/sharing were
