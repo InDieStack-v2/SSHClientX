@@ -89,6 +89,12 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   // whichever specific key this file matched, re-sent to both the pick
   // retry and the eventual commit (T102).
   const [keyPassword, setKeyPassword] = useState("");
+  // Explicit acknowledgement for a "restore_over" staged import whose
+  // confirmation_needed is "older" or "conflict" (contract §2, FR-033) —
+  // committing without it must refuse with the same BOX_OLDER/BOX_CONFLICT
+  // code again, so the checkbox gates the button rather than the button
+  // itself carrying the confirmation.
+  const [riskAcked, setRiskAcked] = useState(false);
 
   // T073: set only on a VAULT_ROLLBACK-coded unlock failure. No race with
   // unmounting (unlike migration-notice, this is a synchronous catch on
@@ -321,6 +327,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   const startImport = async (vaultBytes?: Uint8Array) => {
     setError(null); setInfo(null);
     setKeyPassword("");
+    setRiskAcked(false);
     setBusy(true);
     try {
       const picked = await invoke<StagedImport | null>("import_vault_pick", {
@@ -358,6 +365,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
       if (resumed) {
         setStaged(resumed);
         setImportName(resumed.disposition === "create_profile" ? (resumed.profile || "") : "");
+        setRiskAcked(false);
       }
     } catch (e) {
       // Staged file stays put on a wrong password — same field, try again.
@@ -397,20 +405,28 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
       setError("Pick a name for the imported profile.");
       return;
     }
+    if (staged.confirmation_needed !== "none" && !riskAcked) {
+      setError("Check the box above to confirm before importing.");
+      return;
+    }
     setBusy(true); setError(null);
     try {
-      // FR-031/scope: a key already owned by a profile on this device is
-      // never restored over — the backend always lands it as a new,
-      // separately-named copy (auto-suffixed on a name collision) and
-      // reports back whichever name it actually used.
+      // FR-032a/FR-032b: a key already owned by a profile on this device is
+      // restored directly over that profile's own file (never a separate
+      // copy). `confirmOlder`/`resolveConflict` are required — and the
+      // backend refuses again with the same code without them — whenever
+      // `confirmation_needed` isn't "none" (contract §2, FR-033).
       const landed = await invoke<string>("import_vault_commit", {
         stagingId: staged.staging_id,
         name: staged.disposition === "create_profile" ? importName.trim() : undefined,
         keyPassword: keyPassword || undefined,
+        confirmOlder: staged.confirmation_needed === "older" ? true : undefined,
+        resolveConflict: staged.confirmation_needed === "conflict" ? true : undefined,
       });
       const wasNoOp = staged.disposition === "no_op";
       setStaged(null);
       setKeyPassword("");
+      setRiskAcked(false);
       setInfo(wasNoOp ? "Already up to date — nothing imported." : `Imported as "${landed}".`);
       await reload();
       setSelected(landed);
@@ -592,6 +608,33 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
                     history) — no new profile is created.
                   </div>
                 )}
+                {/* FR-033: BOX_OLDER/BOX_CONFLICT — a restore-over that
+                    would replace something newer or genuinely different
+                    needs an explicit, separate acknowledgement, not just
+                    the ordinary "Import" click. */}
+                {staged.confirmation_needed !== "none" && (
+                  <label className="flex items-start gap-2 px-3 py-2 bg-amber-500/10 border border-amber-500/25 rounded-lg text-amber-200 text-[11.5px] leading-snug cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={riskAcked}
+                      onChange={(e) => setRiskAcked(e.target.checked)}
+                      className="mt-0.5 shrink-0"
+                    />
+                    {staged.confirmation_needed === "older" ? (
+                      <span>
+                        This file (revision {staged.incoming_revision}) is <strong>older</strong> than what's already on
+                        this device. Importing it anyway rolls "{staged.profile}" back to it — the current version is
+                        kept in history, but stops being what opens.
+                      </span>
+                    ) : (
+                      <span>
+                        This file is the same revision as "{staged.profile}" but its content is{" "}
+                        <strong>different</strong> — a real conflict. Importing it anyway replaces the current version
+                        (kept in history).
+                      </span>
+                    )}
+                  </label>
+                )}
                 {staged.disposition === "no_op" && (
                   <div className="text-[11.5px] text-zinc-300 leading-snug">
                     This file matches <span className="font-semibold">"{staged.profile}"</span> exactly — nothing to import.
@@ -603,7 +646,8 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
                     disabled={
                       busy ||
                       (staged.disposition === "create_profile" && !importName.trim()) ||
-                      (staged.disposition === "needs_password" && !keyPassword)
+                      (staged.disposition === "needs_password" && !keyPassword) ||
+                      (staged.confirmation_needed !== "none" && !riskAcked)
                     }
                     className="flex-1 h-9 rounded-lg text-[12.5px] font-semibold bg-primary text-black disabled:opacity-50"
                   >

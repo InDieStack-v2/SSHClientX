@@ -2159,10 +2159,12 @@ async fn import_vault_commit(
     staging_id: String,
     name: Option<String>,
     key_password: Option<String>,
+    confirm_older: Option<bool>,
+    resolve_conflict: Option<bool>,
 ) -> Result<String, String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (app_handle, state, staging, staging_id, name, key_password);
+        let _ = (app_handle, state, staging, staging_id, name, key_password, confirm_older, resolve_conflict);
         return Err("Vault import is not available on Android.".into());
     }
     #[cfg(not(target_os = "android"))]
@@ -2192,6 +2194,20 @@ async fn import_vault_commit(
                 vault::record_diagnostic(&app_handle, &vault::DiagnosticEntry::new(o.code()));
                 o.to_string()
             })?;
+
+        // contracts/tauri-command-contract.md §2 (FR-033): a commit without
+        // the matching confirmation must refuse with the same code again,
+        // never proceed. `import_vault_pick` already reported this via
+        // `confirmation_needed`; re-derived here too rather than trusted
+        // from that earlier call, same reasoning as re-deriving `decision`
+        // itself just above.
+        match decision.confirmation_needed {
+            vault::ConfirmationNeeded::None => {}
+            vault::ConfirmationNeeded::Older if confirm_older == Some(true) => {}
+            vault::ConfirmationNeeded::Older => return Err(vault::Outcome::BoxOlder.to_string()),
+            vault::ConfirmationNeeded::Conflict if resolve_conflict == Some(true) => {}
+            vault::ConfirmationNeeded::Conflict => return Err(vault::Outcome::BoxConflict.to_string()),
+        }
 
         // FR-032a/FR-032b: a key already owned by a profile on this device
         // is restored directly over that profile's own file — never landed
