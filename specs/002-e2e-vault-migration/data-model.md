@@ -251,8 +251,12 @@ Not persisted — process state. Governs whether vault content is reachable.
 
 `locked_soft` is reached by a focus-loss or backgrounded lock and may retain a
 platform-authentication-gated *reference* held by the OS secure store — never the key itself
-(FR-043b). `locked_hard` is reached by idle timeout, OS screen lock or sleep, explicit lock,
-or app exit, and releases that reference too (FR-043a).
+(FR-043b). `locked_hard` is reached by idle timeout, OS screen lock or sleep, or explicit
+lock, and releases that reference too (FR-043a). The app exiting does **not** release it —
+a restarted process starts at `unlocked` with no profile open (this state machine has not
+even begun), but the reference itself survives in the OS secure store, and the
+profile-selection screen may use it for a quick re-unlock of that profile (FR-054, FR-054a)
+without going through this table at all.
 
 **Transitions**:
 

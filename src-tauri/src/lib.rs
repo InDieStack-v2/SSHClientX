@@ -126,20 +126,98 @@ fn is_vault_extension(ext: Option<&std::ffi::OsStr>) -> bool {
     matches!(ext.and_then(|e| e.to_str()), Some(VAULT_EXT) | Some(VAULT_EXT_LEGACY))
 }
 
-fn vault_file(dir: &Path, name: &str, ext: &str) -> PathBuf {
-    dir.join(format!("{name}.{ext}"))
+fn vault_file(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+    dir.join(format!("{stem}.{ext}"))
 }
 
-/// Prefer an existing `.sshclientx` file, else a leftover `.submarine`,
-/// else the path a newly created profile will be written to.
+/// ASCII filename stem for a profile display name.
+/// "Work Laptop" → "work-laptop". Existing exact-name files (e.g. `my_profile`)
+/// still win in `resolve_profile_path` so we don't rename vaults on disk.
+fn slugify_profile_name(name: &str) -> String {
+    let mut slug = String::new();
+    let mut dash = false;
+    for c in name.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+            dash = false;
+        } else if !slug.is_empty() && !dash {
+            slug.push('-');
+            dash = true;
+        }
+    }
+    if slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
+fn is_windows_reserved_stem(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.chars().count() == 4
+            && upper.chars().last().is_some_and(|c| c.is_ascii_digit()))
+}
+
+/// Trim ends, then validate. Callers that persist a name MUST use this so
+/// leading/trailing spaces never become part of the identity or the file.
+fn normalize_profile_name(name: &str) -> Result<String, String> {
+    let n = name.trim();
+    validate_profile_name(n)?;
+    Ok(n.to_string())
+}
+
+fn profile_label_path(vault_path: &Path) -> PathBuf {
+    let stem = vault_path.file_stem().unwrap_or_default();
+    let mut name = stem.to_os_string();
+    name.push(".label");
+    vault_path.with_file_name(name)
+}
+
+fn write_profile_label(vault_path: &Path, display: &str) -> Result<(), String> {
+    fs::write(profile_label_path(vault_path), display.trim().as_bytes())
+        .map_err(|e| format!("[FILE] LABEL_WRITE_FAILED: {}", e))
+}
+
+/// Display name sidecar. Ignored unless `slugify(label) == file stem`, so a
+/// stray file cannot attach another profile's name to this vault.
+fn read_profile_label(vault_path: &Path) -> Option<String> {
+    let text = fs::read_to_string(profile_label_path(vault_path)).ok()?;
+    let n = text.trim();
+    if n.is_empty() {
+        return None;
+    }
+    let stem = vault_path.file_stem()?.to_str()?;
+    if slugify_profile_name(n) != stem {
+        return None;
+    }
+    Some(n.to_string())
+}
+
+/// Prefer an existing exact-name `.sshclientx` / leftover `.submarine`
+/// (legacy stems like `my_profile`), else the slugified modern path a
+/// newly created profile is written to.
 fn resolve_profile_path(dir: &Path, name: &str) -> PathBuf {
-    let modern = vault_file(dir, name, VAULT_EXT);
+    let trimmed = name.trim();
+    let modern = vault_file(dir, trimmed, VAULT_EXT);
     if modern.exists() {
         return modern;
     }
-    let legacy = vault_file(dir, name, VAULT_EXT_LEGACY);
+    let legacy = vault_file(dir, trimmed, VAULT_EXT_LEGACY);
     if legacy.exists() {
         return legacy;
+    }
+    let slug = slugify_profile_name(trimmed);
+    if !slug.is_empty() && slug != trimmed {
+        let slug_modern = vault_file(dir, &slug, VAULT_EXT);
+        if slug_modern.exists() {
+            return slug_modern;
+        }
+        let slug_legacy = vault_file(dir, &slug, VAULT_EXT_LEGACY);
+        if slug_legacy.exists() {
+            return slug_legacy;
+        }
+        return slug_modern;
     }
     modern
 }
@@ -160,36 +238,36 @@ pub(crate) fn profiles_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Compute the on-disk path for a named profile. Caller has already
-/// validated the name with `validate_profile_name`.
+/// validated the name with `normalize_profile_name`.
 pub(crate) fn profile_path(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
     Ok(resolve_profile_path(&profiles_dir(app)?, name))
 }
 
 /// Reject names that would let a user escape the profiles dir or collide
-/// with reserved filenames on Windows. Keep the charset narrow on purpose
-/// so a profile name is always a safe filename component on every OS.
+/// with reserved filenames on Windows. Display names are free text
+/// (internal spaces, letters, punctuation) after end-trim; the vault file
+/// uses `slugify_profile_name`. Path/reserved filename characters are
+/// barred. `:` is also banned (drive marker; unclaimed-keystore namespace).
 pub(crate) fn validate_profile_name(name: &str) -> Result<(), String> {
     let n = name.trim();
     if n.is_empty() {
         return Err("Profile name cannot be empty".into());
     }
-    if n.len() > 32 {
+    if n.chars().count() > 32 {
         return Err("Profile name too long (max 32 chars)".into());
     }
-    if !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        return Err("Profile name may only contain letters, numbers, '-' and '_'".into());
+    if n == "." || n == ".." {
+        return Err("Profile name cannot be '.' or '..'".into());
     }
-    // Windows reserved device names — also weird on macOS/Linux as filename roots.
-    let upper = n.to_uppercase();
-    let reserved = ["CON", "PRN", "AUX", "NUL"];
-    // `last_byte` is safe here because we already enforced ASCII-only at
-    // the charset check above — but we still use `?`/`.map(...)` rather
-    // than `.unwrap()` so a future relaxation can never silently panic.
-    let last_ascii_digit = upper.as_bytes().last().is_some_and(|b| b.is_ascii_digit());
-    if reserved.contains(&upper.as_str())
-        || (upper.starts_with("COM") && upper.len() == 4 && last_ascii_digit)
-        || (upper.starts_with("LPT") && upper.len() == 4 && last_ascii_digit)
-    {
+    const FORBIDDEN: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+    if n.chars().any(|c| c.is_control() || FORBIDDEN.contains(&c)) {
+        return Err("Profile name cannot contain path or reserved filename characters".into());
+    }
+    let slug = slugify_profile_name(n);
+    if slug.is_empty() {
+        return Err("Profile name must contain letters or numbers".into());
+    }
+    if is_windows_reserved_stem(&slug) {
         return Err(format!("'{}' is a reserved name on Windows", n));
     }
     Ok(())
@@ -711,8 +789,12 @@ async fn list_profiles(app_handle: tauri::AppHandle) -> Result<Vec<serde_json::V
             // Hide anything that wouldn't pass our name validator — likely
             // a manually-placed file or stray artefact. We don't surface it
             // because the user has no way to act on it from the UI.
-            if validate_profile_name(stem).is_ok() && !names.iter().any(|n: &String| n == stem) {
-                names.push(stem.to_string());
+            if validate_profile_name(stem).is_err() {
+                continue;
+            }
+            let display = read_profile_label(&path).unwrap_or_else(|| stem.to_string());
+            if !names.iter().any(|n: &String| n == &display) {
+                names.push(display);
             }
         }
     }
@@ -793,10 +875,10 @@ async fn select_profile(
     state: tauri::State<'_, DbState>,
     name: String,
 ) -> Result<bool, String> {
-    validate_profile_name(&name)?;
+    let name = normalize_profile_name(&name)?;
     let path = profile_path(&app_handle, &name)?;
     acquire_writer_claim(&state, &path, &name)?;
-    *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name.clone());
+    *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name);
     Ok(path.exists())
 }
 
@@ -912,15 +994,23 @@ async fn close_profile(
 /// delete button on the picker screen.
 #[tauri::command]
 async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<(), String> {
-    validate_profile_name(&name)?;
+    let name = normalize_profile_name(&name)?;
     let dir = profiles_dir(&app_handle)?;
+    let slug = slugify_profile_name(&name);
     let mut last_err = None;
-    for ext in [VAULT_EXT, VAULT_EXT_LEGACY] {
-        let path = vault_file(&dir, &name, ext);
-        if path.exists() {
-            if let Err(e) = fs::remove_file(&path) {
-                last_err = Some(format!("[FILE] DELETE_PROFILE_FAILED at {:?}: {}", path, e));
+    let mut stems: Vec<&str> = vec![&name];
+    if slug != name {
+        stems.push(&slug);
+    }
+    for stem in stems {
+        for ext in [VAULT_EXT, VAULT_EXT_LEGACY] {
+            let path = vault_file(&dir, stem, ext);
+            if path.exists() {
+                if let Err(e) = fs::remove_file(&path) {
+                    last_err = Some(format!("[FILE] DELETE_PROFILE_FAILED at {:?}: {}", path, e));
+                }
             }
+            let _ = fs::remove_file(profile_label_path(&path));
         }
     }
     if last_err.is_none() {
@@ -953,12 +1043,15 @@ async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<()
 /// acknowledged twice.
 #[tauri::command]
 async fn migration_notice_ack(app_handle: tauri::AppHandle, name: String) -> Result<(), String> {
-    validate_profile_name(&name)?;
+    let name = normalize_profile_name(&name)?;
     let dir = profiles_dir(&app_handle)?;
-    let legacy_path = vault_file(&dir, &name, VAULT_EXT_LEGACY);
-    if legacy_path.exists() {
-        fs::remove_file(&legacy_path)
-            .map_err(|e| format!("[FILE] LEGACY_DELETE_FAILED at {:?}: {}", legacy_path, e))?;
+    let slug = slugify_profile_name(&name);
+    for stem in [&name, &slug] {
+        let legacy_path = vault_file(&dir, stem, VAULT_EXT_LEGACY);
+        if legacy_path.exists() {
+            fs::remove_file(&legacy_path)
+                .map_err(|e| format!("[FILE] LEGACY_DELETE_FAILED at {:?}: {}", legacy_path, e))?;
+        }
     }
     Ok(())
 }
@@ -980,7 +1073,7 @@ async fn rollback_resolve(
     choice: String,
     revision: Option<u64>,
 ) -> Result<(), String> {
-    validate_profile_name(&name)?;
+    let name = normalize_profile_name(&name)?;
     let path = profile_path(&app_handle, &name)?;
     let file_bytes = fs::read(&path).map_err(|e| format!("[FILE] VAULT_READ_FAILED: {}", e))?;
     let sealed = vault::SealedVaultFile::parse(&file_bytes).map_err(|o| o.to_string())?;
@@ -1157,7 +1250,11 @@ async fn vault_unlock_full_inner(app_handle: &tauri::AppHandle, state: &DbState,
         .map_err(|_| "[STATE] LOCK_FAILED_KID")?
         .ok_or_else(|| vault::Outcome::VaultLocked.to_string())?;
 
-    let device_factor = keystore::load_device_factor(&profile_name).map_err(|o| o.to_string())?;
+    let profile_for_ks = profile_name.clone();
+    let device_factor = tokio::task::spawn_blocking(move || keystore::load_device_factor(&profile_for_ks))
+        .await
+        .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))?
+        .map_err(|o| o.to_string())?;
     let keywrap_bytes = fs::read(vault::keywrap_path(&path))
         .map_err(|e| format!("[FILE] KEYWRAP_READ_FAILED: {}", e))?;
     let keywrap = vault::KeyWrapFile::parse(&keywrap_bytes).map_err(|o| o.to_string())?;
@@ -1176,9 +1273,123 @@ async fn vault_unlock_full_inner(app_handle: &tauri::AppHandle, state: &DbState,
         return Err(vault::Outcome::VaultAuth.to_string());
     }
 
+    // FR-054a: refresh the quick-unlock cache on every full unlock, not just
+    // at focus-loss — captured before `unwrapped` moves into `state.dek`.
+    let dek_for_seed = *unwrapped;
     *state.dek.lock().map_err(|_| "[STATE] LOCK_FAILED_KEY")? = Some(unwrapped);
     *state.platform_auth_failures.lock().map_err(|_| "[STATE] LOCK_FAILED_AUTHFAIL")? = 0;
-    lock::apply_unlock(app_handle, state, lock::LockEvent::FullUnlockSucceeded)
+    lock::apply_unlock(app_handle, state, lock::LockEvent::FullUnlockSucceeded)?;
+
+    let profile_for_seed = profile_name.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        keystore::store_quick_unlock(&profile_for_seed, &dek_for_seed)
+    }).await;
+
+    Ok(())
+}
+
+/// FR-054a: is a quick re-unlock even possible for `name` right now? Lets
+/// the profile-selection screen decide whether to render the Touch ID/
+/// Windows Hello button at all, instead of popping a doomed biometric
+/// prompt for a profile that's never been fully unlocked (or whose cache
+/// was already purged by an idle timeout, OS lock/sleep, or explicit lock).
+/// Read-only — touches no `DbState`, since no profile need be selected yet.
+#[tauri::command]
+async fn profile_quick_unlock_available(app_handle: tauri::AppHandle, name: String) -> Result<bool, String> {
+    let name = normalize_profile_name(&name)?;
+    let path = profile_path(&app_handle, &name)?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let file_bytes = fs::read(&path).map_err(|e| format!("[FILE] VAULT_READ_FAILED: {}", e))?;
+    if !matches!(vault::discriminate_format(&file_bytes), vault::DiscriminatedFormat::Sealed) {
+        return Ok(false);
+    }
+    let probe = tokio::task::spawn_blocking(move || {
+        let mut result = keystore::load_quick_unlock(&name);
+        if let Ok(ref mut bytes) = result {
+            bytes.zeroize();
+        }
+        result.is_ok()
+    })
+        .await
+        .unwrap_or(false);
+    Ok(probe)
+}
+
+/// FR-054a: quick re-unlock from the profile-selection screen — no password,
+/// no profile previously open this process. The frontend calls
+/// `select_profile(name)` first, exactly like the password path
+/// (`unlockSelected` in `ProfileSelectPage.tsx`), so writer-claim
+/// acquisition stays exactly where it already is; this command supplies the
+/// DEK from the cached `quickunlock` keystore entry instead of re-deriving
+/// it from a password.
+#[tauri::command]
+async fn vault_unlock_quick_cold(app_handle: tauri::AppHandle, state: tauri::State<'_, DbState>, name: String) -> Result<(), String> {
+    let result = vault_unlock_quick_cold_inner(&app_handle, &state, name).await;
+    vault::record_outcome(&app_handle, result)
+}
+
+async fn vault_unlock_quick_cold_inner(app_handle: &tauri::AppHandle, state: &DbState, name: String) -> Result<(), String> {
+    let name = normalize_profile_name(&name)?;
+
+    // FR-057: same consecutive-failure fallback as every other quick
+    // re-unlock, sharing the same process-wide counter.
+    let failures = *state.platform_auth_failures.lock().map_err(|_| "[STATE] LOCK_FAILED_AUTHFAIL")?;
+    if platform_auth::should_fall_back_to_password(failures) {
+        return Err(vault::Outcome::VaultAuth.to_string());
+    }
+
+    let path = profile_path(app_handle, &name)?;
+    let file_bytes = fs::read(&path).map_err(|e| format!("[FILE] VAULT_READ_FAILED: {}", e))?;
+    let sealed = vault::SealedVaultFile::parse(&file_bytes).map_err(|o| o.to_string())?;
+
+    // T042 (FR-064): same rollback check the password path runs, before any
+    // key material is touched.
+    let profile_for_rollback = name.clone();
+    let file_generation = sealed.generation;
+    tokio::task::spawn_blocking(move || vault::check_rollback(&profile_for_rollback, file_generation))
+        .await
+        .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))?
+        .map_err(|o| o.to_string())?;
+
+    match platform_auth::authenticate("unlock SSHClientX").await {
+        platform_auth::AuthOutcome::Success => {}
+        platform_auth::AuthOutcome::Failed => {
+            if let Ok(mut count) = state.platform_auth_failures.lock() {
+                *count += 1;
+            }
+            return Err(vault::Outcome::VaultAuth.to_string());
+        }
+        platform_auth::AuthOutcome::Unavailable => return Err(vault::Outcome::VaultAuth.to_string()),
+    }
+
+    let name_for_ks = name.clone();
+    let dek = tokio::task::spawn_blocking(move || keystore::load_quick_unlock(&name_for_ks))
+        .await
+        .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))?
+        .map_err(|o| o.to_string())?;
+    if vault::derive_kid(&dek) != sealed.kid {
+        return Err(vault::Outcome::VaultCorrupt.to_string());
+    }
+    let dek = Zeroizing::new(dek);
+
+    let opened = sealed
+        .open(&vault::SealKey { alg: sealed.alg, key: &dek })
+        .map_err(|o| o.to_string())?;
+    let decompressed = Zeroizing::new(vault::vault_decompress(&opened)?);
+    let sender_id = vault::load_or_create_sender_id(app_handle);
+    let kid = sealed.kid;
+    let generation = sealed.generation;
+
+    let mut conn = Connection::open_in_memory().map_err(|e| format!("[DATABASE] MEM_INIT_FAILED: {}", e))?;
+    let owned = to_sqlite_owned(&decompressed)?;
+    conn.deserialize(DatabaseName::Main, owned, false)
+        .map_err(|e| format!("[DATABASE] DESERIALIZE_FAILED: {}", e))?;
+    run_schema_migrations(&conn)?;
+
+    *state.platform_auth_failures.lock().map_err(|_| "[STATE] LOCK_FAILED_AUTHFAIL")? = 0;
+    finish_opening_vault(app_handle, state, &name, path, conn, dek, kid, generation, sender_id, false, false)
 }
 
 /// Password half of FR-055 identity confirmation — the other half,
@@ -1204,7 +1415,11 @@ async fn confirm_identity_by_password(state: &DbState, password: String) -> Resu
         .clone()
         .ok_or("[STATE] MISSING_REQUIRED_RESOURCES_FOR_SAVE")?;
 
-    let device_factor = keystore::load_device_factor(&profile_name).map_err(|o| o.to_string())?;
+    let profile_for_ks = profile_name.clone();
+    let device_factor = tokio::task::spawn_blocking(move || keystore::load_device_factor(&profile_for_ks))
+        .await
+        .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))?
+        .map_err(|o| o.to_string())?;
     let keywrap_bytes = fs::read(vault::keywrap_path(&path))
         .map_err(|e| format!("[FILE] KEYWRAP_READ_FAILED: {}", e))?;
     let keywrap = vault::KeyWrapFile::parse(&keywrap_bytes).map_err(|o| o.to_string())?;
@@ -1450,7 +1665,7 @@ async fn export_profile(
     name: String,
     password: String,
 ) -> Result<Option<String>, String> {
-    validate_profile_name(&name)?;
+    let name = normalize_profile_name(&name)?;
     let src = profile_path(&app_handle, &name)?;
     if !src.exists() {
         return Err(format!("Profile '{}' not found on disk", name));
@@ -1818,10 +2033,11 @@ async fn import_vault_commit(
 
         match &decision.disposition {
             vault::Disposition::CreateProfile => {
-                let profile_name = name.ok_or("[VALIDATION] CREATE_PROFILE_REQUIRES_A_NAME")?;
-                validate_profile_name(&profile_name)?;
+                let profile_name = normalize_profile_name(
+                    &name.ok_or("[VALIDATION] CREATE_PROFILE_REQUIRES_A_NAME")?,
+                )?;
                 fs::create_dir_all(&dir).map_err(|e| format!("[FILE] MKDIR_FAILED: {}", e))?;
-                let dest = vault_file(&dir, &profile_name, VAULT_EXT);
+                let dest = resolve_profile_path(&dir, &profile_name);
                 // FR-058/FR-061: claim the sidecar BEFORE checking existence
                 // — closes the TOCTOU window where two instances importing
                 // the same new name at once could otherwise both pass the
@@ -1839,6 +2055,7 @@ async fn import_vault_commit(
                 let tmp = dest.with_extension("sshclientx.tmp");
                 fs::write(&tmp, &staged_bytes).map_err(|e| format!("[FILE] IMPORT_WRITE_FAILED: {}", e))?;
                 fs::rename(&tmp, &dest).map_err(|e| format!("[FILE] IMPORT_RENAME_FAILED: {}", e))?;
+                let _ = write_profile_label(&dest, &profile_name);
 
                 // T085: this key is no longer unclaimed — remove its
                 // unclaimed-state sidecar now that a profile owns it. The
@@ -1928,6 +2145,26 @@ async fn setup_master_db(app_handle: tauri::AppHandle, password: String, state: 
     // command both funnel through.
     let result = setup_master_db_inner(app_handle.clone(), password, state).await;
     vault::record_outcome(&app_handle, result)
+}
+
+/// Per-connection PRAGMAs that must hold for every open vault.
+///
+/// `secure_delete`: deleted rows (e.g. a removed SSH key/credential/server)
+/// hold plaintext secrets until overwritten; without this, SQLite just
+/// marks their page free and the old private_key/passphrase/password bytes
+/// can still sit in the next `conn.serialize()` snapshot that gets
+/// encrypted to disk. DELETE/UPDATE then zero the vacated bytes instead.
+///
+/// Uses `pragma_update`, not `execute`. SQLite returns the new value for
+/// some assignment PRAGMAs (`secure_delete` always does), and rusqlite's
+/// `execute` treats that row as `ExecuteReturnedResults` — the error
+/// `create_profile` used to surface as `PRAGMA_FAILED`.
+fn apply_runtime_pragmas(conn: &Connection) -> Result<(), String> {
+    conn.pragma_update(None, "foreign_keys", true)
+        .map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
+    conn.pragma_update(None, "secure_delete", true)
+        .map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
+    Ok(())
 }
 
 /// Every schema migration a vault opened from an existing serialized
@@ -2090,7 +2327,6 @@ async fn setup_master_db_inner(
     mut password: String,
     state: tauri::State<'_, DbState>,
 ) -> Result<(), String> {
-    use tauri::Emitter;
     // The active profile must be picked before this command — the UI does
     // it from the picker screen. Refuse early instead of silently writing
     // to a default path.
@@ -2110,7 +2346,7 @@ async fn setup_master_db_inner(
     let kid: [u8; vault::KID_LEN];
     let generation: u64;
     let sender_id: [u8; vault::SENDER_ID_LEN];
-    let mut needs_resave;
+    let needs_resave;
     let mut migrated_this_unlock = false;
 
     if path.exists() {
@@ -2129,31 +2365,15 @@ async fn setup_master_db_inner(
                 // possible, before the user spends any effort on it.
                 // Resolved via a separate `rollback_resolve` call
                 // (T043) — this function does not decide for the user.
-                vault::check_rollback(&profile_name, sealed.generation).map_err(|o| o.to_string())?;
-
-                // T029/T030 (FR-003/FR-003a): no state has been mutated yet
-                // at this point, so a VAULT_NO_KEYSTORE (terminal) or
-                // VAULT_KEYSTORE_DENIED (retryable) failure here loses
-                // nothing — the user sees the distinct outcome and can
-                // retry a denied request with no cleanup needed.
-                let device_factor = keystore::load_device_factor(&profile_name).map_err(|o| {
-                    // `load_device_factor` deliberately collapses "this
-                    // profile's entry is missing" into VAULT_NO_KEYSTORE for
-                    // most callers (see its own doc comment). But reaching
-                    // HERE already means a sealed FILE exists at this path
-                    // with no matching device factor — on a machine whose
-                    // secure store otherwise works fine, that's almost
-                    // always a vault sealed for a DIFFERENT device (e.g. a
-                    // file copied in directly rather than through Import),
-                    // not "this machine has no secure store at all". A
-                    // plain re-throw would tell the user their whole
-                    // machine's keystore is broken when it isn't.
-                    if matches!(o, vault::Outcome::VaultNoKeystore) && keystore::store_available().is_ok() {
-                        vault::Outcome::VaultUnknownKid.to_string()
-                    } else {
-                        o.to_string()
-                    }
-                })?;
+                let profile_for_ks = profile_name.clone();
+                let file_generation = sealed.generation;
+                let device_factor = tokio::task::spawn_blocking(move || {
+                    vault::check_rollback(&profile_for_ks, file_generation)?;
+                    keystore::load_device_factor(&profile_for_ks)
+                })
+                    .await
+                    .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))?
+                    .map_err(|o| o.to_string())?;
                 let keywrap_bytes = fs::read(vault::keywrap_path(&path))
                     .map_err(|e| format!("[FILE] KEYWRAP_READ_FAILED: {}", e))?;
                 let keywrap = vault::KeyWrapFile::parse(&keywrap_bytes).map_err(|o| o.to_string())?;
@@ -2213,8 +2433,14 @@ async fn setup_master_db_inner(
                 // sealed file existed would risk a sealed file on disk with
                 // no way to ever unwrap it again.
                 let device_factor = vault::generate_device_factor();
-                keystore::store_device_factor(&profile_name, &device_factor)
-                    .map_err(|o| o.to_string())?;
+                {
+                    let profile_for_ks = profile_name.clone();
+                    let factor = device_factor;
+                    tokio::task::spawn_blocking(move || keystore::store_device_factor(&profile_for_ks, &factor))
+                        .await
+                        .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))?
+                        .map_err(|o| o.to_string())?;
+                }
 
                 let new_vault_path = migrate_vault_path(&path);
                 let sender_id_for_migration = vault::load_or_create_sender_id(&app_handle);
@@ -2288,8 +2514,14 @@ async fn setup_master_db_inner(
         // anything, for the same reason as the migration path above — a
         // keystore failure here must leave no half-created vault behind.
         let device_factor = vault::generate_device_factor();
-        keystore::store_device_factor(&profile_name, &device_factor)
-            .map_err(|o| o.to_string())?;
+        {
+            let profile_for_ks = profile_name.clone();
+            let factor = device_factor;
+            tokio::task::spawn_blocking(move || keystore::store_device_factor(&profile_for_ks, &factor))
+                .await
+                .map_err(|e| format!("[CRYPTO] KEYSTORE_JOIN: {}", e))?
+                .map_err(|o| o.to_string())?;
+        }
 
         let fresh_dek = vault::generate_dek();
         let fresh_kid = vault::derive_kid(&fresh_dek);
@@ -2340,20 +2572,53 @@ async fn setup_master_db_inner(
         ).map_err(|e| format!("[DATABASE] SCHEMA_CREATION_FAILED: {}", e))?;
     }
 
-    conn.execute("PRAGMA foreign_keys = ON", []).map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
-    // Deleted rows (e.g. a removed SSH key/credential/server) hold plaintext
-    // secrets until overwritten; without this, SQLite just marks their page
-    // free and the old private_key/passphrase/password bytes can still be
-    // sitting in the next `conn.serialize()` snapshot that gets encrypted to
-    // disk. secure_delete makes DELETE/UPDATE zero the vacated bytes instead.
-    conn.execute("PRAGMA secure_delete = ON", []).map_err(|e| format!("[DATABASE] PRAGMA_FAILED: {}", e))?;
+    // FR-054a: capture a raw copy before `dek` moves into `finish_opening_vault`
+    // below — seeds the quick-unlock cache so the profile-selection screen can
+    // offer Touch ID/Windows Hello next time, including after an app restart
+    // (FR-043a no longer purges this entry on exit).
+    let dek_for_quick_unlock = *dek;
+    finish_opening_vault(
+        &app_handle, &state, &profile_name, path, conn, dek, kid, generation, sender_id,
+        needs_resave, migrated_this_unlock,
+    )?;
+
+    let profile_for_seed = profile_name.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        keystore::store_quick_unlock(&profile_for_seed, &dek_for_quick_unlock)
+    }).await;
+
+    Ok(())
+}
+
+/// Shared tail of every successful vault open — sync/HLC instrumentation,
+/// `DbState` population, and the post-open resave/migration-notice —
+/// regardless of how the DEK was obtained (password unwrap, legacy
+/// migration, fresh creation, or `vault_unlock_quick_cold`'s cached
+/// quick-unlock copy). Extracted so the quick-unlock-from-cold path doesn't
+/// duplicate this plumbing.
+fn finish_opening_vault(
+    app_handle: &tauri::AppHandle,
+    state: &DbState,
+    profile_name: &str,
+    path: PathBuf,
+    conn: Connection,
+    dek: Zeroizing<[u8; 32]>,
+    kid: [u8; vault::KID_LEN],
+    generation: u64,
+    sender_id: [u8; vault::SENDER_ID_LEN],
+    mut needs_resave: bool,
+    migrated_this_unlock: bool,
+) -> Result<(), String> {
+    use tauri::Emitter;
+
+    apply_runtime_pragmas(&conn)?;
 
     // ---- Per-entity sync instrumentation (schema v6) ----
     // A per-profile Hybrid Logical Clock backs the `hlc_now()` SQL function so
     // every row mutation auto-stamps `updated_at`. Seed the clock past the
     // newest stamp already in the vault so a freshly-started process never
     // issues one that sorts before data it already holds.
-    let sync_node_id = sync_device_node_id(&app_handle);
+    let sync_node_id = sync_device_node_id(app_handle);
     let seed_ms: u64 = conn
         .query_row(
             "SELECT COALESCE(MAX(updated_at),'') FROM (
@@ -2414,6 +2679,14 @@ async fn setup_master_db_inner(
     let mut sender_guard = state.sender_id.lock().map_err(|_| "[STATE] LOCK_FAILED_SENDER")?;
     let mut path_guard = state.db_path.lock().map_err(|_| "[STATE] LOCK_FAILED_PATH")?;
     let mut hlc_guard = state.hlc.lock().map_err(|_| "[STATE] LOCK_FAILED_HLC")?;
+    // A successful open is authoritatively `unlocked`, full stop — this
+    // overrides any lock-state noise accumulated while getting here (e.g. a
+    // platform-authentication system dialog stealing window focus mid-open,
+    // which fires FocusLost and flips `Unlocked` -> `LockedSoft` even though
+    // no profile was open yet to protect). Without this, that stale
+    // `locked_soft` survives into the just-unlocked view and immediately
+    // re-prompts for platform auth a second time.
+    let mut lock_state_guard = state.lock_state.lock().map_err(|_| "[STATE] LOCK_FAILED_LOCKSTATE")?;
     *conn_guard = Some(conn);
     *dek_guard = Some(dek);
     *kid_guard = Some(kid);
@@ -2421,6 +2694,8 @@ async fn setup_master_db_inner(
     *sender_guard = Some(sender_id);
     *path_guard = Some(path.clone());
     *hlc_guard = Some(hlc_arc);
+    *lock_state_guard = lock::LockState::Unlocked;
+    drop(lock_state_guard);
     drop(hlc_guard);
     drop(path_guard);
     drop(sender_guard);
@@ -2428,9 +2703,13 @@ async fn setup_master_db_inner(
     drop(kid_guard);
     drop(dek_guard);
     drop(conn_guard);
+    let _ = app_handle.emit(
+        "vault-lock-state",
+        serde_json::json!({ "state": lock::LockState::Unlocked.as_str() }),
+    );
 
     if needs_resave {
-        save_vault_internal(&state)?;
+        save_vault_internal(state)?;
     }
 
     // T039 (FR-017): tell the frontend a migration just happened, once,
@@ -2470,7 +2749,7 @@ async fn create_profile(
     name: String,
     password: String,
 ) -> Result<(), String> {
-    validate_profile_name(&name)?;
+    let name = normalize_profile_name(&name)?;
     if password.is_empty() {
         return Err("Password cannot be empty".into());
     }
@@ -2486,7 +2765,8 @@ async fn create_profile(
     // (T048), and a concurrent `create_profile` for the same name is
     // exactly the case the claim exists to prevent.
     acquire_writer_claim(&state, &path, &name)?;
-    *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name);
+    *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name.clone());
+    write_profile_label(&path, &name)?;
     // Reuse setup_master_db's fresh-schema branch by deferring to it. Empty
     // profile starts with the same migrations the legacy path would do.
     // `setup_master_db_inner` already performs the initial save itself
@@ -9589,6 +9869,7 @@ pub fn run() {
             list_profiles, profiles_dir_path, select_profile, create_profile, delete_profile, close_profile,
             migration_notice_ack, rollback_resolve,
             vault_lock, vault_lock_state, vault_unlock_quick, vault_unlock_full,
+            vault_unlock_quick_cold, profile_quick_unlock_available,
             idle_timeout_get, idle_timeout_set,
             recovery_kit_create, recovery_kit_save_file, recovery_kit_consume, pick_and_read_file, read_local_file_bytes,
             unclaimed_keys_list, unclaimed_key_discard,
@@ -9722,6 +10003,86 @@ mod tests {
         assert_eq!(resolve_profile_path(&dir, "p"), modern);
         assert_eq!(migrate_vault_path(&legacy), modern);
         assert_eq!(migrate_vault_path(&modern), modern);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runtime_pragmas_enable_fk_and_secure_delete() {
+        // The create-profile path used `conn.execute("PRAGMA … = ON")`.
+        // `PRAGMA secure_delete = ON` always returns the new value, so
+        // rusqlite's execute() failed with ExecuteReturnedResults and
+        // aborted every new vault. The helper must both succeed and stick.
+        let conn = Connection::open_in_memory().unwrap();
+        apply_runtime_pragmas(&conn).expect("PRAGMA apply must not fail");
+        let fk: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |r| r.get(0))
+            .unwrap();
+        let sd: i64 = conn
+            .pragma_query_value(None, "secure_delete", |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk, 1, "foreign_keys must be on for the in-memory vault");
+        assert_eq!(sd, 1, "secure_delete must be on so deleted secrets are zeroed");
+    }
+
+    #[test]
+    fn slugify_profile_name_is_ascii_kebab() {
+        assert_eq!(slugify_profile_name("Work Laptop"), "work-laptop");
+        assert_eq!(slugify_profile_name("  Work Laptop  "), "work-laptop");
+        assert_eq!(slugify_profile_name("alice"), "alice");
+        assert_eq!(slugify_profile_name("prod-west_1"), "prod-west-1");
+        assert_eq!(slugify_profile_name("v1.2 (prod)"), "v1-2-prod");
+        assert_eq!(slugify_profile_name("Café Work"), "caf-work");
+        assert_eq!(slugify_profile_name("@@@"), "");
+    }
+
+    #[test]
+    fn profile_name_strips_ends_and_allows_internal_spaces() {
+        assert_eq!(normalize_profile_name("  Work Laptop  ").unwrap(), "Work Laptop");
+        for ok in ["alice", "Work Laptop", "prod-west_1", "Café Work", "v1.2 (prod)", "Tom's box"] {
+            assert!(validate_profile_name(ok).is_ok(), "should accept {:?}", ok);
+        }
+    }
+
+    #[test]
+    fn profile_name_rejects_path_reserved_and_empty_slug() {
+        for bad in [
+            "", "   ", ".", "..", "@@@", "a/b", "a\\b", "a:b", "a*b", "a?b",
+            "a\"b", "a<b", "a>b", "a|b", "with\0nul", "CON", "com1", "LPT9",
+        ] {
+            assert!(validate_profile_name(bad).is_err(), "should reject {:?}", bad);
+        }
+        assert!(validate_profile_name(&"x".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn resolve_profile_path_slugs_new_names_keeps_existing_stems() {
+        let dir = std::env::temp_dir().join(format!(
+            "sshclientx-slug-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        // New spaced name → slug file, still one component under `dir`.
+        let p = resolve_profile_path(&dir, "Work Laptop");
+        assert_eq!(p.file_name().unwrap(), "work-laptop.sshclientx");
+        assert_eq!(p.parent().unwrap(), dir.as_path());
+
+        // Existing underscore stem is not rewritten.
+        let legacy_stem = dir.join("my_profile.sshclientx");
+        fs::write(&legacy_stem, b"x").unwrap();
+        assert_eq!(resolve_profile_path(&dir, "my_profile"), legacy_stem);
+
+        // Display name round-trips through the label sidecar bound to the slug.
+        let vault = resolve_profile_path(&dir, "Work Laptop");
+        write_profile_label(&vault, "Work Laptop").unwrap();
+        assert_eq!(read_profile_label(&vault).as_deref(), Some("Work Laptop"));
+        write_profile_label(&vault, "Other Name").unwrap();
+        assert_eq!(read_profile_label(&vault), None, "label must match the file stem's slug");
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

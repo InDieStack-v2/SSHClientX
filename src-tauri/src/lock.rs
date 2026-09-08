@@ -6,6 +6,15 @@
 //! store (`keystore::store_quick_unlock`); `locked_hard` releases that too,
 //! so only a full password unlock can recover it (FR-043, FR-043a, FR-043b).
 //!
+//! That reference is deliberately NOT released on app exit — it outlives
+//! this state machine entirely (a fresh process starts here at `Unlocked`
+//! with no memory of the last one) and is what lets the profile-selection
+//! screen (`lib.rs::vault_unlock_quick_cold`, FR-054a) offer a quick
+//! re-unlock on the very next launch. `lib.rs` also seeds this entry at
+//! every full-unlock success, not only here at a soft lock, so the cache is
+//! warm the first time a profile is ever fully unlocked, not just after the
+//! first focus-loss.
+//!
 //! This module owns the state machine, idle-timeout config, and the
 //! per-platform idle/screen-lock/sleep detectors that feed it. It does NOT
 //! touch SSH sessions, tunnels, transfers, mirrors, or monitors (FR-049) —
@@ -191,12 +200,15 @@ pub async fn perform_lock(
             // signing-dependent `protected` store) — the gate is
             // `vault_unlock_quick` requiring a fresh platform-
             // authentication success before it ever reads this back.
-            let _ = crate::keystore::store_quick_unlock(name, dek);
+            let name = name.clone();
+            let dek = **dek;
+            let _ = tokio::task::spawn_blocking(move || crate::keystore::store_quick_unlock(&name, &dek)).await;
         }
         (LockState::LockedHard, Some(name), _) => {
             // FR-043a: hard lock releases the quick-unlock reference too,
             // so only a full password unlock can recover from here.
-            let _ = crate::keystore::delete_quick_unlock(name);
+            let name = name.clone();
+            let _ = tokio::task::spawn_blocking(move || crate::keystore::delete_quick_unlock(&name)).await;
         }
         _ => {}
     }

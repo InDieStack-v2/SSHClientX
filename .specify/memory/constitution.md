@@ -1,4 +1,30 @@
 <!--
+Sync Impact Report (v4.0.0)
+- Version change: 3.2.0 → 4.0.0 (MAJOR — weakens a NON-NEGOTIABLE rule)
+- Modified principles:
+  - I. Device-Bound Secrets — "neither alone suffices" governed DEK
+    *derivation* only in intent, but read as an absolute ban on any
+    biometric-only path to an already-open vault, including the
+    same-session soft-lock re-unlock FR-054 already permitted. Added an
+    explicit carve-out: a platform-authentication-gated cache of an
+    already-derived DEK may persist — including across an app restart —
+    until the next idle timeout, OS lock/sleep, or explicit lock. The
+    two-of-two unlock (`KeyWrapFile::unwrap_dek`) is unchanged; this is
+    solely about how long a successful unlock's cached result may be
+    reused before the password is required again.
+- Modified specs (not this file, but governed by it):
+  specs/002-e2e-vault-migration/spec.md FR-043a (drop "or the app exiting"
+  from what purges the quick-unlock reference), FR-053 (drop "on app
+  start" from where full unlock is mandatory), FR-054 (extend quick
+  re-unlock to the profile-selection screen across a restart), new FR-054a.
+- Added sections: none. Removed sections: none.
+- Notes: driven by adding Touch ID/Windows Hello to the profile
+  sign-in screen, not just same-session soft-lock re-entry (feature
+  002's lock lifecycle). Rationale for MAJOR rather than MINOR: this
+  narrows a rule the principle labels NON-NEGOTIABLE, which the
+  Governance section itself defines as a MAJOR-only change regardless of
+  how small the carve-out is.
+
 Sync Impact Report (v3.2.0)
 - Version change: 3.1.0 → 3.2.0 (MINOR — materially expanded guidance; no
   principle removed or redefined)
@@ -116,6 +142,14 @@ Argon2id into a KEK that protects the DEK — it is not the DEK and MUST NOT
 derive it. This is deliberately stricter than
 `docs/features/spec-00-e2e-vault.md` §3, which treats passphrase and device
 unlock as alternatives.
+
+This governs how the DEK is *derived*, not how long an already-derived DEK
+may be reused without re-deriving it. A platform-authentication-gated cache
+of an already-derived DEK, held in the OS secure store and released on the
+next idle timeout, OS lock/sleep, or explicit lock, MAY stand in for a full
+unlock — including across an app restart. Deriving the DEK itself still
+always requires both factors; this exception only shortens how often that
+derivation has to happen again.
 
 A vault password is **device-local and MUST NOT travel**. It MUST NOT be
 written into an exported vault file, a recovery kit, or any other artefact
@@ -374,4 +408,4 @@ Compliance:
 - Runtime development follows this file; do not fork a parallel "guidance"
   document that can silently diverge.
 
-**Version**: 3.2.0 | **Ratified**: 2026-09-03 | **Last Amended**: 2026-09-06
+**Version**: 4.0.0 | **Ratified**: 2026-09-03 | **Last Amended**: 2026-09-08

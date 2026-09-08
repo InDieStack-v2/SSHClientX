@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   Plus, Trash2, X, AlertTriangle, ArrowRight, Download, Upload,
   CheckCircle2, ChevronDown, RefreshCw, ArrowUpCircle, Heart, KeyRound, CloudCog,
+  Fingerprint,
 } from "lucide-react";
 import AboutPanel from "./AboutPanel";
 import RecoveryKitPanel from "./RecoveryKitPanel";
@@ -66,6 +67,16 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   const [selected, setSelected] = useState<string>("");
   const [password, setPassword] = useState("");
 
+  // FR-054a: Touch ID/Windows Hello on the profile-selection screen itself —
+  // available only when the backend already holds a cached quick-unlock
+  // reference for this profile (i.e. it's been fully unlocked at least once
+  // since that reference was last released). `forcePassword` is the same
+  // "give up on biometrics, show the password form" fallback LockScreen.tsx
+  // already uses for its own quick-unlock.
+  const [quickAvailable, setQuickAvailable] = useState(false);
+  const [forcePassword, setForcePassword] = useState(false);
+  const [quickBusy, setQuickBusy] = useState(false);
+
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -108,7 +119,11 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     try {
       const list = await invoke<ProfileSummary[]>("list_profiles");
       setProfiles(list);
-      setSelected((prev) => (prev && list.some((p) => p.name === prev) ? prev : list[0]?.name || ""));
+      // Keep whichever row was already open (if it still exists); otherwise
+      // nothing is pre-selected — the picker starts closed, not auto-opened
+      // to the first profile, so a fresh app launch never fires a Touch ID
+      // prompt before the user has clicked anything.
+      setSelected((prev) => (prev && list.some((p) => p.name === prev) ? prev : ""));
     } catch (e) {
       setError(describeVaultError(e).message);
     } finally {
@@ -153,7 +168,24 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     setPassword("");
     setError(null);
     setRollbackInfo(null);
+    setQuickAvailable(false);
+    setForcePassword(false);
     requestAnimationFrame(() => passwordInputRef.current?.focus());
+  }, [selected]);
+
+  // FR-054a: check once per row-open whether a quick re-unlock is even
+  // possible, so the button can render — deliberately does NOT auto-attempt
+  // it. Auto-firing here duplicated the explicit "Unlock" button below (two
+  // ways of triggering the same platform-authentication prompt, occasionally
+  // both at once); the button is the only trigger now, same as the password
+  // path requiring its own explicit click/Enter.
+  useEffect(() => {
+    if (!selected) return;
+    let cancelled = false;
+    invoke<boolean>("profile_quick_unlock_available", { name: selected })
+      .then((available) => { if (!cancelled) setQuickAvailable(available); })
+      .catch(() => { if (!cancelled) setQuickAvailable(false); });
+    return () => { cancelled = true; };
   }, [selected]);
 
   useEffect(() => {
@@ -163,6 +195,27 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   const sortedProfiles = [...profiles].sort((a, b) => a.name.localeCompare(b.name));
 
   const toggle = (name: string) => setSelected((prev) => (prev === name ? "" : name));
+
+  // FR-054a: Touch ID/Windows Hello from a cold profile-selection screen —
+  // no password typed. Same `select_profile` first step the password path
+  // uses (writer claim, active_profile), then the backend supplies the DEK
+  // from its cached quick-unlock entry instead of re-deriving it.
+  const attemptQuickCold = async (name: string) => {
+    setQuickBusy(true); setError(null); setRollbackInfo(null);
+    try {
+      await invoke("select_profile", { name });
+      await invoke("vault_unlock_quick_cold", { name });
+      onUnlocked(name);
+    } catch (e) {
+      // The backend already stops offering platform auth after enough
+      // consecutive failures (FR-057) — nothing to count client-side, just
+      // fall back to the password field.
+      setError(describeVaultError(e).message);
+      setForcePassword(true);
+    } finally {
+      setQuickBusy(false);
+    }
+  };
 
   const unlockSelected = async () => {
     if (!selected) { setError("Pick a profile first."); return; }
@@ -588,25 +641,53 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
 
                     {open && (
                       <div className="px-3 pb-3 pt-1 bg-black/20 space-y-2.5 animate-in fade-in">
-                        <div className="flex gap-2">
-                          <input
-                            ref={passwordInputRef}
-                            type="password"
-                            placeholder="Password"
-                            value={password}
-                            onChange={(e) => setPassword(e.target.value)}
-                            onKeyDown={(e) => e.key === "Enter" && unlockSelected()}
-                            className="flex-1 h-10 px-3.5 bg-zinc-900/50 border border-white/5 rounded-lg text-[13.5px] text-zinc-50 placeholder:text-zinc-600 outline-none focus:border-primary/50 transition-colors"
-                          />
+                        {quickAvailable && !forcePassword ? (
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => attemptQuickCold(p.name)}
+                              disabled={quickBusy}
+                              className="flex-1 h-10 rounded-lg text-[13px] font-semibold bg-primary text-black disabled:opacity-50 flex items-center justify-center gap-1.5 transition-all"
+                            >
+                              {quickBusy ? <RefreshCw size={14} className="animate-spin" /> : <Fingerprint size={14} />}
+                              {quickBusy ? "Waiting…" : "Unlock"}
+                            </button>
+                            <button
+                              onClick={() => setForcePassword(true)}
+                              title="Use password instead"
+                              className="h-10 px-3 rounded-lg text-[12px] font-medium text-zinc-400 hover:text-zinc-100 bg-white/[0.03] border border-white/10 hover:bg-white/[0.07] shrink-0 transition-colors"
+                            >
+                              Password
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="flex gap-2">
+                            <input
+                              ref={passwordInputRef}
+                              type="password"
+                              placeholder="Password"
+                              value={password}
+                              onChange={(e) => setPassword(e.target.value)}
+                              onKeyDown={(e) => e.key === "Enter" && unlockSelected()}
+                              className="flex-1 h-10 px-3.5 bg-zinc-900/50 border border-white/5 rounded-lg text-[13.5px] text-zinc-50 placeholder:text-zinc-600 outline-none focus:border-primary/50 transition-colors"
+                            />
+                            <button
+                              onClick={unlockSelected}
+                              disabled={busy || !password}
+                              title="Open"
+                              className="h-10 px-3.5 rounded-lg text-[13px] font-semibold bg-primary text-black hover:shadow-[0_0_20px_rgba(var(--primary),0.3)] disabled:opacity-40 flex items-center gap-1.5 shrink-0 transition-all"
+                            >
+                              {busy ? <RefreshCw size={14} className="animate-spin" /> : <>Open <ArrowRight size={14} /></>}
+                            </button>
+                          </div>
+                        )}
+                        {quickAvailable && forcePassword && (
                           <button
-                            onClick={unlockSelected}
-                            disabled={busy || !password}
-                            title="Open"
-                            className="h-10 px-3.5 rounded-lg text-[13px] font-semibold bg-primary text-black hover:shadow-[0_0_20px_rgba(var(--primary),0.3)] disabled:opacity-40 flex items-center gap-1.5 shrink-0 transition-all"
+                            onClick={() => { setForcePassword(false); attemptQuickCold(p.name); }}
+                            className="text-[11.5px] text-zinc-500 hover:text-zinc-300"
                           >
-                            {busy ? <RefreshCw size={14} className="animate-spin" /> : <>Open <ArrowRight size={14} /></>}
+                            Try quick unlock again
                           </button>
-                        </div>
+                        )}
                         <div className="flex flex-wrap items-center gap-1.5">
                           {!IS_ANDROID && (
                             <RowAction onClick={() => exportProfile(p.name)} disabled={busy} icon={<Download size={12} />} label="Export" />

@@ -444,10 +444,11 @@ failure cases.
 
 - **FR-043**: The system MUST drop the vault key from its own process memory on every
   lock, without exception, and MUST NOT retain any cached copy of it.
-- **FR-043a**: On a lock caused by the idle timeout, an OS screen lock or sleep, an
-  explicit user lock, or the app exiting, the system MUST additionally release any
-  platform-authentication-gated reference to the key, such that restoring access requires
-  a full unlock.
+- **FR-043a**: On a lock caused by the idle timeout, an OS screen lock or sleep, or an
+  explicit user lock, the system MUST additionally release any platform-authentication-
+  gated reference to the key, such that restoring access requires a full unlock. The app
+  exiting is deliberately not one of these triggers — the reference MAY survive a restart
+  (FR-054).
 - **FR-043b**: On a lock caused by the main window losing focus or the app being
   backgrounded, the system MAY retain a reference to the key that is held by the operating
   system's secure store and gated on platform authentication. The key itself MUST remain
@@ -481,12 +482,23 @@ failure cases.
 **Unlock and identity confirmation**
 
 - **FR-053**: A **full unlock** requires the user's password together with the device's
-  secure store, per FR-007a. The system MUST require a full unlock on app start, after an
-  idle-timeout lock, and after an OS screen-lock or sleep lock.
+  secure store, per FR-007a. The system MUST require a full unlock after an idle-timeout
+  lock, after an OS screen-lock or sleep lock, on the first-ever unlock of a profile, and
+  on app start when no platform-authentication-gated reference is available for the
+  selected profile. App start MAY instead offer a quick re-unlock (FR-054) when such a
+  reference already exists.
 - **FR-054**: A **quick re-unlock** uses platform authentication — the device's biometric
   or OS credential prompt. The system MUST accept a quick re-unlock after a focus-loss or
-  backgrounded lock while the app is still running, and MUST NOT accept one in any
-  situation FR-053 covers.
+  backgrounded lock while the app is still running, and MUST also accept one when
+  reopening a profile whose platform-authentication-gated reference is still present in
+  the OS secure store, including after an app restart (FR-054a). It MUST NOT accept one in
+  any other situation FR-053 covers.
+- **FR-054a**: The profile-selection screen MUST offer a quick re-unlock for a given
+  profile only when a platform-authentication-gated reference already exists for it (i.e.
+  it has been fully unlocked at least once since that reference was last released) and
+  platform authentication is available on this device. Otherwise it MUST show the password
+  form only. This is subject to FR-057's consecutive-failure fallback like every other
+  quick re-unlock.
 - **FR-055**: Wherever this specification requires **identity confirmation** — creating a
   recovery kit (FR-020), exporting (FR-023), and importing — it MUST be satisfied by
   platform authentication or by the password. An in-app confirmation dialog alone MUST NOT
@@ -887,9 +899,12 @@ failure cases.
   costs a fingerprint rather than a password. Re-unlock latency is a first-class concern —
   see SC-007 and SC-018 — because the user pays it repeatedly.
 - **The password's job is reconstituting the key from disk, not gating the window.** That
-  is why platform authentication can cover a focus-loss return (FR-054) while the password
-  is still mandatory on app start, after idle, and after an OS screen lock (FR-053). A
-  stolen powered-off machine still needs the password, so FR-007a and SC-011 hold.
+  is why platform authentication can cover a focus-loss return, and — once a profile has
+  been fully unlocked at least once — an app restart too (FR-054, FR-054a), while the
+  password is still mandatory after idle and after an OS screen lock (FR-053), and on app
+  start whenever no such cached reference exists yet. A stolen powered-off machine still
+  needs the password at least once before any quick re-unlock becomes possible, so FR-007a
+  and SC-011 hold.
 - **Concealment is a UI obligation, not only a key-memory one.** FR-046 and FR-050 mean
   retained terminal scrollback must be hidden while locked, not merely left un-refreshed.
 - **Existing vaults are small enough** that re-sealing during migration completes within

@@ -39,10 +39,14 @@ this vault needs."
 | --- | --- | --- |
 | `devicefactor` | `K_device` | Profile deleted |
 | `highwater` | Highest revision ever written (rollback detection) | Profile deleted |
-| `quickunlock` | A **raw copy of the unlocked DEK** | Every hard lock, and app exit |
+| `quickunlock` | A **raw copy of the unlocked DEK** | Every hard lock (idle timeout, OS lock/sleep, explicit lock) |
 
 The third entry is what makes Touch ID / Windows Hello re-unlock possible —
-see §2.
+see §2. It is seeded on every successful full unlock (profile creation,
+cold-start password unlock, or hard-lock recovery), not only at focus-loss,
+and **app exit does not clear it** — it deliberately survives a restart so
+the profile-selection screen can offer a quick re-unlock next launch
+(FR-054, FR-054a).
 
 ### 1.2 Lock lifecycle (`lock.rs`)
 
@@ -72,19 +76,22 @@ every lock.
 
 Touch ID/Windows Hello (`platform_auth.rs`, macOS/Windows only — Linux has
 no portable equivalent and always falls back to the password) is a
-**shortcut for `locked_soft` only**. It is not a replacement for the
-password:
+**shortcut wherever a `quickunlock` entry already exists for the selected
+profile** — the in-process `locked_soft` re-entry, and (since it now
+survives a restart) the profile-selection screen too. It is not a
+replacement for deriving the DEK in the first place:
 
-- Every app launch starts with `quickunlock` empty (cleared on the previous
-  exit), so the very first unlock of a session is always the full password
-  + device-factor path.
-- Every idle timeout, OS screen lock/sleep, or explicit lock drops straight
-  to `locked_hard`, where platform auth is a no-op and only the password
-  works.
+- A profile's **very first unlock ever** always requires the full password
+  + device-factor path — there is nothing cached yet to fall back on.
+- Every idle timeout, OS screen lock/sleep, or explicit lock purges
+  `quickunlock` and drops to `locked_hard`, where platform auth is a no-op
+  and only the password works again — including on the next app launch,
+  until the profile is fully unlocked with the password once more.
 
-So on macOS/Windows the password is skippable only for "switched away and
-came back within the idle window without the screen locking" — everything
-else, on every platform, requires it.
+So the password is skippable only when a prior full unlock's cache is
+still live — either "switched away and came back within the idle window,"
+or "relaunched the app since a full unlock, before any idle/OS-lock/
+explicit lock purged it." Everything else, on every platform, requires it.
 
 ---
 
