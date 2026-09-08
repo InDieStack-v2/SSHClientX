@@ -581,15 +581,15 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
                     />
                   </>
                 )}
-                {/* FR-031/scope: a matched key never overwrites the profile
-                    that already owns it — importing always adds a
-                    separate, auto-suffixed copy instead, so there's
-                    nothing to confirm about revision or content here. */}
+                {/* FR-032a/FR-032b: a matched key is restored directly over
+                    the profile that already owns it (never a separate
+                    copy — a copy would have no keywrap/device-factor of
+                    its own and could never be opened again). */}
                 {staged.disposition === "restore_over" && (
                   <div className="text-[11.5px] text-zinc-300 leading-snug">
-                    This device already has <span className="font-semibold">"{staged.profile}"</span>. Importing will add
-                    a separate copy (named "{staged.profile} [IMPORT]", or an auto-numbered variant) —{" "}
-                    <span className="font-semibold">"{staged.profile}"</span> itself is left untouched.
+                    This device already has <span className="font-semibold">"{staged.profile}"</span>. Importing will
+                    restore this file over it, replacing its current contents (the previous revision is kept in
+                    history) — no new profile is created.
                   </div>
                 )}
                 {staged.disposition === "no_op" && (
