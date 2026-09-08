@@ -5862,6 +5862,7 @@ name = "sshclientx"
 version = "0.3.8"
 dependencies = [
  "aes-gcm 0.10.3",
+ "android-native-keyring-store",
  "argon2 0.5.3",
  "async-http-proxy",
  "base64 0.22.1",
@@ -5874,6 +5875,7 @@ dependencies = [
  "hex",
  "jni",
  "keyring",
+ "keyring-core",
  "ndk-context",
  "notify",
  "notify-debouncer-mini",

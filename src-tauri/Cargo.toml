@@ -256,17 +256,24 @@ windows = { version = "0.56", features = [
 # explicitly — Cargo unions the feature sets of every declaration of the
 # same crate+version, so this adds android-native-keyring-store ONLY on
 # Android, without disturbing what any other platform already gets.
-# `ndk-context`'s application_context (which this store needs) is
-# initialized by Tauri's own Android bootstrap — no extra Kotlin/JNI glue
-# needed on our side.
+#
+# `v1` then refuses to initialize on Android (`Invalid("platform")`), after
+# which `keyring::Entry::new` is a permanent `NoDefaultStore`. We therefore
+# pin the already-transitive `android-native-keyring-store` and `keyring-core`
+# so `keystore.rs` can `set_default_store` itself after `android_bridge.rs`
+# initializes `ndk-context`. Neither is a new crate (constitution table row 2
+# — OS secure-store binding); both are already in this tree via `keyring`.
+# `ndk-context` is NOT initialized by Tauri — see android_bridge.rs.
 [target.'cfg(target_os = "android")'.dependencies]
 keyring = { version = "4.2", features = ["android-native-keyring-store"] }
+android-native-keyring-store = "1"
+keyring-core = "1"
 # JNI bridge (android_bridge.rs) that initializes `ndk-context`'s global
-# Android context before the first `keyring::Entry` use — verified by
-# direct source inspection that neither Tauri nor tao/wry do this
-# themselves, despite android-native-keyring-store's README claiming
-# otherwise. Both versions already resolved elsewhere in this exact tree
-# (`jni` via `tao`, `ndk-context` via `android-native-keyring-store`
-# itself) — pinning them directly adds no new crate.
+# Android context before the first keystore use — verified by direct source
+# inspection that neither Tauri nor tao/wry do this themselves, despite
+# android-native-keyring-store's README claiming otherwise. Both versions
+# already resolved elsewhere in this exact tree (`jni` via `tao`,
+# `ndk-context` via `android-native-keyring-store` itself) — pinning them
+# directly adds no new crate.
 jni = "0.21"
 ndk-context = "0.1"

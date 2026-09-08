@@ -55,12 +55,26 @@ const LockScreen = ({ lockState, onUnlocked }: Props) => {
     setPassword("");
     if (lockState === "locked_soft") {
       setForcePassword(false);
-      attemptQuick();
+      // Locking itself fires the instant the window loses focus, so
+      // attempting platform auth right here would pop the OS prompt while
+      // the user is still switching away. Only auto-attempt if the window
+      // is actually focused right now (app start, or an idle-timeout lock
+      // while still in front of the app) — the focus listener below covers
+      // the "returned to the app" case instead.
+      if (document.hasFocus()) attemptQuick();
     } else {
       setForcePassword(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [lockState]);
+
+  useEffect(() => {
+    if (lockState !== "locked_soft" || forcePassword) return;
+    const onFocus = () => attemptQuick();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lockState, forcePassword]);
 
   const unlockFull = async () => {
     if (!password) { setError("Type your password."); return; }

@@ -119,7 +119,22 @@ impl Outcome {
                 "This vault file is older than the last one this device saved. It may have been restored from a backup."
             }
             Outcome::VaultNoKeystore => {
-                "No secure credential store is available on this machine. SSHClientX cannot create or open a vault without one."
+                #[cfg(target_os = "macos")]
+                {
+                    "macOS Keychain is not available. Unlock your login keychain in Keychain Access, then try again. SSHClientX cannot create or open a vault without it."
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    "Windows Credential Manager is not available in this session. Sign in with a local user account. SSHClientX cannot create or open a vault without it."
+                }
+                #[cfg(target_os = "android")]
+                {
+                    "Android Keystore is not available on this device. SSHClientX cannot create or open a vault without it."
+                }
+                #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
+                {
+                    "No Secret Service provider is available. Install and start GNOME Keyring or KWallet, then try again. SSHClientX cannot create or open a vault without one."
+                }
             }
             Outcome::VaultKeystoreDenied => {
                 "The secure credential store declined this request. Try again."

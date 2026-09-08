@@ -36,8 +36,46 @@ const SERVICE_DEVICE_FACTOR: &str = "com.sshclientx.app.vault.devicefactor";
 const SERVICE_HIGH_WATER: &str = "com.sshclientx.app.vault.highwater";
 const SERVICE_QUICK_UNLOCK: &str = "com.sshclientx.app.vault.quickunlock";
 
-fn entry(service: &str, profile: &str) -> Result<keyring::Entry, Outcome> {
-    keyring::Entry::new(service, profile).map_err(|e| classify_error(&e))
+#[cfg(target_os = "android")]
+type PlatformEntry = keyring_core::Entry;
+#[cfg(not(target_os = "android"))]
+type PlatformEntry = keyring::Entry;
+
+/// Register the Android Keystore-backed store as keyring's default.
+///
+/// `keyring` 4.2's `v1` feature (what `Entry::new` uses) explicitly refuses
+/// to initialize on Android — its `set_credential_store` returns
+/// `Invalid("platform")`, after which every `keyring::Entry::new` is a
+/// permanent `NoDefaultStore`. T113 enabled `android-native-keyring-store`
+/// and `ndk-context`, but never called `set_default_store`, so every vault
+/// create/open on Android reported VAULT_NO_KEYSTORE. We set the store
+/// ourselves via `keyring_core` after `android_bridge` has initialized
+/// `ndk-context`. Failure is not cached: a too-early call (before the JNI
+/// bridge) must be allowed to succeed on retry.
+#[cfg(target_os = "android")]
+pub fn ensure_android_store() -> Result<(), Outcome> {
+    use std::sync::Mutex;
+    static READY: Mutex<bool> = Mutex::new(false);
+    let mut ready = READY.lock().map_err(|_| Outcome::VaultNoKeystore)?;
+    if *ready {
+        return Ok(());
+    }
+    let store = android_native_keyring_store::Store::new().map_err(|e| classify_error(&e))?;
+    keyring_core::set_default_store(store);
+    *ready = true;
+    Ok(())
+}
+
+fn entry(service: &str, profile: &str) -> Result<PlatformEntry, Outcome> {
+    #[cfg(target_os = "android")]
+    {
+        ensure_android_store()?;
+        keyring_core::Entry::new(service, profile).map_err(|e| classify_error(&e))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        keyring::Entry::new(service, profile).map_err(|e| classify_error(&e))
+    }
 }
 
 /// Store the 32-byte device factor (`K_device`, research.md Decision 3)
@@ -51,15 +89,19 @@ pub fn store_device_factor(profile: &str, factor: &[u8; 32]) -> Result<(), Outco
 }
 
 /// Load the 32-byte device factor for `profile`. `VaultNoKeystore`/
-/// `VaultKeystoreDenied` per `classify_error`; a missing entry (profile
-/// never created, or the keystore entry was lost — spec Edge Cases: "secure
-/// store present at migration, missing later") also surfaces as
-/// `VaultNoKeystore`, since from the caller's perspective the vault is
-/// equally unreachable either way.
+/// `VaultKeystoreDenied` per `classify_error`. A missing entry is
+/// `VaultUnknownKid` — the store is there, this device simply does not
+/// hold this profile's factor (copied vault, or the keystore item was
+/// deleted). Mapping that to `VaultNoKeystore` told users their machine
+/// could not run the app when Keychain/Credential Manager/Secret Service
+/// was sitting there working (FR-003 vs FR-003a; constitution: lost
+/// keystore entry is permanent data loss, not "no store exists").
 pub fn load_device_factor(profile: &str) -> Result<[u8; 32], Outcome> {
-    let secret = entry(SERVICE_DEVICE_FACTOR, profile)?
-        .get_secret()
-        .map_err(|e| classify_error(&e))?;
+    let secret = match entry(SERVICE_DEVICE_FACTOR, profile)?.get_secret() {
+        Ok(bytes) => bytes,
+        Err(keyring::Error::NoEntry) => return Err(Outcome::VaultUnknownKid),
+        Err(e) => return Err(classify_error(&e)),
+    };
     if secret.len() != 32 {
         // A 32-byte DEK should never be anything else; treat as store
         // corruption rather than panicking on the array conversion below.
@@ -127,9 +169,13 @@ pub fn store_quick_unlock(profile: &str, dek: &[u8; 32]) -> Result<(), Outcome> 
 }
 
 pub fn load_quick_unlock(profile: &str) -> Result<[u8; 32], Outcome> {
-    let secret = entry(SERVICE_QUICK_UNLOCK, profile)?
-        .get_secret()
-        .map_err(|e| classify_error(&e))?;
+    let secret = match entry(SERVICE_QUICK_UNLOCK, profile)?.get_secret() {
+        Ok(bytes) => bytes,
+        // Soft-lock entry gone (hard lock, crash, or never written) — the
+        // password path is the recovery, not "this machine has no store".
+        Err(keyring::Error::NoEntry) => return Err(Outcome::VaultAuth),
+        Err(e) => return Err(classify_error(&e)),
+    };
     if secret.len() != 32 {
         return Err(Outcome::VaultCorrupt);
     }
@@ -150,18 +196,22 @@ pub fn delete_quick_unlock(profile: &str) -> Result<(), Outcome> {
 }
 
 /// Cheap up-front check: is a secret store available on this machine at
-/// all? Wraps `Entry::store_status()`, which runs the one-time platform
-/// store initialization and caches the result for this process's lifetime.
+/// all? Probes with a real `get_secret` rather than `Entry::store_status()`.
+/// `store_status` caches a failure for the process lifetime (research.md
+/// risk table) and on Android is permanently `NoDefaultStore` because `v1`
+/// refuses that platform. `NoEntry` on the canary name means the store is
+/// up — nothing stored under that name is the expected empty result.
 ///
-/// Per research.md's risk table: don't treat a cached failure here as
-/// permanent across the *user's* session — if the user retries after
-/// starting the platform's secret-service daemon, a fresh `Entry::new(...)`
-/// call (not this cached check) is what actually re-probes. Use this only
-/// for an early "can we even try" gate, not as the final word.
-pub fn store_available() -> Result<(), Outcome> {
-    match keyring::Entry::store_status() {
-        Ok(()) => Ok(()),
-        Err(e) => Err(classify_error(e)),
+/// Test-only: every production keystore call already surfaces this same
+/// `classify_error` distinction on its own first real operation (e.g.
+/// `store_device_factor` during profile creation), so a separate up-front
+/// probe adds no production value — this exists solely to let the tests
+/// below skip themselves on a CI box with no real secret store.
+#[cfg(test)]
+fn store_available() -> Result<(), Outcome> {
+    match entry("com.sshclientx.app.vault.probe", "availability")?.get_secret() {
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(classify_error(&e)),
     }
 }
 
@@ -294,6 +344,33 @@ mod tests {
         // reads do, and treat it as normal); this is the safe fallback.
         let e = keyring::Error::NoEntry;
         assert_eq!(classify_error(&e), Outcome::VaultNoKeystore);
+    }
+
+    #[test]
+    fn missing_device_factor_is_unknown_kid_not_no_keystore() {
+        let profile = format!("test-missing-df-{}", std::process::id());
+        let _ = delete_device_factor(&profile);
+        if store_available().is_err() {
+            return;
+        }
+        assert_eq!(
+            load_device_factor(&profile),
+            Err(Outcome::VaultUnknownKid),
+            "a working store with no item for this profile is the other-device case, not 'no store on this machine'"
+        );
+    }
+
+    #[test]
+    fn device_factor_roundtrip_when_store_available() {
+        if store_available().is_err() {
+            return;
+        }
+        let profile = format!("test-df-roundtrip-{}", std::process::id());
+        let factor = [0x5Au8; 32];
+        store_device_factor(&profile, &factor).expect("store");
+        let loaded = load_device_factor(&profile).expect("load after store");
+        assert_eq!(loaded, factor);
+        delete_device_factor(&profile).expect("cleanup");
     }
 
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]

@@ -73,4 +73,10 @@ unsafe fn initKeystoreContext<'local>(env: JNIEnv<'local>, _class: JClass<'local
     unsafe {
         ndk_context::initialize_android_context(vm_ptr.cast(), context_ptr.cast());
     }
+
+    // v1 never registers a default store on Android. Do it now that
+    // ndk-context is set — Store::new reads it and panics if it isn't.
+    if let Err(e) = crate::keystore::ensure_android_store() {
+        eprintln!("[ANDROID_BRIDGE] failed to register the Android keystore backend: {e}");
+    }
 }
