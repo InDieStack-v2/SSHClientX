@@ -4,7 +4,7 @@
 
 **Created**: 2026-09-06
 
-**Status**: Ready for implementation — clarifications closed, Governance cleared (constitution v3.1.0)
+**Status**: Ready for implementation — clarifications closed, Governance cleared (constitution v5.1.0)
 
 **Input**: User description: "Migrate the vault export/import from the current password-derived-key model to the spec-00 end-to-end encrypted vault model (docs/features/spec-00-e2e-vault.md, spec-01-export-import.md)."
 
@@ -16,15 +16,15 @@ This feature **cannot be implemented under constitution v2.0.0**. Four rules mus
 amended through Governance before any code lands. Spec Kit rules resolve conflicts in
 favour of the constitution, so this section is a hard gate, not a caveat.
 
-**Status: RESOLVED.** The constitution now stands at **v3.1.0** — v3.0.0 covered all four
-rows below, and v3.1.0 extended the dependency allowance the design turned out to need. The
-four conflicts described here are historical, recorded so the reason for the amendment stays
-legible. This spec is actionable.
+**Status: RESOLVED.** The constitution now stands at **v5.1.0** — v3.0.0 covered all four
+rows below, v3.1.0 extended the dependency allowance the design turned out to need, and
+v5.1.0 permits Android to create fresh sealed vaults. The four conflicts described here are
+historical, recorded so the reason for the amendment stays legible. This spec is actionable.
 
 | Constitution rule | Conflict |
 | --- | --- |
 | III. One Core, Every Platform — "Vault files MUST remain platform-portable: unlock on Windows, macOS, Linux, or Android with the same master password." | The entire point of the target model is that a vault does **not** open on another device without pairing or a recovery kit. This principle is being deliberately reversed. |
-| III. One Core, Every Platform — "Android and desktop MUST ship the same vault format." | Both platforms will read and write both formats, but only desktop can create or migrate to the new one, so the platforms are not at parity for a release. |
+| III. One Core, Every Platform — "Android and desktop MUST ship the same vault format." | Both platforms read both formats and create fresh vaults in the current sealed format; only legacy migration remains desktop-only. |
 | I. Device-Bound Secrets — "sealed with AES-256-GCM" | Target model prefers XChaCha20-Poly1305, with AES-256-GCM as the secondary algorithm. |
 | Technology Constraints — "On-disk vault: magic `OMNV`" · Development Workflow — "changing Argon2/AES parameters … is a constitution-level change" | New container magic, new header, and a changed role for Argon2 (wrapping a key instead of being the key). |
 
@@ -584,8 +584,8 @@ vault unchanged in the two failure cases.
 
 - **FR-013**: On **desktop platforms**, on the first successful unlock of a vault in the
   existing format after update, the system MUST re-seal it into the new format under a
-  newly generated vault key, preserving all existing content. Android is excluded by
-  FR-039 and MUST leave such a vault in its existing format.
+  newly generated vault key, preserving all existing content. Android MUST leave such a
+  vault in its existing format and refuse migration under FR-039.
 - **FR-014**: The system MUST NOT begin migration until the user's existing password has
   successfully decrypted the existing vault.
 - **FR-015**: The system MUST verify that the migrated vault opens before treating
@@ -711,12 +711,11 @@ vault unchanged in the two failure cases.
 - **FR-037**: The system MUST register the vault file type with the operating system so
   the file is recognised, and MUST ensure the operating system does not generate content
   previews of vault files.
-- **FR-038**: Android MUST be able to open, use, and save a vault in the new format once
-  that vault's key has been established in the device's secure store via the recovery
-  kit.
-- **FR-039**: Android MUST NOT create a new-format vault from scratch and MUST NOT
-  migrate an existing-format vault. Both actions MUST refuse with a message saying the
-  action must be performed on a desktop machine, not with a generic failure.
+- **FR-038**: Android MUST be able to create, open, use, and save a vault in the new
+  format. A vault whose key was established through a recovery kit MUST remain usable.
+- **FR-039**: Android MUST NOT migrate an existing-format vault. The action MUST refuse
+  with a message saying migration must be performed on a desktop machine, not with a
+  generic failure.
 - **FR-040**: The general export and import file flows MUST remain unavailable on
   Android in this release and MUST refuse with a message stating that.
 - **FR-041**: The Android recovery-kit flow MUST accept a vault file alongside the
@@ -845,10 +844,10 @@ vault unchanged in the two failure cases.
 - **Story 1 does not ship without Story 2.** Story 1 removes cross-device portability;
   releasing it without the recovery kit would strand multi-machine users. They may be
   built in order but must reach users together.
-- **Desktop creates, Android consumes.** macOS, Windows, and Linux create and migrate
+- **Android creates, desktop migrates.** macOS, Windows, Linux, and Android create fresh
   vaults in the new format. Android can open, use, and save a new-format vault whose key
-  arrived via the recovery kit, but cannot create or migrate one, and keeps refusing the
-  general export and import flows. Two vault formats are live simultaneously on both
+  arrived via the recovery kit, but cannot migrate an existing-format vault; general export
+  and import flows remain unavailable. Two vault formats are live simultaneously on both
   platforms and both must remain readable.
 - **The Android recovery-kit restore is a deliberate carve-out.** Without it, an Android
   user whose desktop has migrated could obtain the vault key but never the vault file,
@@ -939,10 +938,11 @@ what ships today.
 recovery kit is sealed under its own recovery passphrase rather than under a device's vault
 password, so nothing in an exported artefact depends on a password from another machine.
 
-**D2 — Desktop creates, Android consumes.** *(FR-038 – FR-042, SC-012)* Desktop
-platforms create and migrate vaults in the new format. Android gains enough secure-store
-support to open, use, and save a new-format vault whose key arrived via the recovery kit,
-but cannot create or migrate one, and the general export and import flows stay refused
-there. The Android recovery-kit restore accepts a vault file as part of the same action —
-without that carve-out an Android user could obtain the key but never the file. Android
-users with no desktop keep their existing-format vault, unmigrated and un-nagged.
+**D2 — Android creates, desktop migrates legacy vaults.** *(FR-038 – FR-042, SC-012)*
+All platforms create fresh vaults in the new format. Android gains enough secure-store support
+to open, use, and save a new-format vault whose key arrived via the recovery kit, but cannot
+migrate an existing-format vault; the general export and import flows stay refused there. The
+Android recovery-kit restore accepts a vault file as part of the same action — without that
+carve-out an Android user could obtain the key but never the file. Android users with no desktop
+can create a new sealed vault; users with an existing-format vault keep it unmigrated and
+un-nagged.

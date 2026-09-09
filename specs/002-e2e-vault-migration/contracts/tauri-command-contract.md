@@ -256,10 +256,11 @@ Live SSH sessions, tunnels, transfers, mirrors, and monitors keep running across
 | Command | Desktop | Android |
 | --- | --- | --- |
 | `export_profile`, `import_vault_*` | yes | refuse, naming the platform (FR-040) |
-| profile creation, migration | yes | refuse, naming desktop (FR-039) |
+| profile creation | yes | yes — creates a fresh sealed vault through the shared path (FR-038) |
 | `recovery_kit_consume` | yes | **yes** — with `vault_file`, the sole restore path (FR-041) |
 | `recovery_kit_create` | yes | yes |
 | lock lifecycle, unlock | yes | yes |
 
-Android opens, uses, and saves a sealed vault whose key arrived via a kit (FR-038), and reads
-both formats (FR-042).
+Android creates, opens, uses, and saves fresh sealed vaults and sealed vaults whose key arrived
+via a kit (FR-038), reads both formats (FR-042), and refuses legacy-vault migration with a
+desktop-naming message (FR-039).

@@ -48,10 +48,10 @@ project has had. `npm run typecheck` / `npm run build` for the frontend.
 [quickstart.md](quickstart.md) carries nine manual scenarios covering all 26 success criteria,
 several of which need a second machine and cannot be automated.
 
-**Target Platform**: Desktop (macOS, Windows, Linux) creates and migrates. Android opens,
-uses, and saves a sealed vault whose key arrived via a recovery kit, but cannot create or
-migrate one, and keeps refusing the general export/import flows. Both platforms read both
-formats.
+**Target Platform**: Desktop (macOS, Windows, Linux) and Android create fresh sealed vaults.
+Desktop migrates legacy vaults; Android opens, uses, and saves a sealed vault whose key arrived
+via a recovery kit or pairing, but cannot migrate a legacy vault and keeps refusing the general
+export/import flows. Both platforms read both formats.
 
 **Project Type**: Desktop + mobile application, Tauri 2 + Rust core + React renderer, single
 repository.
@@ -96,11 +96,10 @@ Evaluated against **constitution v3.1.0**.
   `localStorage`. No new Tauri plugin is introduced, so no additional Governance step is
   triggered (research.md Decisions 6 and 11 both chose crates over plugins partly for this
   reason).
-- **Principle III (One Core, Every Platform)** — **PASS.** v3.0.0 explicitly permits the
-  desktop-creates / Android-consumes asymmetry and requires both platforms to read both
-  formats, which this design does. Desktop-only paths (`rfd`, platform auth, idle/lock hooks)
-  are `cfg`-gated as the principle requires. The asymmetry carries the amendment's stated lapse
-  condition; it is not open-ended.
+- **Principle III (One Core, Every Platform)** — **PASS.** v5.1.0 permits Android to create
+  fresh sealed vaults through the shared Rust path while retaining desktop-only legacy
+  migration. Both platforms read both formats; desktop-only paths (`rfd`, platform auth,
+  idle/lock hooks) remain `cfg`-gated as the principle requires.
 - **Principle IV (Explicit Trust Boundaries)** — **PASS, and extended.** New untrusted inputs
   arrive with this feature and are guarded: `sender_name` in a sealed container is
   display-only, capped at 255 bytes, never used to build a path and never interpreted as

@@ -1,4 +1,47 @@
 <!--
+Sync Impact Report (v5.1.0)
+- Version change: 5.0.0 → 5.1.0 (MINOR — materially expands Android vault capability).
+- Modified principles:
+  - III. One Core, Every Platform — Android may now create a fresh sealed vault through
+    the same shared Rust creation path as desktop. Legacy-vault migration remains
+    desktop-only, and Android's general export/import flows remain unavailable.
+- Added sections: none. Removed sections: the transitional desktop-creates/Android-consumes
+  asymmetry and its lapse condition.
+- Notes: Android Keystore setup already supports creating the device factor. This amendment
+  removes only the artificial fresh-vault refusal; it preserves device-bound secrets,
+  two-of-two unlock, and the desktop-only migration boundary.
+
+Sync Impact Report (v5.0.0)
+- Version change: 4.0.0 → 5.0.0 (MAJOR — redefines Principles I and III)
+- Modified principles:
+  - I. Device-Bound Secrets — the "or, in future, an explicit pairing" clause is no longer
+    future tense: `specs/003-qr-same-network-transfer` is that pairing. Added an explicit rule
+    for what pairing may do that a recovery kit could not: move the DEK itself over a live,
+    local-network-only, mutually-pinned, human-verified channel directly onto a second device,
+    landing through the same fresh-device-factor-plus-keywrap-sidecar construction a recovery
+    kit already produces. The vault-password-never-travels rule is unchanged and unaffected —
+    pairing moves a DEK, never a password. Per this document's own v4.0.0 precedent, any change
+    that touches the NON-NEGOTIABLE Principle I is MAJOR regardless of size; this one is not
+    small, so MAJOR is doubly warranted.
+  - III. One Core, Every Platform — Android's carve-out ("a sealed vault whose key arrived via
+    a recovery kit") is widened to also cover a key established via explicit pairing (spec
+    003), for both Android host and guest roles. The "cross-device access is via the opt-in
+    recovery kit only" sentence and "device-to-device pairing is a future feature" sentence are
+    both corrected to name pairing as a present, sanctioned second path, not a future one.
+- Modified sections:
+  - Technology & Architecture Constraints — added an exhaustive four-row dependency table for
+    spec 003 (`rcgen`, `qrcode`, `if-addrs`, `jsqr`), mirroring the vault feature's six-row
+    table format, plus a note that `hyper`/`hyper-util`/`tokio-rustls`/`rustls` move from
+    transitive to direct dependencies at no new-crate cost. Added a bullet naming the new
+    LAN-bound, session-scoped HTTPS server as a sanctioned listening capability, distinct from
+    (and not an expansion of) the existing outbound-only network allowance.
+- Added sections: none. Removed sections: none.
+- Notes: driven by `specs/003-qr-same-network-transfer/plan.md`'s Constitution Check, which
+  found its own gate CONDITIONAL against v4.0.0 for exactly the reasons resolved here — the
+  same process v3.0.0/v3.1.0 already went through for spec 002's own dependencies. The
+  TODO(PAIRING) note left in the v3.0.0 report is now resolved: spec 003 is the pairing feature
+  it named, and reuses the sealed format and the two-of-two device-bound construction unchanged.
+
 Sync Impact Report (v4.0.0)
 - Version change: 3.2.0 → 4.0.0 (MAJOR — weakens a NON-NEGOTIABLE rule)
 - Modified principles:
@@ -190,9 +233,22 @@ failure rather than reporting a generic error.
 The application MUST NOT depend on any backend or account service: there is no
 sign-up, sign-in, or server-side identity, and a vault MUST NOT be uploaded,
 synced, or shared with another device except by the user manually moving the
-vault file together with an explicit recovery kit or, in future, an explicit
-pairing. MUST NOT add analytics, telemetry, or crash reporters that send data
-off-device.
+vault file together with an explicit recovery kit, or via an explicit
+device-to-device pairing (`specs/003-qr-same-network-transfer`). MUST NOT add
+analytics, telemetry, or crash reporters that send data off-device.
+
+An explicit pairing MAY move the DEK itself — never a vault password, which
+does not travel under any mechanism — directly onto a second device the user
+is actively operating, over a channel that is local-network-only (no cloud
+relay, no STUN/TURN), mutually authenticated by a certificate pinned to a
+value the user visually confirms matches on both screens, and torn down
+within one short session. The DEK MUST NOT be written to disk unprotected at
+any point in that transit, on either device, and MUST land, on the receiving
+device, through the same fresh-device-factor-plus-keywrap-sidecar
+construction a recovery kit already produces — pairing is a second on-ramp to
+that same device-bound state, not a second way to store a key. A device that
+has never established a key for a given vault MAY acquire one this way,
+exactly as it already may via a recovery kit.
 
 Rationale: a stolen ciphertext file MUST be worthless even to an attacker who
 later learns the password. That is only achievable if the sealing key lives in
@@ -234,22 +290,25 @@ Vault files are device-bound. A vault MUST open only on a device that holds
 its key. Copying a vault file to another device and supplying a vault password
 MUST NOT be sufficient to open it, and that case MUST be refused as
 sealed-for-another-key, distinctly from a wrong-password error. Cross-device
-access is via the opt-in recovery kit only. Device-to-device pairing is a
-future feature and MUST reuse the same sealed format when it arrives.
+access is via the opt-in recovery kit or an explicit device-to-device pairing
+(`specs/003-qr-same-network-transfer`); both MUST reuse the same sealed
+format.
 
-Platform write capability is asymmetric for a transitional period:
+Platform write capability is intentionally narrow:
 
 - Both platforms MUST read both the legacy `OMNV` format and the current
   sealed format, for as long as unmigrated vaults can exist.
-- Desktop (macOS, Windows, Linux) creates and migrates vaults in the current
-  sealed format.
-- Android MAY open, use, and save a sealed vault whose key arrived via a
-  recovery kit, but MUST NOT create or migrate one. Both actions MUST refuse
-  with a message naming desktop as the place to perform them. The general
-  export and import file flows remain unavailable on Android.
-- This asymmetry lapses when Android gains create-and-migrate support, at
-  which point this clause MUST be removed by a further amendment. It is not an
-  open-ended exception.
+- Desktop (macOS, Windows, Linux) MUST create fresh sealed vaults and migrate
+  legacy vaults to the current sealed format.
+- Android MUST create fresh sealed vaults through the shared vault-creation
+  path, and MAY open, use, and save a sealed vault whose key arrived via a
+  recovery kit or an explicit device-to-device pairing
+  (`specs/003-qr-same-network-transfer`). Android MUST NOT migrate a legacy
+  vault; that action MUST refuse with a message naming desktop as the place
+  to perform it. The general export and import file flows remain unavailable
+  on Android; pairing is a distinct mechanism from that general flow and is
+  available on Android for both the host and guest roles.
+
 
 Rationale: the product is one encrypted profile per device with an explicit,
 user-driven path between devices — not one profile that floats freely between
@@ -321,6 +380,21 @@ plugins widen the XSS blast radius (Principle II).
   *plugin* for any of the above remains a separate Governance matter under
   Principle II — crates are preferred precisely because they do not widen the
   plugin surface.
+- The same-network pairing feature (`specs/003-qr-same-network-transfer`) needs four
+  dependencies beyond the baseline above. Principle V requires a documented reason for each;
+  these are the reasons. **This list is exhaustive — adding a fifth is a Governance matter, not
+  a code review.**
+
+  | Dependency | Why it MUST exist | Why nothing already present will do |
+  | --- | --- | --- |
+  | `rcgen` | Generates the fresh, per-session self-signed certificate the pairing channel is pinned against | No existing crate in the tree builds an X.509 certificate; hand-rolling DER encoding is inventing format code on a security-adjacent path |
+  | `qrcode` | Renders the pairing session ticket as a scannable code | No existing crate in the tree produces a QR symbol |
+  | `if-addrs` | Enumerates the device's own network interfaces so the session server binds only to a private/link-local/ULA address, never a public one | `socket2` (already present) augments an existing socket, it does not enumerate interfaces; no stdlib API lists them |
+  | `jsqr` (npm, webview) | Decodes a scanned QR's plaintext session ticket from camera frames, on both desktop and Android, which no Tauri plugin covers for both platforms at once | Decoding public, non-secret ticket text is not a Principle II privileged operation, bounded by contract to that alone — the same class of exception already accepted for recovery-phrase display crossing IPC |
+
+  `hyper`, `hyper-util`, `tokio-rustls`, and `rustls` move from transitive to direct
+  dependencies for this feature's session server and pinned client, but add no new crate — all
+  four are already fully resolved via the existing `reqwest` dependency.
 - On-disk vault, current format: writers MUST produce the sealed container
   defined in `docs/features/spec-01-export-import.md` §2.1 — magic
   `SSHCLTX1`, format version, key identifier (`kid`), monotonic `generation`
@@ -354,6 +428,12 @@ plugins widen the XSS blast radius (Principle II).
 - There is no outbound network beyond the user's own SSH/SFTP targets, a
   user-initiated URL open, and the update check against GitHub releases. MUST
   NOT phone home for any other purpose.
+- The same-network pairing feature additionally runs a short-lived HTTPS server the app itself
+  hosts, bound only to a private/link-local/ULA address on the current network — never a public
+  address, never reachable off that network, and torn down at the end of one session
+  (`specs/003-qr-same-network-transfer`). This is a listening capability the device offers on
+  its own network, not an outbound call, and MUST NOT be broadened into a persistent service, a
+  discovery beacon, or anything reachable beyond one explicit, user-initiated pairing session.
 
 ## Development Workflow
 
@@ -408,4 +488,4 @@ Compliance:
 - Runtime development follows this file; do not fork a parallel "guidance"
   document that can silently diverge.
 
-**Version**: 4.0.0 | **Ratified**: 2026-09-03 | **Last Amended**: 2026-09-08
+**Version**: 5.1.0 | **Ratified**: 2026-09-03 | **Last Amended**: 2026-09-09

@@ -222,8 +222,10 @@ phrase word, or vault content.
 3. Set a vault password for the phone when prompted.
 4. Expect: the vault opens, is usable, and **saves**.
 5. Try Settings → Export and Import on Android → both refuse, naming the platform.
-6. Try creating a new profile on Android → refuses, naming desktop as where to do it.
-7. Confirm an existing unmigrated Android vault still opens and is never nagged to migrate.
+6. Create a new profile on Android with a password of at least eight characters → it opens as
+   a fresh sealed vault and still saves after restart.
+7. Confirm an existing unmigrated Android vault still opens, is never nagged to migrate, and
+   refuses migration with a message naming desktop.
 
 ---
 

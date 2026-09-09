@@ -2904,11 +2904,6 @@ async fn setup_master_db_inner(
             }
         }
     } else {
-        // T112/FR-039: creating a new-format vault from scratch must
-        // happen on a desktop machine — refuse with a named-platform
-        // message before anything is generated or written.
-        #[cfg(target_os = "android")]
-        return Err("[VAULT] DESKTOP_ONLY: creating a new vault must be done on a desktop machine (macOS, Windows, or Linux) — Android can open one afterward once its key is established via a recovery kit.".into());
 
         // Master-password strength floor — enforced ONLY at vault CREATION, not
         // on unlock (an existing vault with a short password must still open).

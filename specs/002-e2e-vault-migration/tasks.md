@@ -259,7 +259,7 @@ with the local vault unchanged in the four failures. [quickstart.md](quickstart.
 - [X] T109 [P] Add a `#[cfg(test)]` test in `src-tauri/src/vault.rs` scanning generated diagnostic output for forbidden substrings (SC-025)
 - [X] T110 [P] Register the `.sshclientx` file association and `application/x-sshclientx` MIME in `packaging/arch/sshclientx.desktop` and the equivalent macOS/Windows bundle configuration in `src-tauri/tauri.conf.json` (FR-037)
 - [X] T111 [P] Suppress OS content previews for vault files in `src-tauri/tauri.conf.json` and the packaging metadata (FR-037)
-- [X] T112 Refuse export, import, profile creation and migration on Android with messages naming the platform and pointing at desktop, in `src-tauri/src/lib.rs` (FR-039, FR-040)
+- [X] T112 Refuse export, import, and legacy-vault migration on Android with messages naming the platform and pointing at desktop; permit fresh profile creation through the shared vault path, in `src-tauri/src/lib.rs` (FR-039, FR-040)
 - [X] T113 Enable Android to open, use and save a sealed vault whose key arrived via a kit, in `src-tauri/src/keystore.rs` and `src-tauri/src/vault.rs` (FR-038, FR-041, FR-042)
 - [X] T114 [P] Add a UI warning when a profiles directory appears to sit inside a cloud-synced folder, in `src/components/ProfileSelectPage.tsx` — `flock` gives no cross-machine exclusion there (research.md Decision 11)
 - [X] T115 [P] Update `README.md` and `ARCHITECTURE.md` for the device-bound vault, the recovery kit, and the loss of password-only portability
