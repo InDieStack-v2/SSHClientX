@@ -39,11 +39,11 @@ are repository-relative and exact.
 
 **Purpose**: Dependencies and module scaffolding. Nothing here changes behaviour.
 
-- [ ] T001 Add `rcgen = "0.14"`, `qrcode = "0.14"`, `if-addrs = "0.14"` to `[dependencies]` in `src-tauri/Cargo.toml`, each with a comment naming its constitution v5.0.0 Technology & Architecture Constraints table row (spec 003 four-row table)
-- [ ] T002 Promote `hyper` (features `server`, `http1`), `hyper-util` (features `tokio`, `server`), `tokio-rustls`, and `rustls` from transitive to direct dependencies in `src-tauri/Cargo.toml`, with a comment noting all four are already fully resolved via `reqwest` → `hyper-rustls` (research.md Decision 1) — adds zero new crates
-- [ ] T003 [P] Add `jsqr` (`^1.4.0`) to `package.json` for the frontend QR decode path (research.md Decision 5)
-- [ ] T004 Create `src-tauri/src/qr_transfer.rs` and declare `mod qr_transfer;` in `src-tauri/src/lib.rs`
-- [ ] T005 [P] Run `cargo tree --manifest-path src-tauri/Cargo.toml -i openssl-sys` after adding T001's dependencies and confirm it still finds nothing (research.md Decision 8's OpenSSL-free guard, re-checked for the new crates)
+- [X] T001 Add `rcgen = "0.14"`, `qrcode = "0.14"`, `if-addrs = "0.14"` to `[dependencies]` in `src-tauri/Cargo.toml`, each with a comment naming its constitution v5.0.0 Technology & Architecture Constraints table row (spec 003 four-row table)
+- [X] T002 Promote `hyper` (features `server`, `http1`), `hyper-util` (features `tokio`, `server`), `tokio-rustls`, and `rustls` from transitive to direct dependencies in `src-tauri/Cargo.toml`, with a comment noting all four are already fully resolved via `reqwest` → `hyper-rustls` (research.md Decision 1) — adds zero new crates
+- [X] T003 [P] Add `jsqr` (`^1.4.0`) to `package.json` for the frontend QR decode path (research.md Decision 5)
+- [X] T004 Create `src-tauri/src/qr_transfer.rs` and declare `mod qr_transfer;` in `src-tauri/src/lib.rs`
+- [X] T005 [P] Run `cargo tree --manifest-path src-tauri/Cargo.toml -i openssl-sys` after adding T001's dependencies and confirm it still finds nothing (research.md Decision 8's OpenSSL-free guard, re-checked for the new crates)
 
 **Checkpoint**: Builds clean, no behaviour change, no new native/OpenSSL dependency.
 
@@ -59,36 +59,27 @@ verified session before it can move a single byte of vault content.
 
 ### QR ticket & outcomes
 
-- [ ] T006 [P] Add the 6 new `Outcome` variants (`QrBad`, `QrExpired`, `QrIpForbidden`, `NetUnreachable`, `TlsPin`, `TokUsed`) with `code()`/`message()` arms in `src-tauri/src/vault.rs`, per data-model.md §4
-- [ ] T007 Implement `QrTicket` parse/serialize in `src-tauri/src/qr_transfer.rs` per contracts/qr-transfer-protocol.md §1 and data-model.md §1: version, url, `tok`, `kid` (optional), `fp`, `exp`, `role`, `sid`, `lbl` (optional, hex-encoded UTF-8 label, data-model.md §1); validation order version → `exp` → URL scheme (`https` only, literal IP, never a hostname) → private/link-local/ULA address check → well-formed hex fields
-- [ ] T008 [P] Implement RFC1918/link-local/ULA address classification plus LAN interface enumeration via `if-addrs` in `src-tauri/src/qr_transfer.rs`, selecting the single `bind_addr` a session advertises and binds to (research.md Decision 6)
-- [ ] T009 [P] Add `#[cfg(test)]` tests in `src-tauri/src/qr_transfer.rs`: `QrTicket` round-trips; a bad version, an already-past `exp`, a public IP, and malformed hex each map to `QR_BAD`/`QR_EXPIRED`/`QR_IP_FORBIDDEN` correctly and in the right precedence order
-
-### Session lifecycle & crypto plumbing
-
-- [ ] T010 Implement `TransferSession` (fields per data-model.md §2: `sid`, `role`, `token_state`, `expires_at`, `fail_count`, `bind_addr`, `cert`, `key_status`, `max_body_bytes`) and its state machine in `src-tauri/src/qr_transfer.rs`, held in a new `QrTransferState` Tauri-managed state (same pattern as `ImportStagingState` in `lib.rs`)
-- [ ] T011 [P] Implement per-session self-signed certificate generation and its SHA-256 fingerprint via `rcgen` in `src-tauri/src/qr_transfer.rs` (research.md Decision 2)
-- [ ] T012 Implement `rustls::ServerConfig` assembly from the T011 certificate for the host's server (research.md Decision 1)
-- [ ] T013 Implement the custom `rustls::client::danger::ServerCertVerifier` that pins against a `QrTicket`'s `fp`, wired into a preconfigured `reqwest::Client` via `ClientBuilder::use_preconfigured_tls` for the guest (research.md Decision 3)
-- [ ] T014 Implement single-use token bookkeeping (`token_state` `Unused → Consumed` on `POST /done` or teardown), `fail_count` increment with teardown at 5, and `expires_at` teardown (≤120s) in `src-tauri/src/qr_transfer.rs` (spec FR-003, FR-004, FR-013)
-- [ ] T015 [P] Add `#[cfg(test)]` tests in `src-tauri/src/qr_transfer.rs` for `TransferSession` lifecycle: token is `Consumed` after `done` and rejects reuse; `fail_count` reaching 5 tears the session down; `expires_at` tears it down independent of activity — all against the pure state machine, no real socket
-
-### Host session server scaffold
-
-- [ ] T016 Implement the `hyper` + `tokio-rustls` accept loop in `src-tauri/src/qr_transfer.rs`, binding only to the session's `bind_addr` from T008/T010 (never `0.0.0.0`), serving via `hyper::server::conn::http1` + `hyper_util::rt::TokioIo` + a hand-written `service_fn` router (research.md Decision 1)
-- [ ] T017 Implement bearer-token auth in the T016 router: constant-time comparison against `tok`, incrementing `fail_count` on any mismatch, responding with `TOK_USED` specifically when the token was valid-but-already-consumed and a generic `401` otherwise (Principle IV guard; contracts/qr-transfer-protocol.md §2)
-- [ ] T018 Implement `GET /s/{sid}/meta` in the T016 router returning `{ kid, generation, size, sha256_prefix, needs_key }` per contracts/qr-transfer-protocol.md §2
-- [ ] T019 Implement `POST /s/{sid}/done` in the T016 router, marking `token_state = Consumed` and scheduling session teardown
-
-### QR display & scan commands
-
-- [ ] T020 [P] Implement QR SVG generation from a `QrTicket::to_string()` via the `qrcode` crate in `src-tauri/src/qr_transfer.rs` (research.md Decision 4)
-- [ ] T021 [P] Add the `android.permission.CAMERA` permission to `src-tauri/gen/android/app/src/main/AndroidManifest.xml`, required for `getUserMedia` camera capture on Android (spec FR-018)
-- [ ] T022 [P] Implement `src/components/QrScanCamera.tsx`: `getUserMedia` capture to a `<canvas>`, `jsqr` frame decode, emitting the decoded ticket text to its caller and nothing else (research.md Decision 5) — no `localStorage`/`sessionStorage` use
-- [ ] T023 Implement `qr_transfer_guest_scan` Tauri command in `src-tauri/src/lib.rs`: parses and validates ticket text via T007 (no network call yet), returning `{ session_id, verification_code, host_label }` on success (`host_label` = the ticket's `lbl` field hex-decoded, or `null` when absent) or a `QR_BAD`/`QR_EXPIRED`/`QR_IP_FORBIDDEN` outcome (contracts/qr-transfer-protocol.md §4). The ticket's `url` MUST NOT be passed to `tauri_plugin_opener`'s `open_url` (already wired up elsewhere in `lib.rs` for About-panel links) or any other external-open API, in this command or any caller — document this as a doc-comment on the command itself (spec FR-006), since it is an architectural invariant nothing here can unit-test on its own
-- [ ] T024 [P] Implement `qr_transfer_host_cancel` and `qr_transfer_guest_cancel` Tauri commands in `src-tauri/src/lib.rs`: tear down the session/server immediately; the guest variant best-effort calls `POST /done` if a connection was ever made
-- [ ] T053 [P] Implement screenshot/screen-recording prevention on the QR/scan and verification-code confirmation screens (spec FR-014): `FLAG_SECURE` on Android via `src-tauri/src/android_bridge.rs`'s existing JNI bridge, applied for the lifetime of `QrHostPanel.tsx`/`QrGuestScanPanel.tsx`; document in a code comment that no equivalent OS-level API exists on desktop platforms, so this is Android-only by necessity, not by omission
-- [ ] T054 Implement the manual-entry fallback for `qr_transfer_guest_scan` (spec FR-002, contracts/qr-transfer-protocol.md §6): render the T007 ticket string as copyable/selectable plain text alongside the QR in `QrHostPanel.tsx`, and add a text-entry field in `QrGuestScanPanel.tsx` that submits directly to the same `qr_transfer_guest_scan` command T023 already implements — no new command, no second parser
+- [X] T006 [P] Add the 6 new `Outcome` variants (`QrBad`, `QrExpired`, `QrIpForbidden`, `NetUnreachable`, `TlsPin`, `TokUsed`) with `code()`/`message()` arms in `src-tauri/src/vault.rs`, per data-model.md §4
+- [X] T007 Implement `QrTicket` parse/serialize in `src-tauri/src/qr_transfer.rs` per contracts/qr-transfer-protocol.md §1 and data-model.md §1: version, url, `tok`, `kid` (optional), `fp`, `exp`, `role`, `sid`, `lbl` (optional, hex-encoded UTF-8 label, data-model.md §1); validation order version → `exp` → URL scheme (`https` only, literal IP, never a hostname) → private/link-local/ULA address check → well-formed hex fields
+- [X] T008 [P] Implement RFC1918/link-local/ULA address classification plus LAN interface enumeration via `if-addrs` in `src-tauri/src/qr_transfer.rs`, selecting the single `bind_addr` a session advertises and binds to (research.md Decision 6)
+- [X] T009 [P] Add `#[cfg(test)]` tests in `src-tauri/src/qr_transfer.rs`: `QrTicket` round-trips; a bad version, an already-past `exp`, a public IP, and malformed hex each map to `QR_BAD`/`QR_EXPIRED`/`QR_IP_FORBIDDEN` correctly and in the right precedence order
+- [X] T010 Implement `TransferSession` (fields per data-model.md §2: `sid`, `role`, `token_state`, `expires_at`, `fail_count`, `bind_addr`, `cert`, `key_status`, `max_body_bytes`) and its state machine in `src-tauri/src/qr_transfer.rs`, held in a new `QrTransferState` Tauri-managed state (same pattern as `ImportStagingState` in `lib.rs`)
+- [X] T011 [P] Implement per-session self-signed certificate generation and its SHA-256 fingerprint via `rcgen` in `src-tauri/src/qr_transfer.rs` (research.md Decision 2)
+- [X] T012 Implement `rustls::ServerConfig` assembly from the T011 certificate for the host's server (research.md Decision 1)
+- [X] T013 Implement the custom `rustls::client::danger::ServerCertVerifier` that pins against a `QrTicket`'s `fp`, wired into a preconfigured `reqwest::Client` via `ClientBuilder::use_preconfigured_tls` for the guest (research.md Decision 3)
+- [X] T014 Implement single-use token bookkeeping (`token_state` `Unused → Consumed` on `POST /done` or teardown), `fail_count` increment with teardown at 5, and `expires_at` teardown (≤120s) in `src-tauri/src/qr_transfer.rs` (spec FR-003, FR-004, FR-013)
+- [X] T015 [P] Add `#[cfg(test)]` tests in `src-tauri/src/qr_transfer.rs` for `TransferSession` lifecycle: token is `Consumed` after `done` and rejects reuse; `fail_count` reaching 5 tears the session down; `expires_at` tears it down independent of activity — all against the pure state machine, no real socket
+- [X] T016 Implement the `hyper` + `tokio-rustls` accept loop in `src-tauri/src/qr_transfer.rs`, binding only to the session's `bind_addr` from T008/T010 (never `0.0.0.0`), serving via `hyper::server::conn::http1` + `hyper_util::rt::TokioIo` + a hand-written `service_fn` router (research.md Decision 1)
+- [X] T017 Implement bearer-token auth in the T016 router: constant-time comparison against `tok`, incrementing `fail_count` on any mismatch, responding with `TOK_USED` specifically when the token was valid-but-already-consumed and a generic `401` otherwise (Principle IV guard; contracts/qr-transfer-protocol.md §2)
+- [X] T018 Implement `GET /s/{sid}/meta` in the T016 router returning `{ kid, generation, size, sha256_prefix, needs_key }` per contracts/qr-transfer-protocol.md §2
+- [X] T019 Implement `POST /s/{sid}/done` in the T016 router, marking `token_state = Consumed` and scheduling session teardown
+- [X] T020 [P] Implement QR SVG generation from a `QrTicket::to_string()` via the `qrcode` crate in `src-tauri/src/qr_transfer.rs` (research.md Decision 4)
+- [X] T021 [P] Add the `android.permission.CAMERA` permission to `src-tauri/gen/android/app/src/main/AndroidManifest.xml`, required for `getUserMedia` camera capture on Android (spec FR-018)
+- [X] T022 [P] Implement `src/components/QrScanCamera.tsx`: `getUserMedia` capture to a `<canvas>`, `jsqr` frame decode, emitting the decoded ticket text to its caller and nothing else (research.md Decision 5) — no `localStorage`/`sessionStorage` use
+- [X] T023 Implement `qr_transfer_guest_scan` Tauri command in `src-tauri/src/lib.rs`: parses and validates ticket text via T007 (no network call yet), returning `{ session_id, verification_code, host_label }` on success (`host_label` = the ticket's `lbl` field hex-decoded, or `null` when absent) or a `QR_BAD`/`QR_EXPIRED`/`QR_IP_FORBIDDEN` outcome (contracts/qr-transfer-protocol.md §4). The ticket's `url` MUST NOT be passed to `tauri_plugin_opener`'s `open_url` (already wired up elsewhere in `lib.rs` for About-panel links) or any other external-open API, in this command or any caller — document this as a doc-comment on the command itself (spec FR-006), since it is an architectural invariant nothing here can unit-test on its own
+- [X] T024 [P] Implement `qr_transfer_host_cancel` and `qr_transfer_guest_cancel` Tauri commands in `src-tauri/src/lib.rs`: tear down the session/server immediately; the guest variant best-effort calls `POST /done` if a connection was ever made
+- [X] T053 [P] Implement screenshot/screen-recording prevention on the QR/scan and verification-code confirmation screens (spec FR-014): `FLAG_SECURE` on Android via `src-tauri/src/android_bridge.rs`'s existing JNI bridge, applied for the lifetime of `QrHostPanel.tsx`/`QrGuestScanPanel.tsx`; document in a code comment that no equivalent OS-level API exists on desktop platforms, so this is Android-only by necessity, not by omission
+- [X] T054 Implement the manual-entry fallback for `qr_transfer_guest_scan` (spec FR-002, contracts/qr-transfer-protocol.md §6): render the T007 ticket string as copyable/selectable plain text alongside the QR in `QrHostPanel.tsx`, and add a text-entry field in `QrGuestScanPanel.tsx` that submits directly to the same `qr_transfer_guest_scan` command T023 already implements — no new command, no second parser
 
 **Checkpoint**: A session can be created, advertised as a QR, scanned, and mutually verified
 (fingerprint pin + human-comparable code available on both sides) — no vault content or key
@@ -106,16 +97,16 @@ onboarding) or as a same-pattern copy (already-paired resync), per research.md D
 same Wi-Fi, one with no prior key for the vault and one already paired, both complete a "Share"
 transfer independently of Push/error-handling work.
 
-- [ ] T025 [US1] Implement `GET /s/{sid}/key` in the T016 router: serve the host's raw DEK bytes, only once the session has reached the `Verified` state, only for `role=pull` (contracts/qr-transfer-protocol.md §2)
-- [ ] T026 [US1] Implement `GET /s/{sid}/file` in the T016 router: serve the sealed vault file bytes (`application/x-sshclientx`), capped at `max_body_bytes`
-- [ ] T027 [US1] Implement `qr_transfer_host_start` for `{ action: "share" }` in `src-tauri/src/lib.rs`: creates a `TransferSession` (`role=pull`, `key_status=Owned`), starts the T016 server, sets the ticket's `lbl` from the active profile's name (or the OS hostname if none is open), returns `{ session_id, qr_svg, verification_code, expires_at }` (contracts/qr-transfer-protocol.md §4)
-- [ ] T028 [US1] Implement the guest's pinned connect and `GET /meta` call in `src-tauri/src/qr_transfer.rs`, using the T013 client
-- [ ] T029 [US1] Implement the guest's local "do I already hold this key?" check (query `keystore`/`recovery::unclaimed_dir` for the ticket's `kid`) and, when the key is missing, `GET /s/{sid}/key` followed by `recovery::establish_unclaimed_key()` with the received DEK (research.md Decisions 8–9) — the DEK exists only in local variables between receipt and this call, never written to a file or logged
-- [ ] T030 [US1] Implement the guest's `GET /s/{sid}/file` fetch, rejecting a response whose `Content-Length` exceeds `max_body_bytes` before fully buffering it (same early-rejection discipline as T036's `PUT` side), then `vault::verify_and_import()`, then land via the existing `claim_unclaimed_key_as_new_profile()` or `land_as_restore_over_copy()` per the returned `Disposition` — call these unmodified (research.md Decision 9)
-- [ ] T031 [US1] Implement `qr_transfer_guest_confirm` in `src-tauri/src/lib.rs` wiring T028–T030 end to end, returning `{ landed_profile_name, disposition }` on success or an `Outcome` code on failure (contracts/qr-transfer-protocol.md §4)
-- [ ] T032 [US1] [P] Implement `src/components/QrHostPanel.tsx`: QR display (from T020's SVG), verification code, countdown to `expires_at`, cancel button, "share" action
-- [ ] T033 [US1] [P] Implement `src/components/QrGuestScanPanel.tsx`: renders `QrScanCamera`, shows the verification code from `qr_transfer_guest_scan` for mandatory user confirmation *before* calling `qr_transfer_guest_confirm` (contracts/qr-transfer-protocol.md §3 — this confirm step is a UI gate, not server-enforced), then progress/result, prompting for a new vault password on this device when the result's `disposition` is `create_profile` with no password yet set
-- [ ] T034 [US1] Wire T029's "already holds the key" fast path into `QrGuestScanPanel.tsx`'s messaging — skip any password-for-new-device prompt when no key establishment happened (spec User Story 1, Acceptance Scenario 4)
+- [X] T025 [US1] Implement `GET /s/{sid}/key` in the T016 router: serve the host's raw DEK bytes, only once the session has reached the `Verified` state, only for `role=pull` (contracts/qr-transfer-protocol.md §2)
+- [X] T026 [US1] Implement `GET /s/{sid}/file` in the T016 router: serve the sealed vault file bytes (`application/x-sshclientx`), capped at `max_body_bytes`
+- [X] T027 [US1] Implement `qr_transfer_host_start` for `{ action: "share" }` in `src-tauri/src/lib.rs`: creates a `TransferSession` (`role=pull`, `key_status=Owned`), starts the T016 server, sets the ticket's `lbl` from the active profile's name (or the OS hostname if none is open), returns `{ session_id, qr_svg, verification_code, expires_at }` (contracts/qr-transfer-protocol.md §4)
+- [X] T028 [US1] Implement the guest's pinned connect and `GET /meta` call in `src-tauri/src/qr_transfer.rs`, using the T013 client
+- [X] T029 [US1] Implement the guest's local "do I already hold this key?" check (query `keystore`/`recovery::unclaimed_dir` for the ticket's `kid`) and, when the key is missing, `GET /s/{sid}/key` followed by `recovery::establish_unclaimed_key()` with the received DEK (research.md Decisions 8–9) — the DEK exists only in local variables between receipt and this call, never written to a file or logged
+- [X] T030 [US1] Implement the guest's `GET /s/{sid}/file` fetch, rejecting a response whose `Content-Length` exceeds `max_body_bytes` before fully buffering it (same early-rejection discipline as T036's `PUT` side), then `vault::verify_and_import()`, then land via the existing `claim_unclaimed_key_as_new_profile()` or `land_as_restore_over_copy()` per the returned `Disposition` — call these unmodified (research.md Decision 9)
+- [X] T031 [US1] Implement `qr_transfer_guest_confirm` in `src-tauri/src/lib.rs` wiring T028–T030 end to end, returning `{ landed_profile_name, disposition }` on success or an `Outcome` code on failure (contracts/qr-transfer-protocol.md §4)
+- [X] T032 [US1] [P] Implement `src/components/QrHostPanel.tsx`: QR display (from T020's SVG), verification code, countdown to `expires_at`, cancel button, "share" action
+- [X] T033 [US1] [P] Implement `src/components/QrGuestScanPanel.tsx`: renders `QrScanCamera`, shows the verification code from `qr_transfer_guest_scan` for mandatory user confirmation *before* calling `qr_transfer_guest_confirm` (contracts/qr-transfer-protocol.md §3 — this confirm step is a UI gate, not server-enforced), then progress/result, prompting for a new vault password on this device when the result's `disposition` is `create_profile` with no password yet set
+- [X] T034 [US1] Wire T029's "already holds the key" fast path into `QrGuestScanPanel.tsx`'s messaging — skip any password-for-new-device prompt when no key establishment happened (spec User Story 1, Acceptance Scenario 4)
 
 **Checkpoint**: User Story 1 fully functional and independently testable — first-time
 onboarding and already-paired resync, both landing correctly, both in the "share"/pull
@@ -131,12 +122,12 @@ that may lack the key and lands the incoming vault.
 **Independent Test**: [quickstart.md](quickstart.md) Scenario C — host chooses "Receive", guest
 sends its vault, independently of the Share/error-handling work.
 
-- [ ] T035 [US2] Implement `PUT /s/{sid}/key` in the T016 router: accept 32 raw bytes from the guest and call `recovery::establish_unclaimed_key()` on the **host** side when the host does not hold this `kid` (role=`push`)
-- [ ] T036 [US2] Implement `PUT /s/{sid}/file` in the T016 router: accept the sealed vault bytes, capped at `max_body_bytes` and rejected with `413` **before** being fully buffered on an over-cap `Content-Length`, then run `vault::verify_and_import()` and land via the existing commit helpers on the host side (same reuse as T030, now server-side)
-- [ ] T037 [US2] Implement `qr_transfer_host_start` for `{ action: "receive" }` in `src-tauri/src/lib.rs`: creates a `TransferSession` (`role=push`, `key_status` computed from the host's own local state for whatever `kid` it may already hold), ticket carries `role=push` and the same `lbl` sourcing as T027
-- [ ] T038 [US2] Implement the guest's push flow in `src-tauri/src/qr_transfer.rs`: when the host's `/meta` reports `needs_key`, `PUT /s/{sid}/key` with the guest's own DEK, then `PUT /s/{sid}/file` — symmetric to T029/T030
-- [ ] T039 [US2] Extend `qr_transfer_guest_confirm` in `src-tauri/src/lib.rs` to branch on the ticket's `role` (T028–T030's pull path vs. T038's push path)
-- [ ] T040 [US2] [P] Extend `QrHostPanel.tsx` with the "receive" action and `QrGuestScanPanel.tsx` with the "send my vault" action for `role=push`
+- [X] T035 [US2] Implement `PUT /s/{sid}/key` in the T016 router: accept 32 raw bytes from the guest and call `recovery::establish_unclaimed_key()` on the **host** side when the host does not hold this `kid` (role=`push`)
+- [X] T036 [US2] Implement `PUT /s/{sid}/file` in the T016 router: accept the sealed vault bytes, capped at `max_body_bytes` and rejected with `413` **before** being fully buffered on an over-cap `Content-Length`, then run `vault::verify_and_import()` and land via the existing commit helpers on the host side (same reuse as T030, now server-side)
+- [X] T037 [US2] Implement `qr_transfer_host_start` for `{ action: "receive" }` in `src-tauri/src/lib.rs`: creates a `TransferSession` (`role=push`, `key_status` computed from the host's own local state for whatever `kid` it may already hold), ticket carries `role=push` and the same `lbl` sourcing as T027
+- [X] T038 [US2] Implement the guest's push flow in `src-tauri/src/qr_transfer.rs`: when the host's `/meta` reports `needs_key`, `PUT /s/{sid}/key` with the guest's own DEK, then `PUT /s/{sid}/file` — symmetric to T029/T030
+- [X] T039 [US2] Extend `qr_transfer_guest_confirm` in `src-tauri/src/lib.rs` to branch on the ticket's `role` (T028–T030's pull path vs. T038's push path)
+- [X] T040 [US2] [P] Extend `QrHostPanel.tsx` with the "receive" action and `QrGuestScanPanel.tsx` with the "send my vault" action for `role=push`
 
 **Checkpoint**: User Stories 1 and 2 both work independently — pull and push directions both
 functional.
@@ -151,12 +142,12 @@ surfaces quickly and distinctly — no indefinite spinners, no ambiguous errors.
 **Independent Test**: [quickstart.md](quickstart.md) Scenarios D, E, F — unreachable guest,
 expired code, reused token — independently of the Share/Receive transfer logic itself.
 
-- [ ] T041 [US3] Implement a connect timeout in the guest's pinned client (T013) bounding `NET_UNREACHABLE` to within 5 seconds of the attempt (spec FR-015, SC-004)
-- [ ] T042 [US3] Implement the `TLS_PIN` path: a fingerprint mismatch aborts immediately, before any `meta`/`key`/`file` call, with no retry loop (contracts/qr-transfer-protocol.md §3 step 1)
-- [ ] T043 [US3] Re-check `QrTicket.exp` immediately before the guest's first network call (not only at initial scan), closing the race where a code expires between scan and confirm
-- [ ] T044 [US3] Ensure a connect that is refused or times out (including client-isolated Wi-Fi) surfaces identically to `NET_UNREACHABLE` — no separate, more confusing error for that case (spec Edge Cases)
-- [ ] T045 [US3] [P] Map every code in contracts/qr-transfer-protocol.md §5 to its exact user-facing message in `QrGuestScanPanel.tsx`/`QrHostPanel.tsx`
-- [ ] T046 [US3] [P] Add `#[cfg(test)]` tests in `src-tauri/src/qr_transfer.rs`: a session's `fail_count` reaching 5 tears it down and further requests are refused; a `Consumed` token is rejected on any later request against a fresh session with the same value; a ticket whose `exp` has already passed is rejected before any connect attempt is made
+- [X] T041 [US3] Implement a connect timeout in the guest's pinned client (T013) bounding `NET_UNREACHABLE` to within 5 seconds of the attempt (spec FR-015, SC-004)
+- [X] T042 [US3] Implement the `TLS_PIN` path: a fingerprint mismatch aborts immediately, before any `meta`/`key`/`file` call, with no retry loop (contracts/qr-transfer-protocol.md §3 step 1)
+- [X] T043 [US3] Re-check `QrTicket.exp` immediately before the guest's first network call (not only at initial scan), closing the race where a code expires between scan and confirm
+- [X] T044 [US3] Ensure a connect that is refused or times out (including client-isolated Wi-Fi) surfaces identically to `NET_UNREACHABLE` — no separate, more confusing error for that case (spec Edge Cases)
+- [X] T045 [US3] [P] Map every code in contracts/qr-transfer-protocol.md §5 to its exact user-facing message in `QrGuestScanPanel.tsx`/`QrHostPanel.tsx`
+- [X] T046 [US3] [P] Add `#[cfg(test)]` tests in `src-tauri/src/qr_transfer.rs`: a session's `fail_count` reaching 5 tears it down and further requests are refused; a `Consumed` token is rejected on any later request against a fresh session with the same value; a ticket whose `exp` has already passed is rejected before any connect attempt is made
 
 **Checkpoint**: All three user stories independently functional; every protocol-level error has
 a distinct, tested outcome and a user-facing message.
@@ -169,8 +160,8 @@ a distinct, tested outcome and a user-facing message.
 - [ ] T048 [P] Verify `if-addrs` enumerates interfaces correctly on Android; if it does not, fall back to reading interface data through the existing `src-tauri/src/android_bridge.rs` JNI bridge instead — research.md open risk
 - [ ] T049 Run `cargo tree --manifest-path src-tauri/Cargo.toml -e normal | grep x509-parser` after T001; if `rcgen`'s default features pulled in cert-verification support this feature never uses, trim to the minimal feature set that still provides generation + fingerprinting — research.md Decision 2 open item
 - [ ] T050 Run [quickstart.md](quickstart.md) Scenarios A–H manually across two real devices (including at least one Android run in both host and guest roles) and record results
-- [ ] T051 [P] Security pass over `src-tauri/src/qr_transfer.rs`: confirm T017's bearer-token comparison is genuinely constant-time (no short-circuiting byte compare), and confirm every DEK value handled between T025/T029/T035/T038 and its destination uses a `Zeroize`/`Zeroizing` wrapper with no intermediate `Vec<u8>` left unwiped
-- [ ] T052 Add a one-line status note to `docs/features/spec-02-qr-same-network.md` pointing at `specs/003-qr-same-network-transfer/` as its implementing feature, so the original tech spec and the shipped feature don't silently drift apart
+- [ ] T051 [US3] Security pass over `src-tauri/src/qr_transfer.rs`: confirm T017's bearer-token comparison is genuinely constant-time (no short-circuiting byte compare), and confirm every DEK value handled between T025/T029/T035/T038 and its destination uses a `Zeroize`/`Zeroizing` wrapper with no intermediate `Vec<u8>` left unwiped
+- [X] T052 Add a one-line status note to `docs/features/spec-02-qr-same-network.md` pointing at `specs/003-qr-same-network-transfer/` as its implementing feature, so the original tech spec and the shipped feature don't silently drift apart
 
 ---
 

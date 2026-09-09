@@ -22,6 +22,16 @@ class MainActivity : TauriActivity() {
   // `tauri android init`; re-apply this native declaration + call if that
   // happens.
   private external fun initKeystoreContext(context: Context)
+
+  fun setQrTransferScreenSecure(enabled: Boolean) {
+    runOnUiThread {
+      if (enabled) {
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+      } else {
+        window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+      }
+    }
+  }
   // Android 15+ (API 35) forces edge-to-edge — `setDecorFitsSystemWindows`
   // and the deprecated translucent-status-bar flags are ignored when
   // targetSdk >= 35. Our compileSdk/targetSdk are both 36, so the WebView
@@ -47,7 +57,7 @@ class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
 
-    initKeystoreContext(applicationContext)
+    initKeystoreContext(this)
 
     // Keep the OS from killing our process while the user is in another
     // app. All SSH state lives in the Rust backend in this same process,

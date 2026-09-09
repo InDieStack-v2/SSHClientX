@@ -164,6 +164,22 @@ bip39 = "2.2"
 # everywhere but is only ever invoked on macOS/Windows.
 robius-authentication = "0.3.1"
 
+# Same-network pairing (spec 003) — Constitution v5.0.0 dependency table:
+# rcgen generates a fresh pinned session certificate; qrcode renders the
+# Rust-owned ticket; if-addrs selects one LAN-only bind address.
+rcgen = "0.14"
+qrcode = "0.14"
+if-addrs = "0.14"
+# Already fully resolved through reqwest -> hyper-rustls (spec 003 Decision
+# 1); direct declarations enable the server and pinned-client APIs only.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+# `http-body-util` is already resolved by hyper; it supplies Hyper 1's owned
+# response bodies without adding a server framework or another transitive crate.
+http-body-util = "0.1"
+
 # ---------------------------------------------------------------------------
 # Desktop-only deps. These crates either don't compile on Android at all
 # (rfd — native file dialog) or have no meaningful mobile equivalent

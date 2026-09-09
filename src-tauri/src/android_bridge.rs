@@ -25,8 +25,12 @@
 //! mismatched mangled name that would surface as an
 //! `UnsatisfiedLinkError` only at runtime, on a real device.
 
-use jni::objects::{JClass, JObject};
-use jni::JNIEnv;
+use jni::objects::{JClass, JObject, JValue};
+use jni::{JNIEnv, JavaVM};
+use std::sync::OnceLock;
+
+static JAVA_VM: OnceLock<usize> = OnceLock::new();
+static ACTIVITY_REF: OnceLock<usize> = OnceLock::new();
 
 // Domain/package split follows tao_macros::android_fn's own documented
 // convention (`Java_{domain}_{package}_{class}_{function}`, dot-separated
@@ -48,35 +52,36 @@ tauri::tao::platform::android::prelude::android_fn![
 #[allow(non_snake_case)]
 unsafe fn initKeystoreContext<'local>(env: JNIEnv<'local>, _class: JClass<'local>, context: JObject<'local>) {
     let Ok(vm) = env.get_java_vm() else {
-        // No sensible recovery: without this, every later keystore call
-        // panics anyway. Logging (not panicking) here just makes THIS the
-        // diagnosable failure point instead of a confusing panic deep
-        // inside `android-native-keyring-store` on first vault use.
         eprintln!("[ANDROID_BRIDGE] failed to obtain the JavaVM handle; keystore access will fail later");
         return;
     };
     let vm_ptr = vm.get_java_vm_pointer();
-
-    // MUST be a global reference, not the local `context` parameter — a
-    // local ref is only valid for the duration of this JNI call and would
-    // leave `ndk_context` holding a dangling pointer the instant this
-    // function returns. `mem::forget` is deliberate: this reference must
-    // outlive the entire process (matching what `ndk_context` expects),
-    // so it is never released via `DeleteGlobalRef` at all.
-    let Ok(global_ref) = env.new_global_ref(context) else {
-        eprintln!("[ANDROID_BRIDGE] failed to create a global ref to the Android context; keystore access will fail later");
+    let Ok(global_ref) = env.new_global_ref(&context) else {
+        eprintln!("[ANDROID_BRIDGE] failed to create a global ref to the Android activity; keystore access will fail later");
         return;
     };
     let context_ptr = global_ref.as_obj().as_raw();
+    let _ = JAVA_VM.set(vm_ptr as usize);
+    let _ = ACTIVITY_REF.set(context_ptr as usize);
     std::mem::forget(global_ref);
-
     unsafe {
         ndk_context::initialize_android_context(vm_ptr.cast(), context_ptr.cast());
     }
-
-    // v1 never registers a default store on Android. Do it now that
-    // ndk-context is set — Store::new reads it and panics if it isn't.
     if let Err(e) = crate::keystore::ensure_android_store() {
         eprintln!("[ANDROID_BRIDGE] failed to register the Android keystore backend: {e}");
     }
+}
+
+/// Toggle Android's OS-level screenshot and screen-recording protection for
+/// the short-lived QR transfer screens. Desktop has no equivalent API.
+pub fn set_qr_transfer_screen_secure(enabled: bool) -> Result<(), String> {
+    let vm_ptr = *JAVA_VM.get().ok_or("[ANDROID_BRIDGE] JavaVM unavailable")? as *mut jni::sys::JavaVM;
+    let activity_ptr = *ACTIVITY_REF.get().ok_or("[ANDROID_BRIDGE] Activity unavailable")? as *mut jni::sys::_jobject;
+    let vm = unsafe { JavaVM::from_raw(vm_ptr).map_err(|_| "[ANDROID_BRIDGE] invalid JavaVM")? };
+    let mut env = vm.attach_current_thread().map_err(|e| format!("[ANDROID_BRIDGE] attach failed: {e}"))?;
+    let activity = unsafe { JObject::from_raw(activity_ptr) };
+    env.call_method(&activity, "setQrTransferScreenSecure", "(Z)V", &[JValue::Bool(enabled as u8)])
+        .map_err(|e| format!("[ANDROID_BRIDGE] secure-screen call failed: {e}"))?;
+    std::mem::forget(activity);
+    Ok(())
 }

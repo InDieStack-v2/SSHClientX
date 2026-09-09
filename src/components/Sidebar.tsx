@@ -1,4 +1,4 @@
-import { Server, KeyRound, Library, Activity, Settings, LogOut, Download } from "lucide-react";
+import { Server, KeyRound, Library, Activity, Settings, LogOut, Download, QrCode } from "lucide-react";
 
 // Vertical rail on desktop, horizontal bottom dock on mobile. Layout swap is
 // driven by `isMobile` so the terminal/session views can use the full screen
@@ -22,6 +22,7 @@ export const Sidebar = ({ activeTab, setActiveTab, isMobile, onLogout, onExport 
     { id: 'vault', icon: KeyRound, label: 'Logins' },
     { id: 'library', icon: Library, label: 'Library' },
     { id: 'monitor', icon: Activity, label: 'Monitor' },
+    { id: 'qr-transfer', icon: QrCode, label: 'Nearby transfer' },
   ];
 
   if (isMobile) {

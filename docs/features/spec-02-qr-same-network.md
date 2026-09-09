@@ -1,7 +1,8 @@
 # Tech spec 2 — QR scan transfer (same network)
 
-**Status:** v1  
-**Applies to:** desktop app and mobile app  
+**Status:** v1 implementation in progress
+**Applies to:** desktop app and mobile app
+**Implementation:** [spec 003 — QR same-network transfer](../../specs/003-qr-same-network-transfer/spec.md)
 **Related:** [Export / import](spec-01-export-import.md), [Cloud sync](spec-03-cloud-storage.md)
 
 ---

@@ -11,6 +11,8 @@ import { useBroadcast } from "./ui/broadcast";
 
 import ProfileSelectPage from "./components/ProfileSelectPage";
 import LockScreen from "./components/LockScreen";
+import QrHostPanel from "./components/QrHostPanel";
+import QrGuestScanPanel from "./components/QrGuestScanPanel";
 import RecoveryKitPanel from "./components/RecoveryKitPanel";
 import { useTauriListen } from "./hooks/useTauriListen";
 import logoUrl from "./assets/logo.png";
@@ -75,6 +77,11 @@ function DesktopApp() {
   // T090: offered once the notice above is acknowledged.
   const [recoveryCreateOpen, setRecoveryCreateOpen] = useState(false);
   const [activeView, setActiveView] = useState<string>("nodes");
+  useEffect(() => {
+    if (activeView !== "qr-transfer") return;
+    void invoke("qr_transfer_screen_protect", { enabled: true }).catch(() => {});
+    return () => { void invoke("qr_transfer_screen_protect", { enabled: false }).catch(() => {}); };
+  }, [activeView]);
   const [sessions, setSessions] = useState<Session[]>([]);
   // Tracks the live status of each open session ('connecting' | 'connected'
   // | 'failed' | 'disconnected'). Updated via the callback every SessionView
@@ -1475,6 +1482,16 @@ function DesktopApp() {
               />
             )}
 
+            {activeView === "qr-transfer" && (
+              <div className="flex-1 flex flex-col min-h-0">
+                <div className="flex-1 min-h-0">
+                  <QrHostPanel />
+                </div>
+                <div className="border-t border-white/10 min-h-0 max-h-[52%]">
+                  <QrGuestScanPanel />
+                </div>
+              </div>
+            )}
             {activeView === "vault" && (
               <div className="flex-1 flex flex-col p-4 sm:p-8 space-y-6 sm:space-y-8 animate-in overflow-y-auto custom-scrollbar">
                 <header className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3 border-b border-zinc-700 pb-5 sm:pb-6 shrink-0">

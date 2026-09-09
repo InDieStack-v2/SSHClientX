@@ -56,6 +56,20 @@ pub enum Outcome {
     /// The profile is already open for writing in another running instance.
     VaultBusy,
 
+    // --- §5.4 Same-network QR pairing outcomes ---
+    /// A QR pairing ticket failed structural validation.
+    QrBad,
+    /// The QR pairing ticket's bounded lifetime elapsed.
+    QrExpired,
+    /// The ticket pointed anywhere except a LAN/private literal IP.
+    QrIpForbidden,
+    /// The scanned host cannot be reached over the local network.
+    NetUnreachable,
+    /// The host certificate did not match the QR-derived pin.
+    TlsPin,
+    /// The pairing session has already completed or been torn down.
+    TokUsed,
+
     // --- §5.3 Recovery-kit outcomes ---
     /// The recovery phrase failed its checksum, or the file is not a kit.
     /// Raised before any passphrase attempt (FR-019e).
@@ -88,6 +102,12 @@ impl Outcome {
             Outcome::VaultKeystoreDenied => "VAULT_KEYSTORE_DENIED",
             Outcome::VaultKdf => "VAULT_KDF",
             Outcome::VaultBusy => "VAULT_BUSY",
+            Outcome::QrBad => "QR_BAD",
+            Outcome::QrExpired => "QR_EXPIRED",
+            Outcome::QrIpForbidden => "QR_IP_FORBIDDEN",
+            Outcome::NetUnreachable => "NET_UNREACHABLE",
+            Outcome::TlsPin => "TLS_PIN",
+            Outcome::TokUsed => "TOK_USED",
             Outcome::KitMalformed => "KIT_MALFORMED",
             Outcome::KitWrongPassphrase => "KIT_WRONG_PASSPHRASE",
             Outcome::KitKidMismatch => "KIT_KID_MISMATCH",
@@ -142,6 +162,12 @@ impl Outcome {
             Outcome::VaultKdf => "Could not derive the vault key from the password.",
             Outcome::VaultBusy => "This profile is already open in another running copy of the app.",
             Outcome::KitMalformed => "This isn't a valid recovery phrase or recovery file.",
+            Outcome::QrBad => "This code isn't a valid transfer code.",
+            Outcome::QrExpired => "This code has expired. Ask the other device to show a new one.",
+            Outcome::QrIpForbidden => "This code isn't a valid transfer code.",
+            Outcome::NetUnreachable => "Not on the same Wi-Fi. Export a .sshclientx file instead.",
+            Outcome::TlsPin => "Could not verify the other device. Try scanning again.",
+            Outcome::TokUsed => "This code was already used. Ask the other device to show a new one.",
             Outcome::KitWrongPassphrase => {
                 "Wrong recovery passphrase for this kit — or, for a typed phrase, this isn't the vault file it was created for."
             }
@@ -171,6 +197,8 @@ mod outcome_tests {
             Outcome::VaultUnknownKid, Outcome::VaultRollback, Outcome::VaultNoKeystore,
             Outcome::VaultKeystoreDenied, Outcome::VaultKdf, Outcome::VaultBusy,
             Outcome::KitMalformed, Outcome::KitWrongPassphrase, Outcome::KitKidMismatch,
+            Outcome::QrBad, Outcome::QrExpired, Outcome::QrIpForbidden, Outcome::NetUnreachable,
+            Outcome::TlsPin, Outcome::TokUsed,
         ];
         let mut codes: Vec<&str> = all.iter().map(|o| o.code()).collect();
         let before = codes.len();

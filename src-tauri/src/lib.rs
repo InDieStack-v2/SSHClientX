@@ -33,6 +33,9 @@ mod lock;
 // Opt-in offline recovery kit: phrase and file forms, sealed under a
 // per-kit recovery passphrase distinct from any device's vault password.
 mod recovery;
+// Short-lived LAN-only QR pairing: ticket validation, TLS session transport,
+// and transfer state. The webview receives only the public ticket/SVG.
+mod qr_transfer;
 // T113: JNI bridge that initializes ndk-context's global Android context,
 // required by the Android keystore backend before first use. See the
 // module doc for why this exists — Tauri does not do this itself.
@@ -1854,6 +1857,265 @@ async fn unclaimed_key_claim_inner(
     let dek = keywrap.unwrap_dek(&device_factor, &key_password).map_err(|o| o.to_string())?;
 
     land_recovered_key(&dir, &vault_file_bytes, &dek, kid, &name).await
+}
+
+#[tauri::command]
+async fn qr_transfer_host_start(
+    app_handle: tauri::AppHandle,
+    db_state: tauri::State<'_, DbState>,
+    transfer_state: tauri::State<'_, qr_transfer::QrTransferState>,
+    action: String,
+    key_password: Option<String>,
+    profile_name: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let role = match action.as_str() {
+        "share" => qr_transfer::TransferRole::Pull,
+        "receive" => qr_transfer::TransferRole::Push,
+        _ => return Err("[VALIDATION] QR_TRANSFER_ACTION".into()),
+    };
+    let (path, kid, generation, label, dek) = {
+        let path = db_state.db_path.lock().map_err(|_| "[STATE] LOCK_FAILED_PATH")?.clone();
+        let kid = *db_state.kid.lock().map_err(|_| "[STATE] LOCK_FAILED_KID")?;
+        let generation = *db_state.generation.lock().map_err(|_| "[STATE] LOCK_FAILED_GENERATION")?;
+        let label = db_state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED_PROFILE")?.clone();
+        let dek = db_state.dek.lock().map_err(|_| "[STATE] LOCK_FAILED_KEY")?
+            .as_ref()
+            .map(|key| Zeroizing::new(**key));
+        (path, kid, generation, label, dek)
+    };
+    if role == qr_transfer::TransferRole::Pull && (path.is_none() || kid.is_none() || dek.is_none()) {
+        return Err(vault::Outcome::VaultLocked.to_string());
+    }
+    if role == qr_transfer::TransferRole::Push {
+        if key_password.as_deref().is_none_or(|password| password.len() < 8) {
+            return Err("[VALIDATION] QR_RECEIVE_PASSWORD_REQUIRED".into());
+        }
+        if profile_name.as_deref().is_none_or(|name| name.trim().is_empty()) {
+            return Err("[VALIDATION] QR_RECEIVE_PROFILE_NAME_REQUIRED".into());
+        }
+    }
+    let (file, size, sha256_prefix) = if role == qr_transfer::TransferRole::Pull {
+        let path = path.ok_or_else(|| vault::Outcome::VaultLocked.to_string())?;
+        let bytes = tokio::task::spawn_blocking(move || fs::read(path))
+            .await
+            .map_err(|e| format!("[STATE] QR_FILE_READ_JOIN: {e}"))?
+            .map_err(|e| format!("[FILE] QR_FILE_READ_FAILED: {e}"))?;
+        if bytes.len() as u64 > qr_transfer::MAX_BODY_BYTES {
+            return Err("[FILE] QR_TRANSFER_TOO_LARGE: vault files must not exceed 8 MiB.".into());
+        }
+        let size = bytes.len() as u64;
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(&bytes);
+        (Some(bytes), Some(size), Some(hex::encode(&digest[..4])))
+    } else {
+        (None, None, None)
+    };
+    let ticket = transfer_state.start_host(
+        role,
+        if role == qr_transfer::TransferRole::Pull { kid } else { None },
+        qr_transfer::TransferMetadata {
+            kid: if role == qr_transfer::TransferRole::Pull { kid } else { None },
+            generation: if role == qr_transfer::TransferRole::Pull { generation } else { None },
+            size,
+            sha256_prefix,
+            needs_key: role == qr_transfer::TransferRole::Push,
+        },
+        label,
+        file,
+        dek,
+        Some(app_handle),
+        key_password,
+        profile_name,
+    ).await.map_err(|outcome| outcome.to_string())?;
+    Ok(serde_json::json!({
+        "session_id": hex::encode(ticket.sid),
+        "qr_svg": qr_transfer::qr_svg(&ticket).map_err(|outcome| outcome.to_string())?,
+        "ticket_text": ticket.to_wire(),
+        "verification_code": ticket.verification_code(),
+        "expires_at": ticket.expires_at,
+    }))
+}
+
+#[tauri::command]
+async fn qr_transfer_host_cancel(
+    state: tauri::State<'_, qr_transfer::QrTransferState>,
+    session_id: String,
+) -> Result<(), String> {
+    state.cancel_host(&session_id).await.map_err(|outcome| outcome.to_string())
+}
+
+/// Parses only the public QR ticket and stages it in Rust for the explicit
+/// confirmation command. The ticket URL is deliberately never opened through
+/// an external application; only the pinned Rust client may connect to it.
+#[tauri::command]
+async fn qr_transfer_guest_scan(
+    state: tauri::State<'_, qr_transfer::QrTransferState>,
+    ticket_text: String,
+) -> Result<serde_json::Value, String> {
+    let ticket = qr_transfer::QrTicket::parse(&ticket_text, qr_transfer::now_unix_seconds())
+        .map_err(|outcome| outcome.to_string())?;
+    let verification_code = ticket.verification_code();
+    let host_label = ticket.host_label.clone();
+    let session_id = state.stage_guest(ticket).map_err(|outcome| outcome.to_string())?;
+    Ok(serde_json::json!({
+        "session_id": session_id,
+        "verification_code": verification_code,
+        "host_label": host_label,
+    }))
+}
+
+/// Toggle Android FLAG_SECURE while the QR transfer surface is visible.
+/// Desktop platforms intentionally return success because they expose no
+/// equivalent OS-level screen-capture prevention API.
+#[tauri::command]
+async fn qr_transfer_screen_protect(enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        return android_bridge::set_qr_transfer_screen_secure(enabled);
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = enabled;
+        Ok(())
+    }
+}
+
+#[tauri::command]
+async fn qr_transfer_guest_cancel(
+    state: tauri::State<'_, qr_transfer::QrTransferState>,
+    session_id: String,
+) -> Result<(), String> {
+    state.cancel_guest(&session_id).map_err(|outcome| outcome.to_string())
+}
+
+#[tauri::command]
+async fn qr_transfer_guest_confirm(
+    app_handle: tauri::AppHandle,
+    db_state: tauri::State<'_, DbState>,
+    transfer_state: tauri::State<'_, qr_transfer::QrTransferState>,
+    session_id: String,
+    mut key_password: Option<String>,
+    profile_name: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let ticket = transfer_state.guest(&session_id).map_err(|outcome| outcome.to_string())?;
+    if ticket.expires_at <= qr_transfer::now_unix_seconds() {
+        return Err(vault::Outcome::QrExpired.to_string());
+    }
+    if ticket.role != qr_transfer::TransferRole::Pull {
+        return Err("[VALIDATION] QR_TRANSFER_ROLE".into());
+    }
+    let client = qr_transfer::pinned_client(&ticket).map_err(|outcome| outcome.to_string())?;
+    let authorization = format!("Bearer {}", hex::encode(ticket.token));
+    let meta = client.get(ticket.endpoint("meta"))
+        .header(reqwest::header::AUTHORIZATION, &authorization)
+        .send()
+        .await
+        .map_err(|_| vault::Outcome::NetUnreachable.to_string())?;
+    let _meta: serde_json::Value = qr_transfer::checked_response(meta)
+        .await
+        .map_err(|outcome| outcome.to_string())?
+        .json()
+        .await
+        .map_err(|_| vault::Outcome::QrBad.to_string())?;
+    if ticket.role == qr_transfer::TransferRole::Push {
+        let path = db_state.db_path.lock().map_err(|_| "[STATE] LOCK_FAILED_PATH")?
+            .clone().ok_or_else(|| vault::Outcome::VaultLocked.to_string())?;
+        let dek = db_state.dek.lock().map_err(|_| "[STATE] LOCK_FAILED_KEY")?
+            .as_ref().map(|key| **key).ok_or_else(|| vault::Outcome::VaultLocked.to_string())?;
+        let file = tokio::task::spawn_blocking(move || fs::read(path))
+            .await.map_err(|e| format!("[STATE] QR_FILE_READ_JOIN: {e}"))?
+            .map_err(|e| format!("[FILE] QR_FILE_READ_FAILED: {e}"))?;
+        if file.len() as u64 > qr_transfer::MAX_BODY_BYTES {
+            return Err("[FILE] QR_TRANSFER_TOO_LARGE: vault files must not exceed 8 MiB.".into());
+        }
+        for (resource, body) in [("key", dek.to_vec()), ("file", file)] {
+            let response = client.put(ticket.endpoint(resource))
+                .header(reqwest::header::AUTHORIZATION, &authorization)
+                .body(body)
+                .send().await
+                .map_err(|_| vault::Outcome::NetUnreachable.to_string())?;
+            qr_transfer::checked_response(response).await.map_err(|outcome| outcome.to_string())?;
+        }
+        let done = client.post(ticket.endpoint("done"))
+            .header(reqwest::header::AUTHORIZATION, authorization)
+            .send().await
+            .map_err(|_| vault::Outcome::NetUnreachable.to_string())?;
+        qr_transfer::checked_response(done).await.map_err(|outcome| outcome.to_string())?;
+        transfer_state.cancel_guest(&session_id).map_err(|outcome| outcome.to_string())?;
+        return Ok(serde_json::json!({ "disposition": "push_sent" }));
+    }
+
+    if ticket.role != qr_transfer::TransferRole::Pull {
+        return Err("[VALIDATION] QR_TRANSFER_ROLE".into());
+    }
+
+    let kid = ticket.kid.ok_or_else(|| vault::Outcome::QrBad.to_string())?;
+    let dir = profiles_dir(&app_handle)?;
+    let mut lookup = resolve_key_lookup(&db_state, &dir, kid, key_password.as_deref())?;
+    let mut received_key: Option<Zeroizing<[u8; 32]>> = None;
+    if matches!(lookup, vault::KeyLookup::Unknown) {
+        let password = key_password.as_deref()
+            .filter(|password| password.len() >= 8)
+            .ok_or("[VALIDATION] QR_NEW_VAULT_PASSWORD_REQUIRED")?;
+        let key_response = client.get(ticket.endpoint("key"))
+            .header(reqwest::header::AUTHORIZATION, &authorization)
+            .send()
+            .await
+            .map_err(|_| vault::Outcome::NetUnreachable.to_string())?;
+        let key_response = qr_transfer::checked_response(key_response)
+            .await
+            .map_err(|outcome| outcome.to_string())?;
+        if key_response.content_length() != Some(32) {
+            return Err(vault::Outcome::QrBad.to_string());
+        }
+        let bytes = key_response.bytes().await.map_err(|_| vault::Outcome::NetUnreachable.to_string())?;
+        let raw_key: [u8; 32] = bytes.as_ref().try_into().map_err(|_| vault::Outcome::QrBad.to_string())?;
+        let key = Zeroizing::new(raw_key);
+        recovery::establish_unclaimed_key(&dir, &key, kid, password).map_err(|outcome| outcome.to_string())?;
+        lookup = vault::KeyLookup::Unclaimed { key: *key };
+        received_key = Some(key);
+    }
+    if let Some(password) = key_password.as_mut() {
+        password.zeroize();
+    }
+
+    let file_response = client.get(ticket.endpoint("file"))
+        .header(reqwest::header::AUTHORIZATION, &authorization)
+        .send()
+        .await
+        .map_err(|_| vault::Outcome::NetUnreachable.to_string())?;
+    let file_response = qr_transfer::checked_response(file_response)
+        .await
+        .map_err(|outcome| outcome.to_string())?;
+    if file_response.content_length().is_some_and(|length| length > qr_transfer::MAX_BODY_BYTES) {
+        return Err("[FILE] QR_TRANSFER_TOO_LARGE: vault files must not exceed 8 MiB.".into());
+    }
+    let file = file_response.bytes().await.map_err(|_| vault::Outcome::NetUnreachable.to_string())?;
+    if file.len() as u64 > qr_transfer::MAX_BODY_BYTES {
+        return Err("[FILE] QR_TRANSFER_TOO_LARGE: vault files must not exceed 8 MiB.".into());
+    }
+    let registry = move |_: &[u8; vault::KID_LEN]| -> vault::KeyLookup { lookup.clone() };
+    let decision = vault::verify_and_import(&file, &registry, true).map_err(|outcome| outcome.to_string())?;
+    let (landed_profile_name, disposition) = match decision.disposition {
+        vault::Disposition::CreateProfile => {
+            let name = profile_name.as_deref().ok_or("[VALIDATION] QR_PROFILE_NAME_REQUIRED")?;
+            (claim_unclaimed_key_as_new_profile(&dir, decision.sealed.kid, name, false, &file).await?, "create_profile")
+        }
+        vault::Disposition::RestoreOver { profile } => {
+            (land_as_restore_over_copy(&dir, &profile, &file).await?, "restore_over_copy")
+        }
+        vault::Disposition::NoOp { profile } => (profile, "no_op"),
+    };
+    let _ = client.post(ticket.endpoint("done"))
+        .header(reqwest::header::AUTHORIZATION, authorization)
+        .send()
+        .await;
+    transfer_state.cancel_guest(&session_id).map_err(|outcome| outcome.to_string())?;
+    drop(received_key);
+    Ok(serde_json::json!({
+        "landed_profile_name": landed_profile_name,
+        "disposition": disposition,
+    }))
 }
 
 /// Copy a profile's encrypted file to a user-chosen location so it can be
@@ -10235,6 +10497,7 @@ pub fn run() {
     builder
         .manage(DbState { conn: std::sync::Arc::new(StdMutex::new(None)), dek: StdMutex::new(None), kid: StdMutex::new(None), generation: StdMutex::new(None), sender_id: StdMutex::new(None), db_path: StdMutex::new(None), active_profile: StdMutex::new(None), hlc: StdMutex::new(None), writer_claim: StdMutex::new(None), lock_state: StdMutex::new(lock::LockState::Unlocked), platform_auth_failures: StdMutex::new(0) })
         .manage(ImportStagingState::default())
+        .manage(qr_transfer::QrTransferState::default())
         .manage(SshState::new())
         // Docker live-log stream registry — keyed by frontend-issued stream id,
         // values are tokio AbortHandles so the user can stop tailing on demand.
@@ -10371,6 +10634,9 @@ pub fn run() {
             idle_timeout_get, idle_timeout_set,
             recovery_kit_create, recovery_kit_save_file, recovery_kit_consume, pick_and_read_file, read_local_file_bytes,
             unclaimed_keys_list, unclaimed_key_discard, unclaimed_key_claim,
+            qr_transfer_host_start, qr_transfer_host_cancel,
+            qr_transfer_guest_scan, qr_transfer_guest_confirm, qr_transfer_guest_cancel,
+            qr_transfer_screen_protect,
             export_profile, import_vault_pick, import_vault_commit, import_vault_discard,
             add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_jump_host, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
             get_credentials, generate_ssh_key,
