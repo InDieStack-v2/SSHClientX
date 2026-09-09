@@ -214,13 +214,16 @@ mod outcome_tests {
 // ---------------------------------------------------------------------------
 
 pub(crate) const LEGACY_MAGIC: &[u8; 4] = b"OMNV";
+#[cfg(any(not(target_os = "android"), test))]
 pub(crate) const LEGACY_VERSION: u8 = 1;
 pub(crate) const LEGACY_SALT_LEN: usize = 16;
 /// Nonce length for the legacy format specifically. Fixed forever at 12
 /// bytes because every `OMNV` file ever written used AES-256-GCM — this is
 /// NOT the same constant as the new sealed container's nonce length, which
 /// varies by algorithm (see `SEALED_NONCE_LEN`, T014).
+#[cfg(any(not(target_os = "android"), test))]
 pub(crate) const LEGACY_NONCE_LEN: usize = 12;
+#[cfg(any(not(target_os = "android"), test))]
 pub(crate) const LEGACY_HEADER_LEN: usize = 4 + 1 + LEGACY_SALT_LEN;
 
 pub(crate) const LEGACY_ARGON2_M_COST: u32 = 64 * 1024;
@@ -260,6 +263,7 @@ pub(crate) fn legacy_encrypt(plaintext: &[u8], key: &[u8; 32]) -> Result<(Vec<u8
     Ok((ciphertext, nonce_bytes))
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 pub(crate) fn legacy_decrypt(
     ciphertext: &[u8],
     nonce_bytes: &[u8],
@@ -280,6 +284,7 @@ pub(crate) fn legacy_decrypt(
 }
 
 /// Returns (salt, nonce, ciphertext) parsed out of a legacy on-disk blob.
+#[cfg(any(not(target_os = "android"), test))]
 pub(crate) fn legacy_parse_blob(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
     if data.len() < LEGACY_HEADER_LEN + LEGACY_NONCE_LEN {
         return Err("[VAULT] INVALID_FORMAT: Data too short".into());
@@ -2084,6 +2089,7 @@ mod key_model_tests {
 
 /// What the caller keeps in memory for the rest of this profile session
 /// after a successful migration.
+#[cfg(any(not(target_os = "android"), test))]
 pub struct MigratedVault {
     pub dek: Zeroizing<[u8; 32]>,
     pub kid: [u8; KID_LEN],
@@ -2108,6 +2114,7 @@ pub struct MigratedVault {
 /// sealed file (complete, verified) is intact — never neither, and the
 /// legacy file remains a fallback until the caller positively confirms the
 /// new one works.
+#[cfg(any(not(target_os = "android"), test))]
 pub fn migrate_to_sealed(
     plaintext: &[u8],
     password: &str,

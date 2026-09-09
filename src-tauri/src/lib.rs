@@ -56,6 +56,7 @@ use tokio::io::AsyncReadExt;
 // Phase 6 (T103) deleted their last callers (the old `import_profile_pick`/
 // `import_profile_save` header-sniffing code) — new code reaches for
 // `vault::LEGACY_*` directly.
+#[cfg(not(target_os = "android"))]
 use vault::LEGACY_SALT_LEN as SALT_LEN;
 
 pub struct DbState {
@@ -222,6 +223,7 @@ fn resolve_profile_path(dir: &Path, name: &str) -> PathBuf {
     modern
 }
 
+#[cfg(not(target_os = "android"))]
 fn migrate_vault_path(path: &Path) -> PathBuf {
     match path.extension().and_then(|e| e.to_str()) {
         Some(VAULT_EXT_LEGACY) => path.with_extension(VAULT_EXT),
@@ -1464,6 +1466,7 @@ async fn confirm_identity_by_password(state: &DbState, password: String) -> Resu
 /// only succeeds for the correct password, so success alone confirms
 /// identity. The DEK is discarded immediately; nothing here touches session
 /// state.
+#[cfg(not(target_os = "android"))]
 async fn verify_profile_password(
     app_handle: &tauri::AppHandle,
     name: &str,
@@ -2781,14 +2784,20 @@ async fn setup_master_db_inner(
         fs::create_dir_all(&dir).map_err(|e| format!("[FILE] DIR_CREATION_FAILED: {}", e))?;
     }
 
+    #[cfg(not(target_os = "android"))]
     let mut path = profile_path(&app_handle, &profile_name)?;
+    #[cfg(target_os = "android")]
+    let path = profile_path(&app_handle, &profile_name)?;
     let mut conn;
     let dek: Zeroizing<[u8; 32]>;
     let kid: [u8; vault::KID_LEN];
     let generation: u64;
     let sender_id: [u8; vault::SENDER_ID_LEN];
     let needs_resave;
+    #[cfg(not(target_os = "android"))]
     let mut migrated_this_unlock = false;
+    #[cfg(target_os = "android")]
+    let migrated_this_unlock = false;
 
     if path.exists() {
         let file_bytes = fs::read(&path)
@@ -8559,6 +8568,7 @@ async fn sftp_open_remote_file(
     session_id: String,
     remote_path: String,
 ) -> Result<(), String> {
+    #[cfg(not(target_os = "android"))]
     use tauri::Emitter;
 
     let sftp = get_sftp_session(&state, &session_id).await?;
@@ -8584,7 +8594,7 @@ async fn sftp_open_remote_file(
     // depend on. Refuse cleanly so the UI can surface a polite message.
     #[cfg(target_os = "android")]
     {
-        let _ = &temp_file_path;
+        let _ = (&app_handle, &temp_file_path);
         return Err("Live edit in system editor is not available on Android.".into());
     }
     #[cfg(not(target_os = "android"))]
@@ -8594,6 +8604,8 @@ async fn sftp_open_remote_file(
             return Err(format!("Failed to open file: {}", e));
         }
     }
+    #[cfg(not(target_os = "android"))]
+    {
 
     // Spawn modification watcher task in background
     let connections_clone = Arc::clone(&state.connections);
@@ -8737,7 +8749,8 @@ async fn sftp_open_remote_file(
         let _ = std::fs::remove_file(&temp_file_path_clone);
     });
 
-    Ok(())
+        Ok(())
+    }
 }
 
 #[tauri::command]

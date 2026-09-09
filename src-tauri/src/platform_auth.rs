@@ -12,11 +12,13 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthOutcome {
     /// The user authenticated successfully.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     Success,
     /// The user was shown a prompt and failed it (wrong fingerprint/PIN,
     /// cancelled, or fell back to a method the policy doesn't support).
     /// Counts toward the repeated-failure threshold that forces a password
     /// fallback (FR-057, T065).
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     Failed,
     /// No prompt could be shown at all — no biometrics enrolled, no device
     /// passcode set, the platform has no mechanism (Linux), or (macOS

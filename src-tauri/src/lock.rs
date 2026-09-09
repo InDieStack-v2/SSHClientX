@@ -33,8 +33,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// open as still-ours rather than a real backgrounding.
 static OPEN_DIALOGS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(not(target_os = "android"))]
 pub struct DialogGuard(());
 
+#[cfg(not(target_os = "android"))]
 impl DialogGuard {
     pub fn open() -> Self {
         OPEN_DIALOGS.fetch_add(1, Ordering::SeqCst);
@@ -42,6 +44,7 @@ impl DialogGuard {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl Drop for DialogGuard {
     fn drop(&mut self) {
         OPEN_DIALOGS.fetch_sub(1, Ordering::SeqCst);
@@ -85,6 +88,7 @@ pub enum LockEvent {
     /// The configured idle timeout elapsed with no user input.
     IdleTimeout,
     /// The OS screen locked, or the system went to sleep.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     OsScreenLockOrSleep,
     /// The user pressed the UI's explicit lock button, or the app is exiting.
     ExplicitLock,
