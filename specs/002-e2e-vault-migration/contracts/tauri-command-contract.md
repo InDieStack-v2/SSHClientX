@@ -69,7 +69,7 @@ or `None` if the user cancelled the save dialog.
 
 Errors: `BOX_AUTH`, `VAULT_NO_KEYSTORE`, `VAULT_KEYSTORE_DENIED`.
 
-Desktop only; Android returns the platform refusal (FR-040).
+Desktop only; Android returns the platform refusal.
 
 ### `import_profile_pick() -> Option<ImportPreview>` · `import_profile_save(...)`
 
@@ -80,10 +80,12 @@ signature survives verification, disposition, and conflict handling.
 
 ## 2. New commands — import
 
-### `import_vault_pick() -> Option<StagedImport>`
+### `import_vault_pick(source_path?, key_password?, retry_staging_id?) -> Option<StagedImport>`
 
-Opens the picker, copies the bytes into the app sandbox, and runs
-`verify_and_import` (FR-029, FR-030) up to but not including the write.
+Desktop opens the native picker when `source_path` is absent. Android requires `source_path`
+from its in-app file browser. Rust guards that path and bounded-copies at most 64 MiB into the
+app sandbox before `verify_and_import` runs; source bytes never transit the renderer
+(FR-029, FR-030).
 
 `StagedImport`: `{ staging_id, disposition, profile?, confirmation_needed, incoming_revision, sender_name, created_at }`
 
@@ -141,10 +143,8 @@ without a passphrase attempt (FR-019e).
 
 `vault_file` is **required for the phrase form on every platform**, because the phrase carries
 only 32 bytes and the Argon2id salt is derived from the `kid` inside the vault file
-(research.md Decision 10). It is required on Android for the file form too, since general
-import is refused there (FR-040) and the single-action restore below is Android's only path
-to an open profile. It is optional only for the file form on desktop, where the kit is
-self-contained and the user may import separately afterwards.
+(research.md Decision 10). It is optional for the file form: after establishing its unclaimed
+key, either platform may import the matching vault through the general import flow.
 
 Now written into the spec as FR-019g and FR-019h.
 
@@ -255,12 +255,12 @@ Live SSH sessions, tunnels, transfers, mirrors, and monitors keep running across
 
 | Command | Desktop | Android |
 | --- | --- | --- |
-| `export_profile`, `import_vault_*` | yes | refuse, naming the platform (FR-040) |
+| `export_profile` | yes | refuse, naming the platform (FR-040) |
+| `import_vault_*` | yes | yes — bytes supplied by the in-app file browser (FR-040) |
+| `recovery_kit_consume` | yes | yes — may land the selected vault as a single restore action (FR-041) |
 | profile creation | yes | yes — creates a fresh sealed vault through the shared path (FR-038) |
-| `recovery_kit_consume` | yes | **yes** — with `vault_file`, the sole restore path (FR-041) |
 | `recovery_kit_create` | yes | yes |
 | lock lifecycle, unlock | yes | yes |
 
-Android creates, opens, uses, and saves fresh sealed vaults and sealed vaults whose key arrived
-via a kit (FR-038), reads both formats (FR-042), and refuses legacy-vault migration with a
-desktop-naming message (FR-039).
+Android creates, opens, uses, saves, and imports sealed vaults (FR-038, FR-040), reads both
+formats (FR-042), and refuses legacy-vault migration with a desktop-naming message (FR-039).

@@ -8,6 +8,7 @@ import {
 import AboutPanel from "./AboutPanel";
 import RecoveryKitPanel from "./RecoveryKitPanel";
 import ClaimUnclaimedKeyPanel from "./ClaimUnclaimedKeyPanel";
+import LocalFileBrowser from "./LocalFileBrowser";
 import logoUrl from "../assets/logo.png";
 import { IS_ANDROID } from "../util/platform";
 import { useConfirm, useTextPrompt } from "../ui/confirm";
@@ -90,6 +91,9 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
   // whichever specific key this file matched, re-sent to both the pick
   // retry and the eventual commit (T102).
   const [keyPassword, setKeyPassword] = useState("");
+  // Android supplies import bytes through the guarded in-app browser because
+  // `rfd` has no mobile backend; desktop keeps its native picker.
+  const [importBrowserOpen, setImportBrowserOpen] = useState(false);
 
   // T073: set only on a VAULT_ROLLBACK-coded unlock failure. No race with
   // unmounting (unlike migration-notice, this is a synchronous catch on
@@ -343,18 +347,14 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
     }
   };
 
-  // T106: stage-then-commit against the verified import pipeline.
-  // `vaultBytes`, when given, is a vault file already read into memory (the
-  // recovery-kit consume flow's own "vault file" pick) — skips a second
-  // native dialog for the same file.
-  const startImport = async (vaultBytes?: Uint8Array) => {
+  // T106: stage-then-commit against the verified import pipeline. File
+  // bytes remain in Rust from the guarded source read through private staging.
+  const startImport = async (sourcePath?: string) => {
     setError(null); setInfo(null);
     setKeyPassword("");
     setBusy(true);
     try {
-      const picked = await invoke<StagedImport | null>("import_vault_pick", {
-        bytes: vaultBytes ? Array.from(vaultBytes) : undefined,
-      });
+      const picked = await invoke<StagedImport | null>("import_vault_pick", { sourcePath });
       if (!picked) { setBusy(false); return; }
       setStaged(picked);
       setImportName(picked.disposition === "create_profile" ? (picked.profile || "") : "");
@@ -373,6 +373,19 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
       setBusy(false);
     }
   };
+  const requestImport = () => {
+    if (IS_ANDROID) {
+      setImportBrowserOpen(true);
+      return;
+    }
+    startImport();
+  };
+
+  const importFromBrowser = (path: string) => {
+    setImportBrowserOpen(false);
+    void startImport(path);
+  };
+
 
   // Retries the same already-staged file with a password for whichever
   // specific key `startImport` identified — no re-picking the file.
@@ -702,16 +715,14 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
                   <X size={12} /> Cancel
                 </button>
               )}
-              {!IS_ANDROID && (
-                <button
-                  onClick={() => startImport()}
-                  disabled={busy}
-                  title="Import an exported .sshclientx or .submarine file"
-                  className="flex-1 h-9 rounded-lg bg-white/[0.02] border border-white/5 hover:bg-white/5 hover:border-white/10 text-zinc-400 hover:text-zinc-100 text-[12px] font-medium transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
-                >
-                  <Upload size={12} /> Import
-                </button>
-              )}
+              <button
+                onClick={requestImport}
+                disabled={busy}
+                title="Import a sealed .sshclientx vault file"
+                className="flex-1 h-9 rounded-lg bg-white/[0.02] border border-white/5 hover:bg-white/5 hover:border-white/10 text-zinc-400 hover:text-zinc-100 text-[12px] font-medium transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+              >
+                <Upload size={12} /> Import
+              </button>
             </div>
 
             <button
@@ -825,16 +836,14 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
               >
                 <Plus size={12} /> New profile
               </button>
-              {!IS_ANDROID && (
-                <button
-                  onClick={() => startImport()}
-                  disabled={busy}
-                  title="Import an exported .sshclientx or .submarine file"
-                  className="flex-1 h-9 rounded-lg bg-white/[0.02] border border-white/5 hover:bg-white/5 hover:border-white/10 text-zinc-400 hover:text-zinc-100 text-[12px] font-medium transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
-                >
-                  <Upload size={12} /> Import
-                </button>
-              )}
+              <button
+                onClick={requestImport}
+                disabled={busy}
+                title="Import a sealed .sshclientx vault file"
+                className="flex-1 h-9 rounded-lg bg-white/[0.02] border border-white/5 hover:bg-white/5 hover:border-white/10 text-zinc-400 hover:text-zinc-100 text-[12px] font-medium transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+              >
+                <Upload size={12} /> Import
+              </button>
             </div>
             <button
               onClick={() => setRecoveryOpen(true)}
@@ -924,7 +933,7 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
         isOpen={recoveryOpen}
         mode="consume"
         onClose={() => setRecoveryOpen(false)}
-        onImportNow={(vaultBytes) => { setRecoveryOpen(false); startImport(vaultBytes); }}
+        onImportNow={() => { setRecoveryOpen(false); startImport(); }}
         onProfileLanded={async (name) => {
           setInfo(`Profile "${name}" is ready — sign in below.`);
           await reload();
@@ -943,6 +952,13 @@ const ProfileSelectPage = ({ onUnlocked }: Props) => {
           reloadUnclaimedKeys();
           setSelected(name);
         }}
+      />
+      <LocalFileBrowser
+        isOpen={importBrowserOpen}
+        title="Import vault"
+        allowedExtensions={["sshclientx"]}
+        onPick={(path) => importFromBrowser(path)}
+        onClose={() => setImportBrowserOpen(false)}
       />
     </div>
   );

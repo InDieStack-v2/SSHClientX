@@ -8,6 +8,8 @@ interface QuickDir { label: string; path: string }
 interface Props {
   isOpen: boolean;
   title: string;
+  /** Case-insensitive file extensions without their dots; directories remain visible. */
+  allowedExtensions?: string[];
   onPick: (path: string, name: string) => void;
   onClose: () => void;
 }
@@ -20,7 +22,7 @@ interface Props {
 // flow. Works on desktop too (falls back to the OS home dir as the start
 // point there), so it's one component either platform can use, even
 // though desktop's RecoveryKitPanel prefers the native dialog when it can.
-const LocalFileBrowser = ({ isOpen, title, onPick, onClose }: Props) => {
+const LocalFileBrowser = ({ isOpen, title, allowedExtensions, onPick, onClose }: Props) => {
   const [quickDirs, setQuickDirs] = useState<QuickDir[] | null>(null);
   const [path, setPath] = useState<string | null>(null);
   const [entries, setEntries] = useState<Entry[]>([]);
@@ -89,17 +91,23 @@ const LocalFileBrowser = ({ isOpen, title, onPick, onClose }: Props) => {
 
           {path && !loading && (
             <div className="space-y-1">
-              {entries.map((e) => (
-                <button
-                  key={e.path}
-                  onClick={() => (e.is_dir ? enter(e.path) : onPick(e.path, e.name))}
-                  className="w-full flex items-center gap-2 px-3 h-10 rounded-lg text-left text-[13px] text-zinc-200 hover:bg-white/5"
-                >
-                  {e.is_dir ? <Folder size={14} className="text-primary shrink-0" /> : <FileIcon size={14} className="text-zinc-500 shrink-0" />}
-                  <span className="truncate flex-1">{e.name}</span>
-                </button>
-              ))}
-              {entries.length === 0 && <div className="px-3 py-2 text-zinc-500 text-[11.5px]">Empty folder.</div>}
+              {entries
+                .filter((entry) => entry.is_dir || !allowedExtensions || allowedExtensions.some(
+                  (extension) => entry.name.toLowerCase().endsWith(`.${extension.toLowerCase()}`),
+                ))
+                .map((entry) => (
+                  <button
+                    key={entry.path}
+                    onClick={() => (entry.is_dir ? enter(entry.path) : onPick(entry.path, entry.name))}
+                    className="w-full flex items-center gap-2 px-3 h-10 rounded-lg text-left text-[13px] text-zinc-200 hover:bg-white/5"
+                  >
+                    {entry.is_dir ? <Folder size={14} className="text-primary shrink-0" /> : <FileIcon size={14} className="text-zinc-500 shrink-0" />}
+                    <span className="truncate flex-1">{entry.name}</span>
+                  </button>
+                ))}
+              {entries.filter((entry) => entry.is_dir || !allowedExtensions || allowedExtensions.some(
+                (extension) => entry.name.toLowerCase().endsWith(`.${extension.toLowerCase()}`),
+              )).length === 0 && <div className="px-3 py-2 text-zinc-500 text-[11.5px]">No matching files.</div>}
             </div>
           )}
         </div>

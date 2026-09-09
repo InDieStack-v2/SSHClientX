@@ -1636,13 +1636,12 @@ async fn read_local_file_bytes(path: String) -> Result<Vec<u8>, String> {
 ///
 /// When `vault_file_bytes` AND `name` are both supplied, this also lands
 /// that vault file as a brand-new profile named `name` in the same call
-/// (FR-041) — the single restore action Android needs, since its only
-/// path to an open profile is a key established via a recovery kit, and
-/// the general Import flow that would otherwise finish the job is
-/// Android-refused (FR-040). Desktop's own call site never passes `name`,
-/// so it keeps today's two-step behavior (establish here, land via a
-/// separate Import) unchanged. Without a landed profile this returns only
-/// `{ kid }`; `profile` is omitted rather than null-shaped either way.
+/// (FR-041). This keeps recovery convenient, while a recovered but
+/// unclaimed key may instead be matched through the general import flow on
+/// either platform. Desktop's own call site never passes `name`, so it
+/// keeps today's two-step behavior (establish here, land via a separate
+/// Import) unchanged. Without a landed profile this returns only `{ kid }`;
+/// `profile` is omitted rather than null-shaped either way.
 #[tauri::command]
 async fn recovery_kit_consume(
     app_handle: tauri::AppHandle,
@@ -1993,6 +1992,45 @@ pub struct ImportStagingState {
     pub staged: StdMutex<std::collections::HashMap<String, PathBuf>>,
 }
 
+/// Largest sealed vault accepted from any import source. This bounds every
+/// subsequent staged read and container parse; the decompressed SQLite payload
+/// is independently capped at the same size in `vault_decompress`.
+const MAX_IMPORT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Copy an untrusted source into private import staging without materialising
+/// it in the renderer or allocating an unbounded buffer. The source may grow
+/// after its metadata was observed, so the limit is enforced while copying.
+fn stage_import_file_bounded(source_path: &Path, staged_path: &Path, max_bytes: u64) -> Result<(), String> {
+    use std::io::Read as _;
+
+    let mut source = fs::File::open(source_path)
+        .map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?;
+    let mut staged = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staged_path)
+        .map_err(|e| format!("[FILE] STAGING_CREATE_FAILED: {}", e))?;
+    let copied = match std::io::copy(&mut source.by_ref().take(max_bytes.saturating_add(1)), &mut staged) {
+        Ok(copied) => copied,
+        Err(e) => {
+            drop(staged);
+            let _ = fs::remove_file(staged_path);
+            return Err(format!("[FILE] STAGING_WRITE_FAILED: {}", e));
+        }
+    };
+    if copied > max_bytes {
+        drop(staged);
+        let _ = fs::remove_file(staged_path);
+        return Err(format!("[FILE] IMPORT_TOO_LARGE: vault files must not exceed {} MiB.", max_bytes / (1024 * 1024)));
+    }
+    if let Err(e) = staged.sync_all() {
+        drop(staged);
+        let _ = fs::remove_file(staged_path);
+        return Err(format!("[FILE] STAGING_SYNC_FAILED: {}", e));
+    }
+    Ok(())
+}
+
 /// Scan every profile file in `dir` for one whose own sealed header
 /// carries `kid` (FR-031: match an incoming file against every key this
 /// device holds, not just the one currently open). `kid` is a plaintext
@@ -2142,10 +2180,10 @@ fn resolve_key_lookup(
 /// `key_password` is the password for whichever specific key this file
 /// turns out to need (an unclaimed recovery-kit key, or another profile's
 /// own vault password — see `resolve_key_lookup`); pass `None` on the
-/// first attempt. `retry_staging_id`, when set, skips the file dialog and
-/// re-verifies the SAME already-staged file with `key_password` — this is
-/// how the UI supplies a password after `needs_password` comes back,
-/// without asking the user to pick the file a second time.
+/// first attempt. `retry_staging_id`, when set, skips source selection and
+/// re-verifies the SAME already-staged file with `key_password`. On Android,
+/// `source_path` comes from the in-app browser and is read, bounded, and
+/// staged wholly in Rust; it never crosses the renderer as file bytes.
 #[tauri::command]
 async fn import_vault_pick(
     app_handle: tauri::AppHandle,
@@ -2153,15 +2191,8 @@ async fn import_vault_pick(
     staging: tauri::State<'_, ImportStagingState>,
     key_password: Option<String>,
     retry_staging_id: Option<String>,
-    bytes: Option<Vec<u8>>,
+    source_path: Option<String>,
 ) -> Result<Option<serde_json::Value>, String> {
-    #[cfg(target_os = "android")]
-    {
-        let _ = (app_handle, state, staging, key_password, retry_staging_id, bytes);
-        return Err("Vault import is not available on Android.".into());
-    }
-    #[cfg(not(target_os = "android"))]
-    {
         let dir = profiles_dir(&app_handle)?;
 
         let (staging_id, staged_path) = if let Some(id) = retry_staging_id {
@@ -2170,25 +2201,6 @@ async fn import_vault_pick(
                 .ok_or("[VALIDATION] UNKNOWN_STAGING_ID")?;
             (id, path)
         } else {
-            // `bytes` lets a caller that already has the vault file's
-            // content in memory (e.g. the recovery-kit consume flow, which
-            // just had the user pick this same file for its own "vault
-            // file" field) skip a second native dialog for the identical
-            // file. Falls back to the normal picker when absent.
-            let source_bytes = if let Some(b) = bytes {
-                b
-            } else {
-                let _dialog_guard = lock::DialogGuard::open();
-                let picked = rfd::FileDialog::new()
-                    .set_title("Import vault")
-                    .add_filter("SSHClientX vault", &[VAULT_EXT, VAULT_EXT_LEGACY])
-                    .pick_file();
-                let source_path = match picked {
-                    Some(p) => p,
-                    None => return Ok(None),
-                };
-                fs::read(&source_path).map_err(|e| format!("[FILE] IMPORT_READ_FAILED: {}", e))?
-            };
             let staging_id = {
                 let mut b = [0u8; 16];
                 rand::thread_rng().fill(&mut b);
@@ -2197,8 +2209,33 @@ async fn import_vault_pick(
             let staged_dir = app_temp_root().join("import_staging");
             fs::create_dir_all(&staged_dir).map_err(|e| format!("[FILE] STAGING_MKDIR_FAILED: {}", e))?;
             let staged_path = staged_dir.join(format!("{}.sshclientx", staging_id));
-            fs::write(&staged_path, &source_bytes).map_err(|e| format!("[FILE] STAGING_WRITE_FAILED: {}", e))?;
-            drop(source_bytes); // the copy on disk is what gets verified from here on
+
+            if let Some(source_path) = source_path {
+                #[cfg(target_os = "android")]
+                if !matches!(Path::new(&source_path).extension().and_then(|ext| ext.to_str()), Some(VAULT_EXT)) {
+                    return Err("[VALIDATION] IMPORT_EXTENSION: Select a sealed .sshclientx vault file.".into());
+                }
+                let safe_source = guard_local_path(&source_path, false)?;
+                stage_import_file_bounded(&safe_source, &staged_path, MAX_IMPORT_BYTES)?;
+            } else {
+                #[cfg(target_os = "android")]
+                {
+                    return Err("[VALIDATION] IMPORT_SOURCE_REQUIRED: Select a vault file in the in-app browser first.".into());
+                }
+                #[cfg(not(target_os = "android"))]
+                {
+                    let _dialog_guard = lock::DialogGuard::open();
+                    let picked = rfd::FileDialog::new()
+                        .set_title("Import vault")
+                        .add_filter("SSHClientX vault", &[VAULT_EXT, VAULT_EXT_LEGACY])
+                        .pick_file();
+                    let source_path = match picked {
+                        Some(path) => path,
+                        None => return Ok(None),
+                    };
+                    stage_import_file_bounded(&source_path, &staged_path, MAX_IMPORT_BYTES)?;
+                }
+            }
             staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?
                 .insert(staging_id.clone(), staged_path.clone());
             (staging_id, staged_path)
@@ -2210,12 +2247,14 @@ async fn import_vault_pick(
         // fail `SealedVaultFile::parse` below as generic "not a vault
         // file" (`BOX_BAD_MAGIC`) — technically true but unhelpful, since
         // it IS a real vault, just not one this pipeline (sealed-container
-        // only, T033+) understands. Name it and point at the actual fix:
-        // migrate it by unlocking on its own device, or place the file
-        // directly in this device's profiles folder if it belongs here.
+        // only) understands. Android cannot migrate it; desktop must do so
+        // before this sealed-container import path can accept it.
         if vault::is_legacy_blob(&staged_bytes) {
             staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?.remove(&staging_id);
             let _ = fs::remove_file(&staged_path);
+            #[cfg(target_os = "android")]
+            return Err("[FILE] LEGACY_VAULT_NOT_IMPORTABLE: This is a pre-migration vault file. Migrate it on a desktop machine before importing it on Android.".into());
+            #[cfg(not(target_os = "android"))]
             return Err("[FILE] LEGACY_VAULT_NOT_IMPORTABLE: This is a pre-migration vault file, not a sealed one \
                 — Import doesn't accept it directly. Unlock it on its original device to migrate it first, or, if \
                 it belongs on this device, place the file in this device's profiles folder instead of importing it."
@@ -2318,7 +2357,6 @@ async fn import_vault_pick(
             "sender_name": decision.sealed.sender_name,
             "created_at": decision.sealed.created_at,
         })))
-    }
 }
 
 /// T099/T100 (FR-032a, FR-032b, FR-034): perform the write staging decided.
@@ -2335,13 +2373,6 @@ async fn import_vault_commit(
     name: Option<String>,
     key_password: Option<String>,
 ) -> Result<String, String> {
-    #[cfg(target_os = "android")]
-    {
-        let _ = (app_handle, state, staging, staging_id, name, key_password);
-        return Err("Vault import is not available on Android.".into());
-    }
-    #[cfg(not(target_os = "android"))]
-    {
         let staged_path = staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?
             .get(&staging_id).cloned()
             .ok_or("[VALIDATION] UNKNOWN_STAGING_ID")?;
@@ -2390,7 +2421,6 @@ async fn import_vault_commit(
         staging.staged.lock().map_err(|_| "[STATE] LOCK_FAILED_STAGING")?.remove(&staging_id);
         let _ = fs::remove_file(&staged_path);
         Ok(landed_name)
-    }
 }
 
 /// Claims a just-verified unclaimed key (per `verify_and_import`'s
@@ -10507,6 +10537,24 @@ mod tests {
             assert!(validate_profile_name(bad).is_err(), "should reject {:?}", bad);
         }
         assert!(validate_profile_name(&"x".repeat(33)).is_err());
+    }
+
+    #[test]
+    fn bounded_import_staging_copies_the_limit_and_removes_oversize_partials() {
+        let dir = test_scratch_dir("bounded-import");
+        let source = dir.join("source.sshclientx");
+        let staged = dir.join("staged.sshclientx");
+
+        fs::write(&source, b"1234").unwrap();
+        let err = stage_import_file_bounded(&source, &staged, 3).unwrap_err();
+        assert!(err.contains("IMPORT_TOO_LARGE"), "unexpected error: {err}");
+        assert!(!staged.exists(), "oversize staging must not leave a partial file");
+
+        fs::write(&source, b"123").unwrap();
+        stage_import_file_bounded(&source, &staged, 3).expect("exactly-at-limit staging succeeds");
+        assert_eq!(fs::read(&staged).unwrap(), b"123");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

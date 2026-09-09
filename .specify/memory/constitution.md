@@ -1,4 +1,16 @@
 <!--
+Sync Impact Report (v5.2.0)
+- Version change: 5.1.0 → 5.2.0 (MINOR — materially expands Android vault capability).
+- Modified principles:
+  - III. One Core, Every Platform — Android may now import a sealed vault through the
+    same verification and staging pipeline as desktop. Its in-app file browser supplies
+    bytes through the existing Rust path guard; Android export and legacy migration remain
+    unavailable.
+- Added sections: none. Removed sections: none.
+- Notes: This adds no filesystem capability or new transport. Imported bytes remain staged
+  in the app sandbox and pass the existing format, integrity, key-identifier, and revision
+  verification before any profile file is written.
+
 Sync Impact Report (v5.1.0)
 - Version change: 5.0.0 → 5.1.0 (MINOR — materially expands Android vault capability).
 - Modified principles:
@@ -301,13 +313,12 @@ Platform write capability is intentionally narrow:
 - Desktop (macOS, Windows, Linux) MUST create fresh sealed vaults and migrate
   legacy vaults to the current sealed format.
 - Android MUST create fresh sealed vaults through the shared vault-creation
-  path, and MAY open, use, and save a sealed vault whose key arrived via a
-  recovery kit or an explicit device-to-device pairing
-  (`specs/003-qr-same-network-transfer`). Android MUST NOT migrate a legacy
-  vault; that action MUST refuse with a message naming desktop as the place
-  to perform it. The general export and import file flows remain unavailable
-  on Android; pairing is a distinct mechanism from that general flow and is
-  available on Android for both the host and guest roles.
+  path, and MAY open, use, save, and import a sealed vault through the
+  shared verification pipeline. Android MUST NOT migrate a legacy vault;
+  that action MUST refuse with a message naming desktop as the place to
+  perform it. Android export remains unavailable. Pairing is a distinct
+  mechanism from general import and is available on Android for both the
+  host and guest roles.
 
 
 Rationale: the product is one encrypted profile per device with an explicit,
@@ -488,4 +499,4 @@ Compliance:
 - Runtime development follows this file; do not fork a parallel "guidance"
   document that can silently diverge.
 
-**Version**: 5.1.0 | **Ratified**: 2026-09-03 | **Last Amended**: 2026-09-09
+**Version**: 5.2.0 | **Ratified**: 2026-09-03 | **Last Amended**: 2026-09-09

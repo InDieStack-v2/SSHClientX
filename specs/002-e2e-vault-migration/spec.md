@@ -4,7 +4,7 @@
 
 **Created**: 2026-09-06
 
-**Status**: Ready for implementation — clarifications closed, Governance cleared (constitution v5.1.0)
+**Status**: Ready for implementation — clarifications closed, Governance cleared (constitution v5.2.0)
 
 **Input**: User description: "Migrate the vault export/import from the current password-derived-key model to the spec-00 end-to-end encrypted vault model (docs/features/spec-00-e2e-vault.md, spec-01-export-import.md)."
 
@@ -16,10 +16,11 @@ This feature **cannot be implemented under constitution v2.0.0**. Four rules mus
 amended through Governance before any code lands. Spec Kit rules resolve conflicts in
 favour of the constitution, so this section is a hard gate, not a caveat.
 
-**Status: RESOLVED.** The constitution now stands at **v5.1.0** — v3.0.0 covered all four
-rows below, v3.1.0 extended the dependency allowance the design turned out to need, and
-v5.1.0 permits Android to create fresh sealed vaults. The four conflicts described here are
-historical, recorded so the reason for the amendment stays legible. This spec is actionable.
+**Status: RESOLVED.** The constitution now stands at **v5.2.0** — v3.0.0 covered all four
+rows below, v3.1.0 extended the dependency allowance the design turned out to need, v5.1.0
+permits Android to create fresh sealed vaults, and v5.2.0 permits Android to import sealed
+vaults. The four conflicts described here are historical, recorded so the reason for the
+amendment stays legible. This spec is actionable.
 
 | Constitution rule | Conflict |
 | --- | --- |
@@ -716,12 +717,13 @@ vault unchanged in the two failure cases.
 - **FR-039**: Android MUST NOT migrate an existing-format vault. The action MUST refuse
   with a message saying migration must be performed on a desktop machine, not with a
   generic failure.
-- **FR-040**: The general export and import file flows MUST remain unavailable on
-  Android in this release and MUST refuse with a message stating that.
+- **FR-040**: Android MUST provide the general sealed-vault import flow through its
+  in-app file browser. It MUST route the supplied bytes through the same verification and
+  staging procedure as desktop. Android export remains unavailable and MUST refuse with a
+  message stating that.
 - **FR-041**: The Android recovery-kit flow MUST accept a vault file alongside the
-  recovery kit as a single restore action, so that a user whose desktop has migrated can
-  reach their vault on Android without the general import flow. This restore MUST use
-  the same verification procedure as FR-029.
+  recovery kit as a single restore action. This restore MUST use the same verification
+  procedure as FR-029.
 - **FR-042**: Both platforms MUST read both the existing and the new vault format for as
   long as unmigrated vaults can exist.
 
@@ -844,15 +846,13 @@ vault unchanged in the two failure cases.
 - **Story 1 does not ship without Story 2.** Story 1 removes cross-device portability;
   releasing it without the recovery kit would strand multi-machine users. They may be
   built in order but must reach users together.
-- **Android creates, desktop migrates.** macOS, Windows, Linux, and Android create fresh
-  vaults in the new format. Android can open, use, and save a new-format vault whose key
-  arrived via the recovery kit, but cannot migrate an existing-format vault; general export
-  and import flows remain unavailable. Two vault formats are live simultaneously on both
-  platforms and both must remain readable.
-- **The Android recovery-kit restore is a deliberate carve-out.** Without it, an Android
-  user whose desktop has migrated could obtain the vault key but never the vault file,
-  because general import is refused there. Restoring a kit plus a file is treated as one
-  recovery action rather than as the general import feature.
+- **Android creates and imports; desktop migrates.** macOS, Windows, Linux, and Android
+  create fresh vaults in the new format. Android can open, use, save, and import a sealed
+  vault, but cannot migrate an existing-format vault; export remains unavailable. Two vault
+  formats are live simultaneously on both platforms and both must remain readable.
+- **The Android recovery-kit restore is a convenient single action.** A user may provide a
+  kit plus a vault file to establish the key and land a profile together. A recovered
+  unclaimed key can also be matched through the general import flow.
 - **Vault passwords are device-local, recovery kits carry their own secret.** A vault
   password is never written into a kit, an export, or anything else that leaves the
   device, and is never required on a second device. A kit is sealed under a recovery
@@ -938,11 +938,11 @@ what ships today.
 recovery kit is sealed under its own recovery passphrase rather than under a device's vault
 password, so nothing in an exported artefact depends on a password from another machine.
 
-**D2 — Android creates, desktop migrates legacy vaults.** *(FR-038 – FR-042, SC-012)*
-All platforms create fresh vaults in the new format. Android gains enough secure-store support
-to open, use, and save a new-format vault whose key arrived via the recovery kit, but cannot
-migrate an existing-format vault; the general export and import flows stay refused there. The
-Android recovery-kit restore accepts a vault file as part of the same action — without that
-carve-out an Android user could obtain the key but never the file. Android users with no desktop
-can create a new sealed vault; users with an existing-format vault keep it unmigrated and
-un-nagged.
+**D2 — Android creates and imports; desktop migrates legacy vaults.** *(FR-038 – FR-042,
+SC-012)* All platforms create fresh vaults in the new format. Android gains enough
+secure-store support to open, use, save, and import a sealed vault through the same verified
+pipeline as desktop, but cannot migrate an existing-format vault; export stays refused there.
+The Android recovery-kit restore accepts a vault file as a convenient single action, while a
+recovered unclaimed key can instead be matched through general import. Android users with no
+desktop can create a new sealed vault; users with an existing-format vault keep it unmigrated
+and un-nagged.

@@ -45,7 +45,7 @@
 3. *Scope bounded* — the four "must be in scope" items from the request are each
    resolved rather than restated: migration is US1/FR-013–018, the cross-device break is
    US2/FR-019–022, restore-over-existing is decided *yes* (FR-032/033), and Android creates
-   fresh sealed vaults while legacy migration remains desktop-only (FR-038–FR-042).
+   and imports sealed vaults while legacy migration remains desktop-only (FR-038–FR-042).
 
 **Iteration 2 — open questions resolved by the user (2026-09-06):**
 
@@ -54,11 +54,11 @@
   gate, because an inert gate would be weaker than what ships today. Added FR-007,
   FR-007a, FR-007b, SC-011; noted as an intentional deviation from spec-00 §3, which
   treats passphrase and device unlock as alternatives.
-- **D2**: desktop and Android create fresh sealed vaults; Android opens, uses, and saves a
-  new-format vault whose key arrived via the recovery kit, but cannot migrate a legacy vault.
+- **D2**: desktop and Android create and import sealed vaults; Android opens, uses, and saves
+  a new-format vault whose key arrived via the recovery kit, but cannot migrate a legacy vault.
   FR-038–FR-042 and SC-012 cover the platform boundary. The Android recovery-kit restore
-  accepting a vault file is a carve-out introduced here, not present in the source request —
-  without it the Android path is a dead end, since general import is refused there.
+  remains a convenient single action; a recovered unclaimed key can instead be matched through
+  general import.
 
 **Blocking item outside the checklist:**
 

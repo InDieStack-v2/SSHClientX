@@ -221,10 +221,13 @@ phrase word, or vault content.
    passphrase** together — not the desktop's vault password.
 3. Set a vault password for the phone when prompted.
 4. Expect: the vault opens, is usable, and **saves**.
-5. Try Settings → Export and Import on Android → both refuse, naming the platform.
-6. Create a new profile on Android with a password of at least eight characters → it opens as
+5. On Android, use Import and choose the sealed vault file with the in-app file browser.
+   Expect the same verified stage-and-commit flow as desktop; an unknown key points to
+   recovery rather than opening the file.
+6. Try Settings → Export on Android → it refuses, naming the platform.
+7. Create a new profile on Android with a password of at least eight characters → it opens as
    a fresh sealed vault and still saves after restart.
-7. Confirm an existing unmigrated Android vault still opens, is never nagged to migrate, and
+8. Confirm an existing unmigrated Android vault still opens, is never nagged to migrate, and
    refuses migration with a message naming desktop.
 
 ---

@@ -10,15 +10,13 @@ interface Props {
   isOpen: boolean;
   mode: "create" | "consume";
   onClose: () => void;
-  /** Consume succeeded (T087) — offer to run the normal import flow on the same
-   *  file. Passes along the vault file's bytes when already picked here, so
-   *  the caller can skip asking for it a second time. Desktop only — the
-   *  general import flow is Android-refused (FR-040); Android's own path to
-   *  a landed profile is `onProfileLanded` below. */
-  onImportNow?: (vaultBytes?: Uint8Array) => void;
-  /** FR-041: consume landed the vault file as a new profile in the same
-   *  call (Android's single-action restore, since it has no general import
-   *  flow to fall back on) — names it so the caller can reload/select it. */
+  /** Consume succeeded — offer the normal import flow. The user selects the
+   * vault again there, so import bytes remain entirely in Rust. Android's
+   * single-action restore remains a convenient alternative. */
+  onImportNow?: () => void;
+  /** Consume landed the vault file as a new profile in the same call
+   * (Android's convenient single-action restore) — names it so the caller
+   * can reload/select it. */
   onProfileLanded?: (name: string) => void;
 }
 
@@ -52,11 +50,9 @@ const RecoveryKitPanel = ({ isOpen, mode, onClose, onImportNow, onProfileLanded 
   const [consumePassphrase, setConsumePassphrase] = useState("");
   const [newVaultPassword, setNewVaultPassword] = useState("");
   const [consumed, setConsumed] = useState(false);
-  // FR-041 (Android only — see the field below): name to land the vault
-  // file under in the same call. Never auto-suffixed on a collision — a
-  // hand-picked name that's taken fails outright, same as the desktop
-  // "create profile" disposition — so this stays exactly what the user
-  // typed once consume succeeds.
+  // Android's single-action restore may land the vault file under this name.
+  // General import is also available after a key is established, but this
+  // path avoids a second confirmation step when the user has both files.
   const [profileName, setProfileName] = useState("");
   const [landedProfile, setLandedProfile] = useState<string | null>(null);
 
@@ -132,10 +128,9 @@ const RecoveryKitPanel = ({ isOpen, mode, onClose, onImportNow, onProfileLanded 
     }
   };
 
-  // FR-041: Android has no general Import flow to fall back on (FR-040), so
-  // its only path to an open profile is landing the vault file in this same
-  // call — needs a name up front, unlike desktop's two-step "establish,
-  // then Import" (where the name comes later, on the Import popup).
+  // Android may either land this file with the recovered key now or use the
+  // general import flow afterward. This form keeps the single-action
+  // restore available, so it still asks for a name up front.
   const needsNameNow = IS_ANDROID && !!vaultFileBytes;
   // The vault file is required for the phrase form everywhere (FR-019g —
   // its salt comes from the file's kid) AND, on Android specifically, for
@@ -299,7 +294,7 @@ const RecoveryKitPanel = ({ isOpen, mode, onClose, onImportNow, onProfileLanded 
                 </p>
                 <div className="flex gap-2">
                   <button
-                    onClick={() => onImportNow?.(vaultFileBytes ?? undefined)}
+                    onClick={() => onImportNow?.()}
                     className="flex-1 h-10 rounded-lg text-[13px] font-semibold bg-primary text-black"
                   >
                     Import now
