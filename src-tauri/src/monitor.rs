@@ -1221,3 +1221,29 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stop_monitor_signals_and_removes_the_poller_entry() {
+        let map: MonitorMap = Arc::new(Mutex::new(HashMap::new()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let entry = Arc::new(MonitorEntry {
+            node_id: 7,
+            enabled_metrics: Arc::new(Mutex::new(Vec::new())),
+            custom_metrics: Arc::new(Mutex::new(Vec::new())),
+            paused: Arc::new(Mutex::new(false)),
+            state: Arc::new(Mutex::new(MonitorState::default())),
+            stop_tx: Mutex::new(Some(stop_tx)),
+        });
+        map.lock().await.insert(7, Arc::clone(&entry));
+
+        stop_monitor(map.clone(), 7).await;
+
+        assert!(map.lock().await.is_empty());
+        assert!(stop_rx.await.is_ok());
+        assert!(*entry.paused.lock().await);
+    }
+}

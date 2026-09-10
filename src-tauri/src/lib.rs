@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use tauri::Manager;
 use serde_json::json;
+mod commands;
+mod database;
+
 use ssh_key::{private::Ed25519Keypair, rand_core::OsRng, PrivateKey};
 mod ssh_manager;
 mod tunnel;
@@ -36,6 +39,9 @@ mod recovery;
 // Short-lived LAN-only QR pairing: ticket validation, TLS session transport,
 // and transfer state. The webview receives only the public ticket/SVG.
 mod qr_transfer;
+// Profile lifecycle and ordered vault persistence owners.
+mod profile_runtime;
+mod vault_store;
 // T113: JNI bridge that initializes ndk-context's global Android context,
 // required by the Android keystore backend before first use. See the
 // module doc for why this exists — Tauri does not do this itself.
@@ -115,6 +121,10 @@ pub struct DbState {
     /// threshold for falling back to the password (`platform_auth::
     /// should_fall_back_to_password`).
     pub platform_auth_failures: StdMutex<u32>,
+    /// Runtime lifecycle/epoch owner for the active profile.
+    pub runtime: profile_runtime::ProfileRuntime,
+    /// Per-profile serialized save boundary and admission sequence.
+    pub save_coordinator: vault_store::VaultSaveCoordinator,
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +289,7 @@ pub(crate) fn validate_profile_name(name: &str) -> Result<(), String> {
 }
 
 fn save_vault_internal(state: &DbState) -> Result<(), String> {
+    let _permit = state.save_coordinator.acquire()?;
     let conn_guard = state.conn.lock().map_err(|_| "[STATE] MUTEX_POISON_CONN")?;
     let dek_guard = state.dek.lock().map_err(|_| "[STATE] MUTEX_POISON_KEY")?;
     let kid_guard = state.kid.lock().map_err(|_| "[STATE] MUTEX_POISON_KID")?;
@@ -301,7 +312,7 @@ fn save_vault_internal(state: &DbState) -> Result<(), String> {
         // Advance the revision counter only once the save actually
         // succeeds — a failed attempt must not burn a generation number
         // (that would make the next real save look like it skipped one).
-        let new_generation = *generation + 1;
+        let new_generation = _permit.next_generation(*generation);
         save_vault_blocking(conn, dek, *kid, *sender_id, new_generation, &path, profile_name)?;
         *generation = new_generation;
         Ok(())
@@ -736,6 +747,7 @@ mod sync_trigger_tests {
 /// chain runs on a blocking-pool thread so concurrent terminal output
 /// and keystrokes don't stall on the tokio worker pool.
 async fn save_vault_async(state: &DbState) -> Result<(), String> {
+    let permit = state.save_coordinator.acquire_async().await?;
     let conn_arc = std::sync::Arc::clone(&state.conn);
     let (dek, kid, new_generation, sender_id, path, profile_name) = {
         let dk = state.dek.lock().map_err(|_| "[STATE] MUTEX_POISON_KEY")?;
@@ -744,19 +756,15 @@ async fn save_vault_async(state: &DbState) -> Result<(), String> {
         let sg = state.sender_id.lock().map_err(|_| "[STATE] MUTEX_POISON_SENDER")?;
         let pg = state.db_path.lock().map_err(|_| "[STATE] MUTEX_POISON_PATH")?;
         let profg = state.active_profile.lock().map_err(|_| "[STATE] MUTEX_POISON_PROFILE")?;
-        // T048 (FR-061): no claim, no write — checked for presence here
-        // alongside every other required resource. The claim itself isn't
-        // `Clone`/moved into the blocking closure; it doesn't need to be —
-        // only its existence in `state` for the duration of this call is
-        // the guarantee, and `state` outlives this whole async function.
         let claimg = state.writer_claim.lock().map_err(|_| "[STATE] MUTEX_POISON_CLAIM")?;
         match (dk.as_ref(), kg.as_ref(), gg.as_ref(), sg.as_ref(), pg.as_ref(), profg.as_ref(), claimg.as_ref()) {
             (Some(d), Some(k), Some(g), Some(s), Some(p), Some(profile), Some(_claim)) =>
-                (d.clone(), *k, *g + 1, *s, p.clone(), profile.clone()),
+                (d.clone(), *k, permit.next_generation(*g), *s, p.clone(), profile.clone()),
             _ => return Err("[STATE] MISSING_REQUIRED_RESOURCES_FOR_SAVE".into()),
         }
     };
     tokio::task::spawn_blocking(move || {
+        let _permit = permit;
         let cg = conn_arc.lock().map_err(|_| "[STATE] MUTEX_POISON_CONN")?;
         let conn = cg.as_ref().ok_or("[STATE] DATABASE_NOT_INITIALIZED")?;
         save_vault_blocking(conn, &dek, kid, sender_id, new_generation, &path, &profile_name)
@@ -887,9 +895,7 @@ fn acquire_writer_claim(state: &DbState, vault_path: &Path, name: &str) -> Resul
 /// `setup_master_db` calls operate against that profile's file. Returns
 /// whether the profile's encrypted file already exists (caller uses this
 /// to decide between "ask for password" and "this profile is empty / not
-/// yet created" flows). Also acquires the writer claim (T046) — a profile
-/// already open in another running instance is refused here, before
-/// anything else about it is touched.
+/// yet created" flows). Also acquires the writer claim before activation.
 #[tauri::command]
 async fn select_profile(
     app_handle: tauri::AppHandle,
@@ -897,24 +903,30 @@ async fn select_profile(
     name: String,
 ) -> Result<bool, String> {
     let name = normalize_profile_name(&name)?;
+    commands::profile::require_picker(&state)?;
     let path = profile_path(&app_handle, &name)?;
     acquire_writer_claim(&state, &path, &name)?;
+    if let Err(error) = state.runtime.select() {
+        *state.writer_claim.lock().map_err(|_| "[STATE] LOCK_FAILED_CLAIM")? = None;
+        return Err(error);
+    }
     *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name);
     Ok(path.exists())
 }
 
 /// Drop in-memory state so the UI can return to the profile picker without
 /// restarting the app. This MUST tear down every piece of per-profile
-/// runtime state, not just the DB — otherwise live SSH sessions, tunnels,
-/// SFTP channels, terminal PTYs, and fingerprint waiters from the
-/// previous profile would survive the switch and (worse) attribute any
-/// `known_hosts` writes they triggered to the NEXT profile's DB.
+/// runtime state before releasing the writer claim.
 #[tauri::command]
 async fn close_profile(
     state: tauri::State<'_, DbState>,
     ssh: tauri::State<'_, SshState>,
     monitor_map: tauri::State<'_, MonitorMap>,
+    mirror_map: tauri::State<'_, MirrorMap>,
+    docker_streams: tauri::State<'_, docker::DockerStreams>,
+    qr_state: tauri::State<'_, qr_transfer::QrTransferState>,
 ) -> Result<(), String> {
+    let close_admission = state.runtime.begin_close()?;
     // 0. Persist any accumulated in-memory changes (chief among them:
     // cmd_history rows written by TerminalView's Enter-key handler, which
     // deliberately skip a per-keystroke fsync). Best-effort: if the vault
@@ -928,6 +940,12 @@ async fn close_profile(
     // falls to 1 and the poller exits.
     monitor::pause_all(monitor_map.inner().clone()).await;
     monitor_map.lock().await.clear();
+    // Mirrors own filesystem watchers and join handles; stop every active
+    // mirror before the SSH handles they depend on are dropped.
+    let mirrors = mirror::list(mirror_map.inner(), None).await;
+    for mirror in mirrors {
+        let _ = mirror::stop(mirror_map.inner(), &mirror.id).await;
+    }
 
     // 2. Collect every active session id, then run the standard
     // disconnect path for each one. This frees tunnel listener sockets,
@@ -971,6 +989,26 @@ async fn close_profile(
     for tx in kbi_waiters {
         let _ = tx.send(None);
     }
+    // Cancel transfer flags before removing their registry entries so any
+    // chunk loop that is between iterations observes the profile close.
+    for flag in ssh.transfer_cancels.lock().await.values() {
+        flag.store(true, std::sync::atomic::Ordering::Release);
+    }
+    ssh.transfer_cancels.lock().await.clear();
+    ssh.session_tunnel_specs.lock().await.clear();
+    ssh.session_generation.lock().await.clear();
+
+    // Abort Docker streams and cancel QR host/guest ownership before the
+    // profile key material is released.
+    let stream_handles: Vec<_> = docker_streams.streams.lock().await.drain().map(|(_, handle)| handle).collect();
+    for handle in stream_handles {
+        handle.abort();
+    }
+    let host_ids: Vec<String> = qr_state.hosts.lock().map_err(|_| "[STATE] QR_HOSTS_POISONED")?.keys().cloned().collect();
+    for id in host_ids {
+        let _ = qr_state.cancel_host(&id).await;
+    }
+    qr_state.guests.lock().map_err(|_| "[STATE] QR_GUESTS_POISONED")?.clear();
 
     // 5. Belt-and-suspenders: clear the residual maps in case anything
     // raced in between the steps above.
@@ -994,27 +1032,27 @@ async fn close_profile(
     *state.hlc.lock().map_err(|_| "[STATE] LOCK_FAILED_HLC")? = None;
     // Reset lock state too — without this, locking then closing the
     // profile (without unlocking first) would leave `locked_soft`/
-    // `locked_hard` stale in `DbState` for whatever profile is opened
-    // next, making a fresh, successful unlock immediately look locked
-    // again to the frontend.
+    // `locked_hard` stale in `DbState` for whatever profile is opened next.
     *state.lock_state.lock().map_err(|_| "[STATE] LOCK_FAILED_LOCKSTATE")? = lock::LockState::Unlocked;
     *state.platform_auth_failures.lock().map_err(|_| "[STATE] LOCK_FAILED_AUTHFAIL")? = 0;
-    // T046 (FR-059): release the writer claim LAST, after every other
-    // piece of teardown above has completed — so a second instance that
-    // was waiting on `VAULT_BUSY` cannot start writing until this
-    // instance has genuinely finished with the profile, not merely
-    // decided to leave.
+    // Release the writer claim only after every other teardown step and the
+    // strict runtime resource barrier have completed.
+    state.runtime.shutdown(profile_runtime::DEFAULT_SHUTDOWN_TIMEOUT).await?;
     *state.writer_claim.lock().map_err(|_| "[STATE] LOCK_FAILED_CLAIM")? = None;
+    state.runtime.finish_close(close_admission, Ok(()))?;
     Ok(())
 }
 
 /// Permanently delete a profile's encrypted file and its keystore
-/// artifacts (device factor, high-water mark, quick-unlock copy). The
-/// caller must NOT be "in" that profile (would orphan in-memory state
-/// pointing at a deleted file). UI enforces this by only showing the
-/// delete button on the picker screen.
+/// artifacts (device factor, high-water mark, quick-unlock copy). Active
+/// profile deletion is rejected until the runtime is back in `Picker`.
 #[tauri::command]
-async fn delete_profile(app_handle: tauri::AppHandle, name: String) -> Result<(), String> {
+async fn delete_profile(
+    app_handle: tauri::AppHandle,
+    state: tauri::State<'_, DbState>,
+    name: String,
+) -> Result<(), String> {
+    commands::profile::reject_active_delete(&state)?;
     let name = normalize_profile_name(&name)?;
     let dir = profiles_dir(&app_handle)?;
     let slug = slugify_profile_name(&name);
@@ -3467,6 +3505,7 @@ fn finish_opening_vault(
     drop(kid_guard);
     drop(dek_guard);
     drop(conn_guard);
+    state.runtime.unlock()?;
     let _ = app_handle.emit(
         "vault-lock-state",
         serde_json::json!({ "state": lock::LockState::Unlocked.as_str() }),
@@ -3514,6 +3553,7 @@ async fn create_profile(
     password: String,
 ) -> Result<(), String> {
     let name = normalize_profile_name(&name)?;
+    commands::profile::require_picker(&state)?;
     if password.is_empty() {
         return Err("Password cannot be empty".into());
     }
@@ -3529,6 +3569,10 @@ async fn create_profile(
     // (T048), and a concurrent `create_profile` for the same name is
     // exactly the case the claim exists to prevent.
     acquire_writer_claim(&state, &path, &name)?;
+    if let Err(error) = state.runtime.select() {
+        *state.writer_claim.lock().map_err(|_| "[STATE] LOCK_FAILED_CLAIM")? = None;
+        return Err(error);
+    }
     *state.active_profile.lock().map_err(|_| "[STATE] LOCK_FAILED")? = Some(name.clone());
     write_profile_label(&path, &name)?;
     // Reuse setup_master_db's fresh-schema branch by deferring to it. Empty
@@ -5336,7 +5380,7 @@ async fn initiate_connection(
         .as_deref()
         .map(str::to_string)
         .unwrap_or_else(|| "primary".to_string());
-    let is_secondary = role != "primary";
+    let is_secondary = role != "primary" || commands::sftp::is_secondary_session(&session_id);
     let separate = separate_sessions.unwrap_or(false);
     // Only the PRIMARY drives interactive keyboard-interactive (2FA) auth. A
     // secondary connection that hit a 2FA challenge would emit a `kbi-prompt`
@@ -5442,8 +5486,18 @@ async fn initiate_connection(
     // entirely for keys that already carry a `::` suffix (i.e. this IS a
     // secondary), and a plain no-op on first connect / shared mode.
     if !is_secondary {
-        teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::sftp", session_id)).await;
-        teardown_connection_key(state.inner(), mirrors.inner(), &format!("{}::fwd", session_id)).await;
+        teardown_connection_key(
+            state.inner(),
+            mirrors.inner(),
+            &commands::transfer::secondary_session_id(&session_id, "sftp"),
+        )
+        .await;
+        teardown_connection_key(
+            state.inner(),
+            mirrors.inner(),
+            &commands::transfer::secondary_session_id(&session_id, "fwd"),
+        )
+        .await;
     } else {
         // Dedicated-transport reconnect (manual button / auto-retry) OVER a
         // still-live old handle: the base-tagged tunnels ride this transport and
@@ -10090,8 +10144,7 @@ fn default_metrics() -> Vec<String> {
 /// outage/recovered event payloads so the frontend can show a meaningful
 /// toast ("web-01 is offline") without doing another round-trip.
 fn fetch_node_name(conn: &rusqlite::Connection, node_id: i32) -> String {
-    conn.query_row("SELECT name FROM servers WHERE id = ?1", [node_id], |r| r.get::<_, String>(0))
-        .unwrap_or_else(|_| format!("node-{}", node_id))
+    database::ProfileRepository::new(conn).server_name(node_id)
 }
 
 fn load_monitor_config(
@@ -10552,7 +10605,7 @@ pub fn run() {
     // installer AND the Android APK. Capability is granted in default.json.
     let builder = builder.plugin(tauri_plugin_opener::init());
     builder
-        .manage(DbState { conn: std::sync::Arc::new(StdMutex::new(None)), dek: StdMutex::new(None), kid: StdMutex::new(None), generation: StdMutex::new(None), sender_id: StdMutex::new(None), db_path: StdMutex::new(None), active_profile: StdMutex::new(None), hlc: StdMutex::new(None), writer_claim: StdMutex::new(None), lock_state: StdMutex::new(lock::LockState::Unlocked), platform_auth_failures: StdMutex::new(0) })
+        .manage(DbState { conn: std::sync::Arc::new(StdMutex::new(None)), dek: StdMutex::new(None), kid: StdMutex::new(None), generation: StdMutex::new(None), sender_id: StdMutex::new(None), db_path: StdMutex::new(None), active_profile: StdMutex::new(None), hlc: StdMutex::new(None), writer_claim: StdMutex::new(None), lock_state: StdMutex::new(lock::LockState::Unlocked), platform_auth_failures: StdMutex::new(0), runtime: profile_runtime::ProfileRuntime::new(), save_coordinator: vault_store::VaultSaveCoordinator::new() })
         .manage(ImportStagingState::default())
         .manage(qr_transfer::QrTransferState::default())
         .manage(SshState::new())
@@ -10747,6 +10800,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
 
     /// `chrono_like_timestamp`'s hand-rolled civil-calendar conversion,
     /// checked against reference points computed independently (Python's
@@ -11037,6 +11091,8 @@ mod tests {
             writer_claim: StdMutex::new(None),
             lock_state: StdMutex::new(lock::LockState::Unlocked),
             platform_auth_failures: StdMutex::new(0),
+            runtime: profile_runtime::ProfileRuntime::new(),
+            save_coordinator: vault_store::VaultSaveCoordinator::new(),
         };
 
         match resolve_key_lookup(&state, &dir, kid, Some(password)).expect("resolve") {
@@ -11225,5 +11281,28 @@ mod tests {
         assert_eq!(fourth, "Backup [IMPORT] 3");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn frozen_ipc_event_families_keep_ids_and_payload_encoding_contract() {
+        let session_id = "sid";
+        let terminal_id = "tid";
+        let event_names = [
+            format!("terminal-output-{terminal_id}"),
+            format!("terminal-closed-{terminal_id}"),
+            format!("fingerprint-prompt-{session_id}"),
+            format!("kbi-prompt-{session_id}"),
+            format!("connection-success-{session_id}"),
+            format!("connection-failed-{session_id}"),
+            format!("session-disconnected-{session_id}"),
+            format!("sftp-transfer-{session_id}"),
+            format!("tunnel-update-{session_id}"),
+            format!("tunnel-log-{session_id}"),
+            format!("mirror-update-{session_id}"),
+            format!("mirror-log-{session_id}"),
+            format!("qr-transfer-state-{session_id}"),
+        ];
+        assert!(event_names.iter().all(|name| name.ends_with(session_id) || name.ends_with(terminal_id)));
+        assert_eq!(base64::engine::general_purpose::STANDARD.encode([0u8, 1, 2]), "AAEC");
     }
 }

@@ -545,12 +545,13 @@ impl QrTransferState {
         let listener = tokio::net::TcpListener::bind(SocketAddr::new(bind_addr, 0))
             .await
             .map_err(|_| Outcome::NetUnreachable)?;
+        let listener_addr = listener.local_addr().map_err(|_| Outcome::NetUnreachable)?;
         let tls = generate_certificate(bind_addr)?;
         let now = now_unix_seconds();
         let mut session = TransferSession::new(role, bind_addr, now);
         session.certificate_fingerprint = Some(tls.fingerprint);
         let ticket = QrTicket {
-            address: listener.local_addr().map_err(|_| Outcome::NetUnreachable)?,
+            address: SocketAddr::new(session.bind_addr, listener_addr.port()),
             token: session.token,
             kid,
             fingerprint: tls.fingerprint,
@@ -982,6 +983,16 @@ mod tests {
         let mut expired = TransferSession::new(TransferRole::Pull, "192.168.1.7".parse().unwrap(), 1_000);
         assert!(!expired.is_live(expired.expires_at));
         assert_eq!(expired.status, SessionStatus::Expired);
+    }
+
+    #[test]
+    fn transfer_state_cancels_and_removes_guest_ownership() {
+        let state = QrTransferState::default();
+        let session_id = state.stage_guest(ticket()).unwrap();
+        state.mark_guest_connected(&session_id).unwrap();
+        let returned = state.cancel_guest(&session_id).unwrap();
+        assert!(returned.is_some());
+        assert_eq!(state.cancel_guest(&session_id).unwrap(), None);
     }
 
     #[test]

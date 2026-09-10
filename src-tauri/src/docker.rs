@@ -795,3 +795,26 @@ pub async fn open_container_terminal(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stream_registry_abort_removes_owned_stream() {
+        let streams = DockerStreams::new();
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        streams
+            .streams
+            .lock()
+            .await
+            .insert("stream-1".into(), task.abort_handle());
+
+        let handle = streams.streams.lock().await.remove("stream-1").unwrap();
+        handle.abort();
+        assert!(streams.streams.lock().await.is_empty());
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+}
