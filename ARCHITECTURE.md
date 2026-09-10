@@ -26,10 +26,11 @@ fits together" picture.
                      │           Rust core (lib.rs::run())        │
                      │  ┌────────┐ ┌──────────┐ ┌──────┐ ┌──────┐│
                      │  │ vault  │ │ssh_manager│ │tunnel│ │mirror││
-                     │  │(lib.rs)│ │  (TOFU)   │ │      │ │      ││
+                     │  │ + DB   │ │  (TOFU)   │ │      │ │      ││
                      │  └────────┘ └──────────┘ └──────┘ └──────┘│
                      │  ┌────────┐ ┌──────────┐ ┌──────┐ ┌──────┐│
-                     │  │monitor │ │  docker   │ │ hlc  │ │about ││
+                     │  │commands│ │ database │ │runtime│ │docker││
+                     │  │ adapters│ │repository│ │ + save │ │      ││
                      │  └────────┘ └──────────┘ └──────┘ └──────┘│
                      └───────────────┬───────────────────────────┘
                                      │
@@ -83,20 +84,26 @@ flowchart LR
         INFO[InfoPanel]
         ADD[AddNodePanel / NodeGrid]
     end
-
     subgraph CORE["Rust core"]
         VAULT[lib.rs: DbState\nvault + SQLite]
+        REPO[database/repository.rs\nprofile queries]
+        CMD[commands/*\nTauri-facing adapters]
+        RUNTIME[profile_runtime.rs\nlifecycle + admission]
+        SAVE[vault_store.rs\nordered persistence]
         SSHM[ssh_manager.rs: SshState\nTOFU ClientHandler]
-        SFTPCMD[lib.rs: sftp_* / local_*\nguard_local_path]
+        SFTPCMD[lib.rs + commands/sftp.rs\nsftp/local + path guards]
         TUNM[tunnel.rs]
         MIRM[mirror.rs: MirrorMap\n+ notify watcher]
         MONM[monitor.rs: MonitorMap\nindependent pollers]
         DOCM[docker.rs: DockerStreams\nallow-listed exec]
-        LIBCMD[lib.rs: run_info_script\nssh_info_probe_section]
+        LIBCMD[lib.rs: operations\ninfo/probe commands]
     end
 
     PSP -- "setup_master_db / select_profile" --> VAULT
     ADD -- "add_server / import_ssh_config etc." --> VAULT
+    CMD --> RUNTIME
+    CMD --> SAVE
+    VAULT --> REPO
     TERM -- "initiate_connection\nwrite_terminal_data" --> SSHM
     SFTP -- "sftp_list / sftp_upload_file / ..." --> SFTPCMD
     SFTP -- "local_list / local_mkdir / ..." --> SFTPCMD
@@ -179,23 +186,24 @@ so remote↔local copies use dedicated `sftp_*`/`local_*` streaming commands
 instead of buffering through a `Uint8Array` in JS.
 
 ## Rust core (`src-tauri/src/`)
+`lib.rs` remains the composition root; feature-facing adapters live under
+`commands/`, persistence queries under `database/`, and lifecycle/ordered-save
+coordination under `profile_runtime.rs` and `vault_store.rs`.
 
-`lib.rs` (8.5k lines) is intentionally the majority of the backend — it
-owns the vault, the SQLite schema/sync-trigger machinery, and most
-`#[tauri::command]`s (114 of the crate's ~131). The other modules are
-split out because they carry meaningfully separate state or protocol
-concerns:
-
-| Module | Owns |
 |---|---|
-| `lib.rs` | `DbState`, vault open/save/migrate (Argon2id → AES-256-GCM → zstd), SQLite schema + HLC-stamped sync triggers (dormant, kept for backward-compatible reads — see below), SSH connection setup, SFTP file ops, local FS ops (`guard_local_path`), server-config import (ssh config / PuTTY / MobaXterm), most commands |
-| `ssh_manager.rs` | `SshState` (live `russh` handle map) + the TOFU `ClientHandler` (host-key verify → `fingerprint-prompt-{sid}` event → `verify_fingerprint_response`) |
+| `lib.rs` | `DbState`, vault open/save/migrate, SQLite schema + HLC triggers, compatibility commands, and `run()` |
+| `commands/*` | Small domain adapters for profile lifecycle, SSH/SFTP/transfer naming, and operation error contracts |
+| `database/repository.rs` | Typed read helpers over the active profile SQLite connection |
+| `profile_runtime.rs` | Picker/selected/unlocked/locked/closing lifecycle, epoch admission, and shutdown barrier |
+| `vault_store.rs` | Serialized vault-save admission and monotonic generation assignment |
+| `ssh_manager.rs` | `SshState` (live `russh` handle map) + TOFU `ClientHandler` |
 | `tunnel.rs` | Local/dynamic/remote port forwards over a session's `SshState` handle |
-| `mirror.rs` | Two-way local↔remote folder sync + `notify`-based watcher; `MirrorMap` state; `.submarine-trash`/`.submarine-tmp` naming kept for compat |
-| `monitor.rs` | Independent SSH pollers for the monitoring dashboard (`MonitorMap`) — separate connections from the interactive `SshState`, so a laggy monitor poll can't stall a terminal |
-| `docker.rs` | Allow-listed `docker` invocation over SSH exec (`DockerStreams`); explicitly excludes destructive verbs (`rm`, `remove`, `down`) |
-| `hlc.rs` | Hybrid logical clock — stamps `updated_at` for local conflict-free ordering; nothing remote consumes it now that sync is gone |
+| `mirror.rs` | Two-way local↔remote folder sync + `notify`-based watcher + `MirrorMap` |
+| `monitor.rs` | Independent SSH pollers for the monitoring dashboard (`MonitorMap`) |
+| `docker.rs` | Allow-listed `docker` invocation over SSH exec (`DockerStreams`) |
+| `hlc.rs` | Hybrid logical clock for local conflict-free ordering |
 | `about.rs` | App version + GitHub release check (`InDieStack-v2/SSHClientX`) |
+
 
 ### Why sync/HLC code is still here
 
@@ -257,11 +265,22 @@ Tauri-managed state, set up once in `run()`:
 
 - `DbState` — SQLite connection + master key/salt/active-profile, guarded
   by `std::sync::Mutex` (not tokio's — see async rule above).
+- `ProfileRuntime` — picker/selected/unlocked/locked/closing state, epoch
+  admission, and the resource acknowledgement barrier used by profile close.
+- `VaultSaveCoordinator` — serialized save admission with monotonic
+  generation assignment; failed saves release their permit before the next
+  writer proceeds.
 - `SshState` (`ssh_manager.rs`) — live interactive SSH sessions.
 - `MirrorMap` (`mirror.rs`) — active two-way sync watchers, keyed by
   session id.
 - `MonitorMap` (`monitor.rs`) — active dashboard pollers, keyed by node id.
 - `DockerStreams` (`docker.rs`) — in-flight Docker exec streams.
+
+Profile close enters `Closing` before cancellation, invalidates the active
+epoch, drains feature-owned workers and registries, waits up to the configured
+shutdown timeout, and only then releases the profile writer claim. A timeout
+or cleanup error leaves the runtime unavailable for retry instead of exposing
+partially torn-down state.
 
 UI-only preferences (terminal colors/font, SFTP pane layout) live in
 `localStorage` under `sshclientx-*` keys — nothing security-sensitive is
