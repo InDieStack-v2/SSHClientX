@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Copy, Radio, X } from "lucide-react";
+import { useTauriListen } from "../hooks/useTauriListen";
 import { describeVaultError } from "../util/vaultErrors";
 
 interface HostSession {
@@ -18,6 +19,8 @@ const QrHostPanel = () => {
   const [copied, setCopied] = useState(false);
   const [receivePassword, setReceivePassword] = useState("");
   const [receiveProfileName, setReceiveProfileName] = useState("");
+  const [now, setNow] = useState(() => Date.now());
+  const [transferState, setTransferState] = useState<string | null>(null);
 
   const start = async (action: "share" | "receive") => {
     setBusy(true); setError(null);
@@ -38,6 +41,28 @@ const QrHostPanel = () => {
   };
 
   useEffect(() => () => { if (session) void invoke("qr_transfer_host_cancel", { sessionId: session.session_id }).catch(() => {}); }, [session]);
+  useTauriListen<{ state: string; outcome_code?: string }>(
+    session ? `qr-transfer-state-${session.session_id}` : "qr-transfer-state-inactive",
+    (event) => {
+      setTransferState(event.payload.outcome_code
+        ? `${event.payload.state}: ${describeVaultError(event.payload.outcome_code).message}`
+        : event.payload.state);
+    },
+    [session?.session_id],
+  );
+
+  useEffect(() => {
+    if (!session) return;
+    const interval = window.setInterval(() => {
+      const current = Date.now();
+      setNow(current);
+      if (session.expires_at <= Math.floor(current / 1000)) {
+        void invoke("qr_transfer_host_cancel", { sessionId: session.session_id }).catch(() => {});
+        setSession(null);
+      }
+    }, 1_000);
+    return () => window.clearInterval(interval);
+  }, [session]);
 
   if (!session) return (
     <div className="flex-1 overflow-y-auto p-4 sm:p-8">
@@ -52,7 +77,7 @@ const QrHostPanel = () => {
     </div>
   );
 
-  const seconds = Math.max(0, session.expires_at - Math.floor(Date.now() / 1000));
+  const seconds = Math.max(0, session.expires_at - Math.floor(now / 1000));
   return (
     <div className="flex-1 overflow-y-auto p-4 sm:p-8">
       <div className="max-w-xl mx-auto space-y-5">
@@ -60,6 +85,7 @@ const QrHostPanel = () => {
         <div className="rounded-2xl bg-white p-5 w-fit mx-auto"><img src={`data:image/svg+xml;utf8,${encodeURIComponent(session.qr_svg)}`} alt="QR transfer code" className="w-64 h-64" /></div>
         <div className="rounded-xl border border-primary/30 bg-primary/10 p-4 text-center"><span className="text-[10px] uppercase tracking-widest text-primary">Verification code</span><strong className="block mt-2 font-mono text-2xl tracking-widest text-white">{session.verification_code}</strong><p className="text-xs text-zinc-400 mt-2">The other device must show the same code before transfer.</p></div>
         <div className="rounded-xl border border-white/10 bg-white/[0.03] p-3"><div className="flex items-center justify-between mb-1"><span className="text-[10px] uppercase tracking-wider text-zinc-500">Manual entry fallback</span><button onClick={() => { navigator.clipboard?.writeText(session.ticket_text); setCopied(true); setTimeout(() => setCopied(false), 1500); }} className="text-xs text-primary flex items-center gap-1"> <Copy size={12} /> {copied ? "Copied" : "Copy"}</button></div><p className="select-text break-all font-mono text-[10px] leading-relaxed text-zinc-400">{session.ticket_text}</p></div>
+        {transferState && <p className="text-center text-xs text-primary capitalize">Transfer {transferState}</p>}
         <p className="text-center text-xs text-zinc-500">Expires in {seconds}s</p>
       </div>
     </div>

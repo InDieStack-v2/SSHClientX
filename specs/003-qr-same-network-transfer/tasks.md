@@ -242,3 +242,13 @@ Task: "Implement src/components/QrScanCamera.tsx"
 With two developers: one takes US1 (T025–T034) while the other starts US2's router handlers
 (T035–T036, which don't depend on US1's completion, only on Foundational) and US3's guard work
 (T041–T046, which also only depends on Foundational) — merge before Polish.
+
+## Phase 7: Convergence
+
+- [X] T055 CRITICAL Restore the `role=push` branch in `qr_transfer_guest_confirm` by moving its role check after the push dispatch; send the current unlocked vault key/file only after the human verification gate, honor host `meta.needs_key`, and add a regression test proving push does not return `QR_TRANSFER_ROLE` (US2 / FR-001 / FR-018; contradicts).
+- [X] T056 CRITICAL Replace ordinary DEK copies in QR HTTP transport (`Bytes::copy_from_slice`, `dek.to_vec`, raw key buffers) with bounded zeroizing transport handling; preserve 32-byte key validation and add a focused regression test or documented invariant showing the DEK is never retained in a non-zeroizing application buffer (FR-010 / SC-008 / Constitution I; partial).
+- [X] T057 Emit the contract-defined host session transitions (`connected`, `verifying`, `transferring`, `completed`, `failed { outcome_code }`) and subscribe in `QrHostPanel` so the host observes a remote cancellation, expiry, or failure (contract §4; missing).
+- [X] T058 Track whether a guest established a session connection and make `qr_transfer_guest_cancel` best-effort `POST /done` with its pinned client before deleting local state (contract §4 / FR-013; partial).
+- [X] T059 Perform a Rust-owned key/status preflight after human confirmation, then render the new-device password/profile prompt only when a pulled vault needs a local key or the push host needs one; preserve the existing-key copy landing path without an onboarding password prompt (FR-009a / FR-010a / T034; partial).
+- [X] T060 Add a live QR host countdown that rerenders once per second, cancels the displayed session at expiry, and disables stale guest confirmation actions (FR-002 / FR-003; partial).
+- [X] T061 Enforce the 8 MiB transfer cap while streaming every QR HTTP request and response, including absent or false Content-Length headers, and return a bounded transfer error before excess bytes are retained (FR-012 / US2 AC2; partial).

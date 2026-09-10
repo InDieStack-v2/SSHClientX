@@ -12,9 +12,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use http_body_util::BodyExt;
-use zeroize::Zeroizing;
 use std::time::{SystemTime, UNIX_EPOCH};
+use http_body_util::BodyExt;
+use tauri::Emitter;
+use zeroize::Zeroizing;
 
 pub const TICKET_VERSION: &str = "v1";
 pub const MAX_SESSION_SECONDS: u64 = 120;
@@ -33,6 +34,7 @@ impl TransferRole {
     fn parse(value: &str) -> Result<Self, Outcome> {
         match value {
             "pull" => Ok(Self::Pull),
+
             "push" => Ok(Self::Push),
             _ => Err(Outcome::QrBad),
         }
@@ -44,6 +46,24 @@ impl TransferRole {
             Self::Push => "push",
         }
     }
+}
+
+pub const fn allows_guest_confirmation(role: TransferRole) -> bool {
+    matches!(role, TransferRole::Pull | TransferRole::Push)
+}
+
+// `Bytes::from_owner` keeps this wrapper alive until the HTTP body is dropped;
+// unlike `Vec<u8>` / `Bytes::copy_from_slice`, the DEK owner zeroizes itself.
+struct ZeroizingKeyBody(Zeroizing<[u8; 32]>);
+
+impl AsRef<[u8]> for ZeroizingKeyBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.0[..]
+    }
+}
+
+pub fn zeroizing_key_bytes(key: Zeroizing<[u8; 32]>) -> hyper::body::Bytes {
+    hyper::body::Bytes::from_owner(ZeroizingKeyBody(key))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,7 +291,9 @@ impl TransferSession {
             }
             return Err(Outcome::QrBad);
         }
-        self.status = SessionStatus::Connected;
+        if self.status == SessionStatus::Advertising {
+            self.status = SessionStatus::Connected;
+        }
         Ok(())
     }
 
@@ -438,6 +460,22 @@ pub struct HostedSession {
     shutdown: tokio::sync::watch::Sender<bool>,
 }
 
+impl HostedSession {
+    fn emit_state(&self, state: &'static str, outcome_code: Option<&str>) {
+        let Some(app_handle) = self.app_handle.as_ref() else { return };
+        let _ = app_handle.emit(
+            &format!("qr-transfer-state-{}", hex::encode(self.session.sid)),
+            serde_json::json!({ "state": state, "outcome_code": outcome_code }),
+        );
+    }
+}
+
+#[derive(Clone)]
+pub struct GuestSession {
+    ticket: QrTicket,
+    connected: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct TransferMetadata {
     pub kid: Option<[u8; 16]>,
@@ -450,7 +488,7 @@ pub struct TransferMetadata {
 #[derive(Clone)]
 pub struct QrTransferState {
     pub hosts: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<HostedSession>>>>>,
-    pub guests: Arc<Mutex<HashMap<String, QrTicket>>>,
+    pub guests: Arc<Mutex<HashMap<String, GuestSession>>>,
 }
 
 impl Default for QrTransferState {
@@ -465,20 +503,30 @@ impl Default for QrTransferState {
 impl QrTransferState {
     pub fn stage_guest(&self, ticket: QrTicket) -> Result<String, Outcome> {
         let session_id = hex::encode(ticket.sid);
-        self.guests.lock().map_err(|_| Outcome::QrBad)?.insert(session_id.clone(), ticket);
+        self.guests.lock().map_err(|_| Outcome::QrBad)?.insert(
+            session_id.clone(),
+            GuestSession { ticket, connected: false },
+        );
         Ok(session_id)
     }
 
-    pub fn cancel_guest(&self, session_id: &str) -> Result<(), Outcome> {
-        self.guests.lock().map_err(|_| Outcome::QrBad)?.remove(session_id);
-        Ok(())
+    pub fn cancel_guest(&self, session_id: &str) -> Result<Option<QrTicket>, Outcome> {
+        let guest = self.guests.lock().map_err(|_| Outcome::QrBad)?.remove(session_id);
+        Ok(guest.and_then(|guest| guest.connected.then_some(guest.ticket)))
     }
 
     pub fn guest(&self, session_id: &str) -> Result<QrTicket, Outcome> {
         self.guests.lock().map_err(|_| Outcome::QrBad)?
             .get(session_id)
-            .cloned()
+            .map(|guest| guest.ticket.clone())
             .ok_or(Outcome::TokUsed)
+    }
+
+    pub fn mark_guest_connected(&self, session_id: &str) -> Result<(), Outcome> {
+        let mut guests = self.guests.lock().map_err(|_| Outcome::QrBad)?;
+        let guest = guests.get_mut(session_id).ok_or(Outcome::TokUsed)?;
+        guest.connected = true;
+        Ok(())
     }
 
     pub async fn start_host(
@@ -535,6 +583,7 @@ impl QrTransferState {
         if let Some(hosted) = hosted {
             let mut hosted = hosted.lock().await;
             hosted.session.cancel();
+            hosted.emit_state("failed", Some("QR_CANCELLED"));
             let _ = hosted.shutdown.send(true);
         }
         Ok(())
@@ -567,6 +616,82 @@ fn typed_response(
         .unwrap_or_else(|_| hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::new())))
 }
 
+async fn collect_file_bounded(
+    mut body: hyper::body::Incoming,
+    max_bytes: u64,
+) -> Result<Vec<u8>, hyper::StatusCode> {
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| hyper::StatusCode::BAD_REQUEST)?;
+        if let Some(data) = frame.data_ref() {
+            let next_len = (bytes.len() as u64).saturating_add(data.len() as u64);
+            if next_len > max_bytes {
+                return Err(hyper::StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            bytes.extend_from_slice(data);
+        }
+    }
+    Ok(bytes)
+}
+
+async fn collect_dek_bounded(
+    mut body: hyper::body::Incoming,
+) -> Result<Zeroizing<[u8; 32]>, hyper::StatusCode> {
+    let mut dek = Zeroizing::new([0u8; 32]);
+    let mut offset = 0usize;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| hyper::StatusCode::BAD_REQUEST)?;
+        if let Some(data) = frame.data_ref() {
+            let end = offset.saturating_add(data.len());
+            if end > dek.len() {
+                return Err(hyper::StatusCode::PAYLOAD_TOO_LARGE);
+            }
+            dek[offset..end].copy_from_slice(data);
+            offset = end;
+        }
+    }
+    if offset == dek.len() {
+        Ok(dek)
+    } else {
+        Err(hyper::StatusCode::PAYLOAD_TOO_LARGE)
+    }
+}
+
+pub async fn read_response_bounded(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> Result<Vec<u8>, Outcome> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| Outcome::NetUnreachable)? {
+        let next_len = (bytes.len() as u64).saturating_add(chunk.len() as u64);
+        if next_len > max_bytes {
+            return Err(Outcome::QrTooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+pub async fn read_dek_response(
+    mut response: reqwest::Response,
+) -> Result<Zeroizing<[u8; 32]>, Outcome> {
+    let mut dek = Zeroizing::new([0u8; 32]);
+    let mut offset = 0usize;
+    while let Some(chunk) = response.chunk().await.map_err(|_| Outcome::NetUnreachable)? {
+        let end = offset.saturating_add(chunk.len());
+        if end > dek.len() {
+            return Err(Outcome::QrBad);
+        }
+        dek[offset..end].copy_from_slice(&chunk);
+        offset = end;
+    }
+    if offset == dek.len() {
+        Ok(dek)
+    } else {
+        Err(Outcome::QrBad)
+    }
+}
+
 async fn finalize_pushed_vault(hosted: &mut HostedSession) -> Result<(), String> {
     let (Some(app_handle), Some(password), Some(profile_name), Some(file), Some(dek)) = (
         hosted.app_handle.clone(),
@@ -578,9 +703,9 @@ async fn finalize_pushed_vault(hosted: &mut HostedSession) -> Result<(), String>
         return Err("[VALIDATION] QR_RECEIVE_CONFIGURATION".into());
     };
     let sealed = crate::vault::SealedVaultFile::parse(file).map_err(|outcome| outcome.to_string())?;
-    let key = **dek;
+    let key = dek.clone();
     let registry = move |_: &[u8; crate::vault::KID_LEN]| -> crate::vault::KeyLookup {
-        crate::vault::KeyLookup::Unclaimed { key }
+        crate::vault::KeyLookup::Unclaimed { key: key.clone() }
     };
     let decision = crate::vault::verify_and_import(file, &registry, true)
         .map_err(|outcome| outcome.to_string())?;
@@ -611,10 +736,20 @@ async fn route_request(
 ) -> Result<hyper::Response<ResponseBody>, std::convert::Infallible> {
     let (method, path) = (request.method().clone(), request.uri().path().to_string());
     let mut hosted = hosted.lock().await;
+    let was_advertising = hosted.session.status == SessionStatus::Advertising;
     match hosted.session.authenticate(&bearer_token(&request).unwrap_or([0; 16]), now_unix_seconds()) {
-        Ok(()) => {}
+        Ok(()) => {
+            if was_advertising {
+                hosted.emit_state("connected", None);
+            }
+        }
         Err(Outcome::TokUsed) => return Ok(response(hyper::StatusCode::UNAUTHORIZED, "TOK_USED")),
-        Err(_) => return Ok(response(hyper::StatusCode::UNAUTHORIZED, "")),
+        Err(outcome) => {
+            if hosted.session.status == SessionStatus::Failed {
+                hosted.emit_state("failed", Some(&outcome.to_string()));
+            }
+            return Ok(response(hyper::StatusCode::UNAUTHORIZED, ""));
+        }
     }
     let base = format!("/s/{}", hex::encode(hosted.session.sid));
     if method == hyper::Method::GET && path == format!("{base}/meta") {
@@ -633,27 +768,43 @@ async fn route_request(
     if method == hyper::Method::POST && path == format!("{base}/done") {
         if hosted.session.role == TransferRole::Push {
             if let Err(error) = finalize_pushed_vault(&mut hosted).await {
+                hosted.emit_state("failed", Some("QR_IMPORT_FAILED"));
                 return Ok(response(hyper::StatusCode::UNPROCESSABLE_ENTITY, error));
             }
         }
         hosted.session.complete();
+        hosted.emit_state("completed", None);
         let _ = hosted.shutdown.send(true);
         return Ok(response(hyper::StatusCode::NO_CONTENT, ""));
     }
     if method == hyper::Method::GET && path == format!("{base}/key") && hosted.session.role == TransferRole::Pull {
-        if hosted.session.mark_verified().and_then(|_| hosted.session.mark_transferring()).is_err() {
+        if hosted.session.mark_verified().is_err() {
             return Ok(response(hyper::StatusCode::FORBIDDEN, ""));
         }
+        hosted.emit_state("verifying", None);
+        if hosted.session.mark_transferring().is_err() {
+            return Ok(response(hyper::StatusCode::FORBIDDEN, ""));
+        }
+        hosted.emit_state("transferring", None);
         let Some(dek) = hosted.dek.as_ref() else {
             return Ok(response(hyper::StatusCode::NOT_FOUND, ""));
         };
-        return Ok(response(hyper::StatusCode::OK, hyper::body::Bytes::copy_from_slice(&dek[..])));
+        return Ok(typed_response(
+            hyper::StatusCode::OK,
+            zeroizing_key_bytes(dek.clone()),
+            "application/octet-stream",
+        ));
     }
     if method == hyper::Method::GET && path == format!("{base}/file") && hosted.session.role == TransferRole::Pull {
-        if hosted.session.status == SessionStatus::Connected
-            && hosted.session.mark_verified().and_then(|_| hosted.session.mark_transferring()).is_err()
-        {
-            return Ok(response(hyper::StatusCode::FORBIDDEN, ""));
+        if hosted.session.status == SessionStatus::Connected {
+            if hosted.session.mark_verified().is_err() {
+                return Ok(response(hyper::StatusCode::FORBIDDEN, ""));
+            }
+            hosted.emit_state("verifying", None);
+            if hosted.session.mark_transferring().is_err() {
+                return Ok(response(hyper::StatusCode::FORBIDDEN, ""));
+            }
+            hosted.emit_state("transferring", None);
         }
         let Some(file) = hosted.file.as_ref() else {
             return Ok(response(hyper::StatusCode::NOT_FOUND, ""));
@@ -674,18 +825,16 @@ async fn route_request(
         if declared.is_some_and(|length| length > 32) {
             return Ok(response(hyper::StatusCode::PAYLOAD_TOO_LARGE, ""));
         }
-        let body = match request.into_body().collect().await {
-            Ok(body) => body.to_bytes(),
-            Err(_) => return Ok(response(hyper::StatusCode::BAD_REQUEST, "")),
+        let dek = match collect_dek_bounded(request.into_body()).await {
+            Ok(dek) => dek,
+            Err(status) => return Ok(response(status, "")),
         };
-        if body.len() != 32 {
-            return Ok(response(hyper::StatusCode::PAYLOAD_TOO_LARGE, ""));
-        }
-        let mut raw = [0u8; 32];
-        raw.copy_from_slice(&body);
-        hosted.dek = Some(Zeroizing::new(raw));
+        hosted.dek = Some(dek);
         hosted.session.key_status = KeyStatus::Owned;
-        hosted.session.mark_verified().ok();
+        if hosted.session.mark_verified().is_err() {
+            return Ok(response(hyper::StatusCode::FORBIDDEN, ""));
+        }
+        hosted.emit_state("verifying", None);
         return Ok(response(hyper::StatusCode::NO_CONTENT, ""));
     }
     if method == hyper::Method::PUT && path == format!("{base}/file") && hosted.session.role == TransferRole::Push {
@@ -695,15 +844,15 @@ async fn route_request(
         if declared.is_some_and(|length| length > hosted.session.max_body_bytes) {
             return Ok(response(hyper::StatusCode::PAYLOAD_TOO_LARGE, ""));
         }
-        let body = match request.into_body().collect().await {
-            Ok(body) => body.to_bytes(),
-            Err(_) => return Ok(response(hyper::StatusCode::BAD_REQUEST, "")),
+        let file = match collect_file_bounded(request.into_body(), hosted.session.max_body_bytes).await {
+            Ok(file) => file,
+            Err(status) => return Ok(response(status, "")),
         };
-        if body.len() as u64 > hosted.session.max_body_bytes {
-            return Ok(response(hyper::StatusCode::PAYLOAD_TOO_LARGE, ""));
+        hosted.file = Some(file);
+        if hosted.session.mark_transferring().is_err() {
+            return Ok(response(hyper::StatusCode::FORBIDDEN, ""));
         }
-        hosted.file = Some(body.to_vec());
-        hosted.session.mark_transferring().ok();
+        hosted.emit_state("transferring", None);
         return Ok(response(hyper::StatusCode::NO_CONTENT, ""));
     }
     Ok(response(hyper::StatusCode::NOT_FOUND, ""))
@@ -725,6 +874,7 @@ async fn run_accept_loop(
             _ = &mut expiry => {
                 if let Ok(mut session) = hosted.try_lock() {
                     session.session.is_live(expires_at);
+                    session.emit_state("failed", Some("QR_EXPIRED"));
                     let _ = session.shutdown.send(true);
                 }
                 break;
@@ -768,6 +918,7 @@ mod tests {
             token: [1; 16],
             kid: Some([2; 16]),
             fingerprint: [3; 32],
+
             expires_at: 10_000,
             role: TransferRole::Pull,
             sid: [4; 16],
@@ -793,6 +944,21 @@ mod tests {
         assert_eq!(QrTicket::parse(&public, 9_900), Err(Outcome::QrIpForbidden));
         let malformed = ticket().to_wire().replace("tok=01010101010101010101010101010101", "tok=zz");
         assert_eq!(QrTicket::parse(&malformed, 9_900), Err(Outcome::QrBad));
+    }
+
+    #[test]
+    fn both_ticket_roles_allow_guest_confirmation() {
+        assert!(allows_guest_confirmation(TransferRole::Pull));
+        assert!(allows_guest_confirmation(TransferRole::Push));
+    }
+    #[test]
+    fn authentication_does_not_regress_verified_session_state() {
+        let mut session = TransferSession::new(TransferRole::Pull, "192.168.1.7".parse().unwrap(), 1_000);
+        let token = session.token;
+        session.authenticate(&token, 1_001).unwrap();
+        session.mark_verified().unwrap();
+        session.authenticate(&token, 1_002).unwrap();
+        assert_eq!(session.status, SessionStatus::Verified);
     }
 
     #[test]

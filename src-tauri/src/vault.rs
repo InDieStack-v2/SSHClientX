@@ -59,6 +59,8 @@ pub enum Outcome {
     // --- §5.4 Same-network QR pairing outcomes ---
     /// A QR pairing ticket failed structural validation.
     QrBad,
+    /// The peer exceeded the fixed QR transfer size cap.
+    QrTooLarge,
     /// The QR pairing ticket's bounded lifetime elapsed.
     QrExpired,
     /// The ticket pointed anywhere except a LAN/private literal IP.
@@ -103,6 +105,7 @@ impl Outcome {
             Outcome::VaultKdf => "VAULT_KDF",
             Outcome::VaultBusy => "VAULT_BUSY",
             Outcome::QrBad => "QR_BAD",
+            Outcome::QrTooLarge => "QR_TOO_LARGE",
             Outcome::QrExpired => "QR_EXPIRED",
             Outcome::QrIpForbidden => "QR_IP_FORBIDDEN",
             Outcome::NetUnreachable => "NET_UNREACHABLE",
@@ -163,6 +166,7 @@ impl Outcome {
             Outcome::VaultBusy => "This profile is already open in another running copy of the app.",
             Outcome::KitMalformed => "This isn't a valid recovery phrase or recovery file.",
             Outcome::QrBad => "This code isn't a valid transfer code.",
+            Outcome::QrTooLarge => "The transfer is larger than the 8 MiB safety limit.",
             Outcome::QrExpired => "This code has expired. Ask the other device to show a new one.",
             Outcome::QrIpForbidden => "This code isn't a valid transfer code.",
             Outcome::NetUnreachable => "Not on the same Wi-Fi. Export a .sshclientx file instead.",
@@ -197,8 +201,8 @@ mod outcome_tests {
             Outcome::VaultUnknownKid, Outcome::VaultRollback, Outcome::VaultNoKeystore,
             Outcome::VaultKeystoreDenied, Outcome::VaultKdf, Outcome::VaultBusy,
             Outcome::KitMalformed, Outcome::KitWrongPassphrase, Outcome::KitKidMismatch,
-            Outcome::QrBad, Outcome::QrExpired, Outcome::QrIpForbidden, Outcome::NetUnreachable,
-            Outcome::TlsPin, Outcome::TokUsed,
+            Outcome::QrBad, Outcome::QrTooLarge, Outcome::QrExpired, Outcome::QrIpForbidden,
+            Outcome::NetUnreachable, Outcome::TlsPin, Outcome::TokUsed,
         ];
         let mut codes: Vec<&str> = all.iter().map(|o| o.code()).collect();
         let before = codes.len();
@@ -1205,7 +1209,7 @@ pub enum KeyLookup {
     /// This `kid` is unclaimed — it came from a consumed recovery kit and
     /// owns no profile yet (FR-031a). Importing a file for it creates a new
     /// profile that then owns it (FR-032).
-    Unclaimed { key: [u8; 32] },
+    Unclaimed { key: Zeroizing<[u8; 32]> },
     /// This `kid` is owned by an existing profile. `current_revision` and
     /// `current_content_hash` (SHA-256 of the *decrypted* local payload, not
     /// of the local sealed bytes — two seals of identical content get
@@ -1213,7 +1217,7 @@ pub enum KeyLookup {
     /// revision policy in step 8.
     Owned {
         profile: String,
-        key: [u8; 32],
+        key: Zeroizing<[u8; 32]>,
         current_revision: u64,
         current_content_hash: [u8; 32],
     },
@@ -1392,7 +1396,7 @@ mod verify_and_import_tests {
         let bytes = seal_bytes(&key, kid, 1, b"secret payload");
         let result = verify_and_import(
             &bytes,
-            &move |_kid| KeyLookup::Unclaimed { key: owned },
+            &move |_kid| KeyLookup::Unclaimed { key: owned.into() },
             false, // identity NOT confirmed
         );
         assert!(matches!(result, Err(Outcome::BoxAuth)));
@@ -1403,7 +1407,7 @@ mod verify_and_import_tests {
         let (owned, key) = leaked_key(SealAlg::XChaCha20Poly1305);
         let kid = [2u8; KID_LEN];
         let bytes = seal_bytes(&key, kid, 1, b"payload for a brand new profile");
-        let result = verify_and_import(&bytes, &move |_| KeyLookup::Unclaimed { key: owned }, true)
+        let result = verify_and_import(&bytes, &move |_| KeyLookup::Unclaimed { key: owned.into() }, true)
             .expect("should succeed");
         assert_eq!(result.disposition, Disposition::CreateProfile);
         assert_eq!(result.confirmation_needed, ConfirmationNeeded::None);
@@ -1418,7 +1422,7 @@ mod verify_and_import_tests {
             &bytes,
             &move |_| KeyLookup::Owned {
                 profile: "alice".into(),
-                key: owned,
+                key: owned.into(),
                 current_revision: 5,
                 current_content_hash: content_hash(b"older content"),
             },
@@ -1438,7 +1442,7 @@ mod verify_and_import_tests {
             &bytes,
             &move |_| KeyLookup::Owned {
                 profile: "bob".into(),
-                key: owned,
+                key: owned.into(),
                 current_revision: 9,
                 current_content_hash: content_hash(b"fresh content"),
             },
@@ -1459,7 +1463,7 @@ mod verify_and_import_tests {
             &bytes,
             &move |_| KeyLookup::Owned {
                 profile: "carol".into(),
-                key: owned,
+                key: owned.into(),
                 current_revision: 7,
                 current_content_hash: content_hash(plaintext),
             },
@@ -1479,7 +1483,7 @@ mod verify_and_import_tests {
             &bytes,
             &move |_| KeyLookup::Owned {
                 profile: "dave".into(),
-                key: owned,
+                key: owned.into(),
                 current_revision: 7,
                 current_content_hash: content_hash(b"different local version"),
             },
@@ -1520,7 +1524,7 @@ mod verify_and_import_tests {
         let bytes = seal_bytes(&sealing_key, kid, 1, b"payload");
         let result = verify_and_import(
             &bytes,
-            &move |_| KeyLookup::Unclaimed { key: *wrong_key },
+            &move |_| KeyLookup::Unclaimed { key: (*wrong_key).into() },
             true,
         );
         assert!(matches!(result, Err(Outcome::BoxCorrupt)));
@@ -1583,11 +1587,11 @@ mod verify_and_import_tests {
 
         let registry = move |k: &[u8; KID_LEN]| -> KeyLookup {
             if *k == kid_a {
-                KeyLookup::Owned { profile: "alice".into(), key: owned_a, current_revision: 3, current_content_hash: [0u8; 32] }
+                KeyLookup::Owned { profile: "alice".into(), key: owned_a.into(), current_revision: 3, current_content_hash: [0u8; 32] }
             } else if *k == kid_b {
-                KeyLookup::Owned { profile: "bob".into(), key: owned_b, current_revision: 5, current_content_hash: [0u8; 32] }
+                KeyLookup::Owned { profile: "bob".into(), key: owned_b.into(), current_revision: 5, current_content_hash: [0u8; 32] }
             } else if *k == kid_c {
-                KeyLookup::Unclaimed { key: owned_c }
+                KeyLookup::Unclaimed { key: owned_c.into() }
             } else {
                 KeyLookup::Unknown
             }

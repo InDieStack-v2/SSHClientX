@@ -1773,9 +1773,9 @@ async fn land_recovered_key(
     kid: [u8; vault::KID_LEN],
     name: &str,
 ) -> Result<String, String> {
-    let key = **dek;
+    let key = dek.clone();
     let registry = move |file_kid: &[u8; vault::KID_LEN]| -> vault::KeyLookup {
-        if *file_kid == kid { vault::KeyLookup::Unclaimed { key } } else { vault::KeyLookup::Unknown }
+        if *file_kid == kid { vault::KeyLookup::Unclaimed { key: key.clone() } } else { vault::KeyLookup::Unknown }
     };
     let decision = vault::verify_and_import(vault_bytes, &registry, true).map_err(|o| {
         // `BOX_UNKNOWN_KEY`'s own message ("sealed with another device's
@@ -1985,7 +1985,56 @@ async fn qr_transfer_guest_cancel(
     state: tauri::State<'_, qr_transfer::QrTransferState>,
     session_id: String,
 ) -> Result<(), String> {
-    state.cancel_guest(&session_id).map_err(|outcome| outcome.to_string())
+    let connected_ticket = state.cancel_guest(&session_id).map_err(|outcome| outcome.to_string())?;
+    if let Some(ticket) = connected_ticket {
+        if let Ok(client) = qr_transfer::pinned_client(&ticket) {
+            let _ = client.post(ticket.endpoint("done"))
+                .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", hex::encode(ticket.token)))
+                .send()
+                .await;
+        }
+    }
+    Ok(())
+}
+
+/// Connects only after the scanned-code comparison and reports whether the
+/// pulled vault already has an unlocked local key. No ticket secret reaches
+/// the webview, and no transfer bytes move during this preflight.
+#[tauri::command]
+async fn qr_transfer_guest_preflight(
+    app_handle: tauri::AppHandle,
+    db_state: tauri::State<'_, DbState>,
+    transfer_state: tauri::State<'_, qr_transfer::QrTransferState>,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    let ticket = transfer_state.guest(&session_id).map_err(|outcome| outcome.to_string())?;
+    if ticket.expires_at <= qr_transfer::now_unix_seconds() {
+        return Err(vault::Outcome::QrExpired.to_string());
+    }
+    let client = qr_transfer::pinned_client(&ticket).map_err(|outcome| outcome.to_string())?;
+    let response = client.get(ticket.endpoint("meta"))
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", hex::encode(ticket.token)))
+        .send()
+        .await
+        .map_err(|_| vault::Outcome::NetUnreachable.to_string())?;
+    let meta: serde_json::Value = qr_transfer::checked_response(response)
+        .await
+        .map_err(|outcome| outcome.to_string())?
+        .json()
+        .await
+        .map_err(|_| vault::Outcome::QrBad.to_string())?;
+    transfer_state.mark_guest_connected(&session_id).map_err(|outcome| outcome.to_string())?;
+    let needs_credentials = if ticket.role == qr_transfer::TransferRole::Pull {
+        let kid = ticket.kid.ok_or_else(|| vault::Outcome::QrBad.to_string())?;
+        let dir = profiles_dir(&app_handle)?;
+        matches!(resolve_key_lookup(&db_state, &dir, kid, None)?, vault::KeyLookup::Unknown)
+    } else {
+        false
+    };
+    Ok(serde_json::json!({
+        "needs_credentials": needs_credentials,
+        "needs_key": meta.get("needs_key").and_then(serde_json::Value::as_bool).unwrap_or(false),
+    }))
 }
 
 #[tauri::command]
@@ -2001,9 +2050,6 @@ async fn qr_transfer_guest_confirm(
     if ticket.expires_at <= qr_transfer::now_unix_seconds() {
         return Err(vault::Outcome::QrExpired.to_string());
     }
-    if ticket.role != qr_transfer::TransferRole::Pull {
-        return Err("[VALIDATION] QR_TRANSFER_ROLE".into());
-    }
     let client = qr_transfer::pinned_client(&ticket).map_err(|outcome| outcome.to_string())?;
     let authorization = format!("Bearer {}", hex::encode(ticket.token));
     let meta = client.get(ticket.endpoint("meta"))
@@ -2011,31 +2057,43 @@ async fn qr_transfer_guest_confirm(
         .send()
         .await
         .map_err(|_| vault::Outcome::NetUnreachable.to_string())?;
-    let _meta: serde_json::Value = qr_transfer::checked_response(meta)
+    let meta: serde_json::Value = qr_transfer::checked_response(meta)
         .await
         .map_err(|outcome| outcome.to_string())?
         .json()
         .await
         .map_err(|_| vault::Outcome::QrBad.to_string())?;
+    transfer_state.mark_guest_connected(&session_id).map_err(|outcome| outcome.to_string())?;
+    if !qr_transfer::allows_guest_confirmation(ticket.role) {
+        return Err("[VALIDATION] QR_TRANSFER_ROLE".into());
+    }
     if ticket.role == qr_transfer::TransferRole::Push {
         let path = db_state.db_path.lock().map_err(|_| "[STATE] LOCK_FAILED_PATH")?
             .clone().ok_or_else(|| vault::Outcome::VaultLocked.to_string())?;
         let dek = db_state.dek.lock().map_err(|_| "[STATE] LOCK_FAILED_KEY")?
-            .as_ref().map(|key| **key).ok_or_else(|| vault::Outcome::VaultLocked.to_string())?;
+            .as_ref().map(|key| Zeroizing::new(**key)).ok_or_else(|| vault::Outcome::VaultLocked.to_string())?;
         let file = tokio::task::spawn_blocking(move || fs::read(path))
             .await.map_err(|e| format!("[STATE] QR_FILE_READ_JOIN: {e}"))?
             .map_err(|e| format!("[FILE] QR_FILE_READ_FAILED: {e}"))?;
         if file.len() as u64 > qr_transfer::MAX_BODY_BYTES {
             return Err("[FILE] QR_TRANSFER_TOO_LARGE: vault files must not exceed 8 MiB.".into());
         }
-        for (resource, body) in [("key", dek.to_vec()), ("file", file)] {
-            let response = client.put(ticket.endpoint(resource))
+        let needs_key = meta.get("needs_key").and_then(serde_json::Value::as_bool)
+            .ok_or_else(|| vault::Outcome::QrBad.to_string())?;
+        if needs_key {
+            let response = client.put(ticket.endpoint("key"))
                 .header(reqwest::header::AUTHORIZATION, &authorization)
-                .body(body)
+                .body(qr_transfer::zeroizing_key_bytes(dek.clone()))
                 .send().await
                 .map_err(|_| vault::Outcome::NetUnreachable.to_string())?;
             qr_transfer::checked_response(response).await.map_err(|outcome| outcome.to_string())?;
         }
+        let response = client.put(ticket.endpoint("file"))
+            .header(reqwest::header::AUTHORIZATION, &authorization)
+            .body(file)
+            .send().await
+            .map_err(|_| vault::Outcome::NetUnreachable.to_string())?;
+        qr_transfer::checked_response(response).await.map_err(|outcome| outcome.to_string())?;
         let done = client.post(ticket.endpoint("done"))
             .header(reqwest::header::AUTHORIZATION, authorization)
             .send().await
@@ -2065,14 +2123,14 @@ async fn qr_transfer_guest_confirm(
         let key_response = qr_transfer::checked_response(key_response)
             .await
             .map_err(|outcome| outcome.to_string())?;
-        if key_response.content_length() != Some(32) {
+        if key_response.content_length().is_some_and(|length| length > 32) {
             return Err(vault::Outcome::QrBad.to_string());
         }
-        let bytes = key_response.bytes().await.map_err(|_| vault::Outcome::NetUnreachable.to_string())?;
-        let raw_key: [u8; 32] = bytes.as_ref().try_into().map_err(|_| vault::Outcome::QrBad.to_string())?;
-        let key = Zeroizing::new(raw_key);
+        let key = qr_transfer::read_dek_response(key_response)
+            .await
+            .map_err(|outcome| outcome.to_string())?;
         recovery::establish_unclaimed_key(&dir, &key, kid, password).map_err(|outcome| outcome.to_string())?;
-        lookup = vault::KeyLookup::Unclaimed { key: *key };
+        lookup = vault::KeyLookup::Unclaimed { key: key.clone() };
         received_key = Some(key);
     }
     if let Some(password) = key_password.as_mut() {
@@ -2090,10 +2148,9 @@ async fn qr_transfer_guest_confirm(
     if file_response.content_length().is_some_and(|length| length > qr_transfer::MAX_BODY_BYTES) {
         return Err("[FILE] QR_TRANSFER_TOO_LARGE: vault files must not exceed 8 MiB.".into());
     }
-    let file = file_response.bytes().await.map_err(|_| vault::Outcome::NetUnreachable.to_string())?;
-    if file.len() as u64 > qr_transfer::MAX_BODY_BYTES {
-        return Err("[FILE] QR_TRANSFER_TOO_LARGE: vault files must not exceed 8 MiB.".into());
-    }
+    let file = qr_transfer::read_response_bounded(file_response, qr_transfer::MAX_BODY_BYTES)
+        .await
+        .map_err(|outcome| outcome.to_string())?;
     let registry = move |_: &[u8; vault::KID_LEN]| -> vault::KeyLookup { lookup.clone() };
     let decision = vault::verify_and_import(&file, &registry, true).map_err(|outcome| outcome.to_string())?;
     let (landed_profile_name, disposition) = match decision.disposition {
@@ -2381,7 +2438,7 @@ fn resolve_key_lookup(
                 let current_content_hash: [u8; 32] = Sha256::digest(&current_plain).into();
                 return Ok(vault::KeyLookup::Owned {
                     profile: op.clone(),
-                    key: **od,
+                    key: od.clone(),
                     current_revision: *og,
                     current_content_hash,
                 });
@@ -2409,7 +2466,7 @@ fn resolve_key_lookup(
             let current_content_hash: [u8; 32] = Sha256::digest(&owner_plain).into();
             return Ok(vault::KeyLookup::Owned {
                 profile: owner,
-                key: *dek,
+                key: dek,
                 current_revision: owner_sealed.generation,
                 current_content_hash,
             });
@@ -2424,7 +2481,7 @@ fn resolve_key_lookup(
             let keywrap_bytes = fs::read(&keywrap_path).map_err(|e| format!("[FILE] UNCLAIMED_KEYWRAP_READ_FAILED: {}", e))?;
             let keywrap = vault::KeyWrapFile::parse(&keywrap_bytes).map_err(|o| o.to_string())?;
             let dek = keywrap.unwrap_dek(&device_factor, password).map_err(|o| o.to_string())?;
-            return Ok(vault::KeyLookup::Unclaimed { key: *dek });
+            return Ok(vault::KeyLookup::Unclaimed { key: dek });
         }
         // A matching unclaimed key exists but no password was supplied for
         // it this call — collapses to Unknown rather than a distinct
@@ -10635,7 +10692,7 @@ pub fn run() {
             recovery_kit_create, recovery_kit_save_file, recovery_kit_consume, pick_and_read_file, read_local_file_bytes,
             unclaimed_keys_list, unclaimed_key_discard, unclaimed_key_claim,
             qr_transfer_host_start, qr_transfer_host_cancel,
-            qr_transfer_guest_scan, qr_transfer_guest_confirm, qr_transfer_guest_cancel,
+            qr_transfer_guest_scan, qr_transfer_guest_preflight, qr_transfer_guest_confirm, qr_transfer_guest_cancel,
             qr_transfer_screen_protect,
             export_profile, import_vault_pick, import_vault_commit, import_vault_discard,
             add_server, save_quick_connect_node, edit_server, delete_server, add_mirror_to_server, get_servers, get_ssh_keys, set_server_color, set_folder_color, set_server_notes, set_server_run_on_connect, set_server_jump_host, reorder_servers, clone_server, reveal_server_password, reveal_credential_password, reveal_ssh_key,
